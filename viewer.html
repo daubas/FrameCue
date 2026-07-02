@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Subtitle Review</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #141414; color: #f4f4f4; }
+    main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; min-height: 100vh; }
+    .stage { display: grid; place-items: center; padding: 24px; }
+    .frame { position: relative; width: min(100%, 1180px); aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: 6px; }
+    .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .subtitle { position: absolute; left: 7%; right: 7%; bottom: 5%; display: grid; gap: 8px; text-align: center; text-shadow: 0 2px 3px #000; }
+    .subtitle-line { display: none; }
+    .subtitle-line span { display: inline; padding: 0.08em 0.35em; background: rgba(0, 0, 0, 0.58); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+    .subtitle-line mark { padding: 0.02em 0.12em; border-radius: 3px; background: rgba(196, 44, 44, 0.9); color: #fff; }
+    .subtitle-line.visible { display: block; }
+    .subtitle-line.original { font-size: clamp(16px, 2vw, 30px); line-height: 1.2; font-weight: 650; }
+    .subtitle-line.target { font-size: clamp(22px, 3vw, 44px); line-height: 1.25; font-weight: 750; }
+    aside { border-left: 1px solid #303030; padding: 16px; display: grid; grid-template-rows: auto auto auto 1fr auto auto; gap: 12px; background: #1f1f1f; }
+    .meta { display: grid; gap: 4px; color: #cfcfcf; font-size: 14px; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+    button { border: 1px solid #555; background: #2b2b2b; color: #fff; border-radius: 6px; padding: 8px 10px; cursor: pointer; }
+    button:hover { background: #383838; }
+    textarea { width: 100%; height: 100%; min-height: 280px; resize: none; border: 1px solid #555; border-radius: 6px; padding: 12px; background: #101010; color: #fff; font: 18px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #prompt { height: 92px; min-height: 92px; font-size: 15px; }
+    audio { width: 100%; }
+    .risks { display: flex; gap: 6px; flex-wrap: wrap; min-height: 24px; }
+    .risk { padding: 3px 7px; border-radius: 999px; background: #593737; color: #ffdada; font-size: 12px; }
+    input[type="range"] { width: 100%; }
+    .list { overflow: auto; border: 1px solid #333; border-radius: 6px; max-height: 220px; }
+    .cue { padding: 8px 10px; border-bottom: 1px solid #333; cursor: pointer; color: #cfcfcf; }
+    .cue.active { background: #31475f; color: #fff; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid #303030; } }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="stage">
+      <div class="frame">
+        <img id="image" alt="">
+        <div class="subtitle">
+          <div id="originalLine" class="subtitle-line original"><span id="originalOverlay"></span></div>
+          <div class="subtitle-line target visible"><span id="overlay"></span></div>
+        </div>
+      </div>
+    </section>
+    <aside>
+      <div class="meta">
+        <strong id="counter">Loading</strong>
+        <span id="timing"></span>
+        <span id="scene"></span>
+      </div>
+      <div>
+        <input id="slider" type="range" min="0" max="0" value="0">
+      </div>
+      <div>
+        <audio id="audio" controls></audio>
+        <div id="risks" class="risks"></div>
+      </div>
+      <textarea id="editor" spellcheck="false"></textarea>
+      <textarea id="prompt" spellcheck="false" placeholder="Prompt note for this cue"></textarea>
+      <div>
+        <div class="controls">
+          <button id="prev">←</button>
+          <button id="next">→</button>
+          <button id="play">Play Cue</button>
+          <button id="downloadSrt">Download SRT</button>
+          <button id="downloadChanges">Download Changes</button>
+          <button id="downloadJson">Download JSON</button>
+        </div>
+        <div id="list" class="list"></div>
+      </div>
+    </aside>
+  </main>
+  <script>
+    let data, index = 0;
+    const $ = (id) => document.getElementById(id);
+    const storeKey = () => `subtitle-review:${location.pathname}`;
+
+    function srtTime(seconds) {
+      const ms = Math.round(seconds * 1000);
+      const h = String(Math.floor(ms / 3600000)).padStart(2, "0");
+      const m = String(Math.floor(ms % 3600000 / 60000)).padStart(2, "0");
+      const s = String(Math.floor(ms % 60000 / 1000)).padStart(2, "0");
+      const x = String(ms % 1000).padStart(3, "0");
+      return `${h}:${m}:${s},${x}`;
+    }
+
+    function renderList() {
+      $("list").innerHTML = data.cues.map((cue, i) =>
+        `<div class="cue ${i === index ? "active" : ""}" data-i="${i}">${cue.id}. ${cue.text.replaceAll("<", "&lt;")}</div>`
+      ).join("");
+      document.querySelectorAll(".cue").forEach((el) => {
+        el.onclick = () => go(Number(el.dataset.i));
+      });
+    }
+
+    function escapeHtml(text) {
+      return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    }
+
+    function markedText(text, risks) {
+      let html = escapeHtml(text);
+      const terms = (risks || []).filter((risk) => !["英文混中文", "數字"].includes(risk));
+      terms.sort((a, b) => b.length - a.length).forEach((term) => {
+        html = html.replaceAll(escapeHtml(term), `<mark>${escapeHtml(term)}</mark>`);
+      });
+      return html;
+    }
+
+    function go(next) {
+      index = Math.max(0, Math.min(data.cues.length - 1, next));
+      const cue = data.cues[index];
+      const scene = data.scenes.find((row) => row.id === cue.scene_id) || data.scenes[0];
+      const hasOriginal = Boolean(cue.original_text);
+      $("image").src = scene.image;
+      $("originalLine").classList.toggle("visible", hasOriginal);
+      $("originalOverlay").textContent = cue.original_text || "";
+      $("overlay").innerHTML = markedText(cue.text, cue.pronunciation_risks);
+      $("audio").src = cue.audio || "";
+      $("audio").style.display = cue.audio ? "block" : "none";
+      $("risks").innerHTML = (cue.pronunciation_risks || []).map((risk) => `<span class="risk">${risk}</span>`).join("");
+      $("editor").value = cue.text;
+      $("prompt").value = cue.prompt_note || "";
+      $("counter").textContent = `${index + 1} / ${data.cues.length}`;
+      $("timing").textContent = `${srtTime(cue.start)} → ${srtTime(cue.end)}`;
+      $("scene").textContent = `scene ${scene.id}: ${srtTime(scene.start)} → ${srtTime(scene.end)}`;
+      $("slider").value = index;
+      renderList();
+      document.querySelector(".cue.active")?.scrollIntoView({ block: "nearest" });
+    }
+
+    function saveDraft() {
+      localStorage.setItem(storeKey(), JSON.stringify(data.cues.map((cue) => ({
+        text: cue.text,
+        prompt_note: cue.prompt_note || "",
+      }))));
+    }
+
+    function download(name, type, text) {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([text], { type }));
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    function srtText() {
+      return data.cues.map((cue, i) =>
+        `${i + 1}\n${srtTime(cue.start)} --> ${srtTime(cue.end)}\n${cue.text}\n`
+      ).join("\n");
+    }
+
+    function changesText() {
+      const changes = data.cues.filter((cue) =>
+        cue.text !== cue.source_text || (cue.prompt_note || "").trim()
+      ).map((cue) => ({
+        id: cue.id,
+        start: srtTime(cue.start),
+        end: srtTime(cue.end),
+        original_subtitle: cue.source_text,
+        updated_subtitle: cue.text,
+        prompt_note: cue.prompt_note || "",
+      }));
+      return JSON.stringify(changes, null, 2);
+    }
+
+    $("editor").addEventListener("input", () => {
+      data.cues[index].text = $("editor").value;
+      $("overlay").innerHTML = markedText(data.cues[index].text, data.cues[index].pronunciation_risks);
+      saveDraft();
+    });
+    $("prompt").addEventListener("input", () => {
+      data.cues[index].prompt_note = $("prompt").value;
+      saveDraft();
+    });
+    $("slider").addEventListener("input", () => go(Number($("slider").value)));
+    $("prev").onclick = () => go(index - 1);
+    $("next").onclick = () => go(index + 1);
+    function toggleAudio() {
+      const audio = $("audio");
+      if (!audio.src) return;
+      if (audio.paused) {
+        audio.play();
+      } else {
+        audio.pause();
+      }
+    }
+
+    $("play").onclick = toggleAudio;
+    $("downloadSrt").onclick = () => download("edited_subtitles.srt", "application/x-subrip", srtText());
+    $("downloadChanges").onclick = () => download("subtitle_change_list.json", "application/json", changesText());
+    $("downloadJson").onclick = () => download("edited_review_package.json", "application/json", JSON.stringify(data, null, 2));
+    document.addEventListener("keydown", (event) => {
+      if (event.target.tagName === "TEXTAREA") return;
+      if (["ArrowLeft", "ArrowUp"].includes(event.key)) go(index - 1);
+      if (["ArrowRight", "ArrowDown"].includes(event.key)) go(index + 1);
+      if (event.key === " ") {
+        event.preventDefault();
+        toggleAudio();
+      }
+    });
+
+    fetch("review_package.json").then((res) => res.json()).then((loaded) => {
+      data = loaded;
+      const draft = JSON.parse(localStorage.getItem(storeKey()) || "null");
+      if (draft && draft.length === data.cues.length) {
+        data.cues.forEach((cue, i) => {
+          cue.source_text = cue.text;
+          if (typeof draft[i] === "string") {
+            cue.text = draft[i];
+          } else {
+            cue.text = draft[i].text;
+            cue.prompt_note = draft[i].prompt_note || "";
+          }
+        });
+      } else {
+        data.cues.forEach((cue) => cue.source_text = cue.text);
+      }
+      $("slider").max = data.cues.length - 1;
+      go(0);
+    });
+  </script>
+</body>
+</html>
