@@ -37,9 +37,16 @@
     .list-title { color: #cfcfcf; font-size: 12px; font-weight: 700; text-transform: uppercase; }
     .list { overflow: auto; border: 1px solid #333; border-radius: 6px; max-height: 220px; }
     #riskList { max-height: 150px; }
+    #blockList { max-height: 170px; }
     .cue { padding: 8px 10px; border-bottom: 1px solid #333; cursor: pointer; color: #cfcfcf; }
     .cue.active { background: #31475f; color: #fff; }
     .cue .cue-risks { display: block; color: #ffb4b4; font-size: 12px; margin-top: 3px; }
+    .block { padding: 8px 10px; border-bottom: 1px solid #333; cursor: pointer; color: #cfcfcf; }
+    .block.active { background: #4a3f2a; color: #fff; }
+    .block-meta { display: block; color: #aaa; font-size: 12px; margin-top: 3px; }
+    .block-source { max-height: 90px; overflow: auto; border: 1px solid #333; border-radius: 6px; padding: 8px; background: #151515; color: #ddd; font-size: 13px; line-height: 1.4; }
+    #blockTarget, #blockSpeech, #blockNote { min-height: 64px; height: 64px; font-size: 14px; }
+    #blockPanel[hidden] { display: none; }
     @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid #303030; } }
   </style>
 </head>
@@ -88,6 +95,18 @@
           <button id="downloadJson">Download JSON</button>
         </div>
         <div class="lists">
+          <div id="blockPanel" hidden>
+            <div class="list-title">Blocks <span id="blockStatus"></span></div>
+            <div id="blockList" class="list"></div>
+            <div id="blockSource" class="block-source"></div>
+            <textarea id="blockTarget" spellcheck="false" placeholder="Block target text"></textarea>
+            <textarea id="blockSpeech" spellcheck="false" placeholder="Block speech text"></textarea>
+            <textarea id="blockNote" spellcheck="false" placeholder="Block note: merge / split / rewrite"></textarea>
+            <div class="controls">
+              <button id="approveBlock">Approve Block</button>
+              <button id="downloadBlockDecisions">Download Block Decisions</button>
+            </div>
+          </div>
           <div>
             <div class="list-title">Risk Cues</div>
             <div id="riskList" class="list"></div>
@@ -101,9 +120,10 @@
     </aside>
   </main>
   <script>
-    let data, index = 0;
+    let data, semanticBlocks, index = 0, blockIndex = 0, blockDecisions = {};
     const $ = (id) => document.getElementById(id);
     const storeKey = () => `subtitle-review:${location.pathname}`;
+    const blockStoreKey = () => `subtitle-review-blocks:${location.pathname}`;
 
     function srtTime(seconds) {
       const ms = Math.round(seconds * 1000);
@@ -126,6 +146,7 @@
       document.querySelectorAll(".cue").forEach((el) => {
         el.onclick = () => go(Number(el.dataset.i));
       });
+      renderBlocks();
     }
 
     function escapeHtml(text) {
@@ -160,6 +181,7 @@
       $("scene").textContent = `scene ${scene.id}: ${srtTime(scene.start)} → ${srtTime(scene.end)}`;
       $("slider").value = index;
       renderList();
+      syncBlockToCue(cue.id);
       document.querySelector(".cue.active")?.scrollIntoView({ block: "nearest" });
     }
 
@@ -196,6 +218,85 @@
         prompt_note: cue.prompt_note || "",
       }));
       return JSON.stringify(changes, null, 2);
+    }
+
+    function blockDecision(block) {
+      if (!blockDecisions[block.id]) {
+        blockDecisions[block.id] = {
+          id: block.id,
+          source_cue_ids: block.source_cue_ids || [],
+          target_text: block.target_text || "",
+          speech_text: block.speech_text || "",
+          note: "",
+          decision: "",
+        };
+      }
+      return blockDecisions[block.id];
+    }
+
+    function saveBlockDecisions() {
+      localStorage.setItem(blockStoreKey(), JSON.stringify(blockDecisions));
+    }
+
+    function blockCueIds(block) {
+      return block.source_cue_ids || block.input_ids || [];
+    }
+
+    function syncBlockToCue(cueId) {
+      if (!semanticBlocks) return;
+      const found = semanticBlocks.blocks.findIndex((block) => blockCueIds(block).includes(cueId));
+      if (found >= 0 && found !== blockIndex) {
+        blockIndex = found;
+        renderBlocks();
+      }
+    }
+
+    function goBlock(next) {
+      if (!semanticBlocks) return;
+      blockIndex = Math.max(0, Math.min(semanticBlocks.blocks.length - 1, next));
+      const firstCueId = blockCueIds(semanticBlocks.blocks[blockIndex])[0];
+      const cueIndex = data.cues.findIndex((cue) => cue.id === firstCueId);
+      if (cueIndex >= 0) go(cueIndex);
+      renderBlocks();
+    }
+
+    function renderBlocks() {
+      if (!semanticBlocks) return;
+      $("blockPanel").hidden = false;
+      $("blockStatus").textContent = `${blockIndex + 1}/${semanticBlocks.blocks.length}`;
+      $("blockList").innerHTML = semanticBlocks.blocks.map((block, i) => {
+        const decision = blockDecisions[block.id]?.decision || "";
+        const text = escapeHtml(block.target_text || "(empty)");
+        const meta = `${block.id} · ${(block.budget_ms / 1000).toFixed(1)}s · ${(block.source_cue_ids || []).join(",")}${decision ? " · " + decision : ""}`;
+        return `<div class="block ${i === blockIndex ? "active" : ""}" data-i="${i}">${text}<span class="block-meta">${escapeHtml(meta)}</span></div>`;
+      }).join("");
+      document.querySelectorAll(".block").forEach((el) => {
+        el.onclick = () => goBlock(Number(el.dataset.i));
+      });
+      const block = semanticBlocks.blocks[blockIndex];
+      const decision = blockDecision(block);
+      $("blockSource").textContent = block.source_text || "";
+      $("blockTarget").value = decision.target_text;
+      $("blockSpeech").value = decision.speech_text;
+      $("blockNote").value = decision.note || "";
+      document.querySelector(".block.active")?.scrollIntoView({ block: "nearest" });
+    }
+
+    function updateCurrentBlock() {
+      if (!semanticBlocks) return;
+      const block = semanticBlocks.blocks[blockIndex];
+      const decision = blockDecision(block);
+      decision.target_text = $("blockTarget").value;
+      decision.speech_text = $("blockSpeech").value;
+      decision.note = $("blockNote").value;
+      saveBlockDecisions();
+    }
+
+    function blockDecisionText() {
+      return JSON.stringify({
+        workflow: "framecue_block_decisions_v1",
+        decisions: Object.values(blockDecisions),
+      }, null, 2);
     }
 
     function searchMatches() {
@@ -255,6 +356,9 @@
       data.cues[index].prompt_note = $("prompt").value;
       saveDraft();
     });
+    $("blockTarget").addEventListener("input", updateCurrentBlock);
+    $("blockSpeech").addEventListener("input", updateCurrentBlock);
+    $("blockNote").addEventListener("input", updateCurrentBlock);
     $("slider").addEventListener("input", () => go(Number($("slider").value)));
     $("searchTerm").addEventListener("input", () => updateSearchStatus());
     $("findNext").onclick = findNextMatch;
@@ -275,6 +379,13 @@
     $("downloadSrt").onclick = () => download("edited_subtitles.srt", "application/x-subrip", srtText());
     $("downloadChanges").onclick = () => download("subtitle_change_list.json", "application/json", changesText());
     $("downloadJson").onclick = () => download("edited_review_package.json", "application/json", JSON.stringify(data, null, 2));
+    $("approveBlock").onclick = () => {
+      const block = semanticBlocks.blocks[blockIndex];
+      blockDecision(block).decision = "approved";
+      saveBlockDecisions();
+      renderBlocks();
+    };
+    $("downloadBlockDecisions").onclick = () => download("block_decisions.json", "application/json", blockDecisionText());
     document.addEventListener("keydown", (event) => {
       if (["INPUT", "TEXTAREA"].includes(event.target.tagName)) return;
       if (["ArrowLeft", "ArrowUp"].includes(event.key)) go(index - 1);
@@ -304,6 +415,12 @@
       $("slider").max = data.cues.length - 1;
       go(0);
     });
+    fetch("semantic_blocks/semantic_blocks.json").then((res) => res.ok ? res.json() : null).then((loaded) => {
+      if (!loaded) return;
+      semanticBlocks = loaded;
+      blockDecisions = JSON.parse(localStorage.getItem(blockStoreKey()) || "{}");
+      renderBlocks();
+    }).catch(() => {});
   </script>
 </body>
 </html>
