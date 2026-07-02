@@ -239,7 +239,7 @@
     }
 
     function blockCueIds(block) {
-      return block.source_cue_ids || block.input_ids || [];
+      return block.input_ids || block.source_cue_ids || [];
     }
 
     function syncBlockToCue(cueId) {
