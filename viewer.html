@@ -26,8 +26,12 @@
     .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     .tab { display: flex; justify-content: center; align-items: center; gap: 6px; }
     .tab.active { background: #405773; border-color: #6c8bb0; }
+    .mini-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .mini-tab { display: flex; justify-content: center; align-items: center; gap: 6px; padding: 6px 8px; font-size: 13px; }
+    .mini-tab.active { background: #31475f; border-color: #6c8bb0; }
     .pane { display: none; min-height: 0; overflow: auto; padding-right: 2px; }
     .pane.active { display: grid; gap: 10px; align-content: start; }
+    .list-pane[hidden] { display: none; }
     .field-title { display: flex; align-items: center; gap: 6px; color: #cfcfcf; font-size: 12px; font-weight: 700; text-transform: uppercase; }
     .help { position: relative; display: inline-grid; place-items: center; flex: 0 0 auto; width: 16px; height: 16px; border: 1px solid #777; border-radius: 50%; color: #ffd27a; font-size: 11px; font-weight: 800; cursor: help; text-transform: none; }
     .help:hover::after, .help:focus::after { content: attr(data-tip); position: fixed; right: 16px; top: 16px; z-index: 9999; width: min(320px, calc(100vw - 32px)); padding: 8px 10px; border: 1px solid #555; border-radius: 6px; background: #101010; color: #f4f4f4; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35); font-size: 12px; font-weight: 500; line-height: 1.45; text-align: left; }
@@ -125,12 +129,16 @@
             </div>
           </div>
           <div class="lists">
-            <div>
-              <div class="list-title">Risk Cues <span class="help" tabindex="0" data-tip="只列出可能有破音字、專有名詞或中英混讀風險的字幕，方便逐一聽。">!</span></div>
+            <div class="mini-tabs">
+              <button id="tabRiskList" class="mini-tab active">Risk <span class="help" data-tip="只列出可能有破音字、專有名詞或中英混讀風險的字幕，方便逐一聽。">!</span></button>
+              <button id="tabAllList" class="mini-tab">All <span class="help" data-tip="全部逐句字幕清單；點一列會跳到該句並同步畫面、音訊和編輯框。">!</span></button>
+            </div>
+            <div id="riskListPane" class="list-pane">
+              <div class="list-title">Risk Cues</div>
               <div id="riskList" class="list"></div>
             </div>
-            <div>
-              <div class="list-title">All Cues <span class="help" tabindex="0" data-tip="全部逐句字幕清單；點一列會跳到該句並同步畫面、音訊和編輯框。">!</span></div>
+            <div id="allListPane" class="list-pane" hidden>
+              <div class="list-title">All Cues</div>
               <div id="list" class="list"></div>
             </div>
           </div>
@@ -158,7 +166,7 @@
     </aside>
   </main>
   <script>
-    let data, semanticBlocks, index = 0, blockIndex = 0, blockDecisions = {}, activeTab = "cue";
+    let data, semanticBlocks, index = 0, blockIndex = 0, blockDecisions = {}, activeTab = "cue", cueListTab = "risk";
     const $ = (id) => document.getElementById(id);
     const storeKey = () => `subtitle-review:${location.pathname}`;
     const blockStoreKey = () => `subtitle-review-blocks:${location.pathname}`;
@@ -169,6 +177,15 @@
       $("tabBlock").classList.toggle("active", name === "block");
       $("cuePane").classList.toggle("active", name === "cue");
       $("blockPane").classList.toggle("active", name === "block");
+    }
+
+    function setCueListTab(name) {
+      cueListTab = name;
+      $("tabRiskList").classList.toggle("active", name === "risk");
+      $("tabAllList").classList.toggle("active", name === "all");
+      $("riskListPane").hidden = name !== "risk";
+      $("allListPane").hidden = name !== "all";
+      scrollCurrentCueList();
     }
 
     function srtTime(seconds) {
@@ -218,6 +235,14 @@
       if (bottom > list.scrollTop + list.clientHeight) list.scrollTop = bottom - list.clientHeight;
     }
 
+    function scrollCurrentCueList() {
+      if (cueListTab === "risk") {
+        scrollInList("riskList", ".cue.active");
+      } else {
+        scrollInList("list", ".cue.active");
+      }
+    }
+
     function go(next) {
       index = Math.max(0, Math.min(data.cues.length - 1, next));
       const cue = data.cues[index];
@@ -238,7 +263,7 @@
       $("slider").value = index;
       renderList();
       syncBlockToCue(cue.id);
-      scrollInList("list", ".cue.active");
+      scrollCurrentCueList();
     }
 
     function saveDraft() {
@@ -422,6 +447,8 @@
     $("replaceAll").onclick = replaceAllMatches;
     $("tabCue").onclick = () => setTab("cue");
     $("tabBlock").onclick = () => setTab("block");
+    $("tabRiskList").onclick = () => setCueListTab("risk");
+    $("tabAllList").onclick = () => setCueListTab("all");
     $("prev").onclick = () => go(index - 1);
     $("next").onclick = () => go(index + 1);
     function toggleAudio() {
