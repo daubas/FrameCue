@@ -105,7 +105,7 @@
         <section id="cuePane" class="pane active">
           <div class="field-title">Subtitle <span class="help" tabindex="0" data-tip="目前這一句會顯示在影片畫面上，也會進入 SRT 匯出。">!</span></div>
           <textarea id="editor" spellcheck="false" placeholder="Current subtitle text"></textarea>
-          <div class="field-title">Prompt Note <span class="help" tabindex="0" data-tip="給後續重寫或重新產 TTS 的備註，不會直接顯示在影片字幕上。">!</span></div>
+          <div class="field-title">Prompt Note <span class="help" tabindex="0" data-tip="給後續 LLM 重寫這一句用的 prompt 指示；不會直接顯示在影片字幕上。">!</span></div>
           <textarea id="prompt" spellcheck="false" placeholder="Prompt note for this cue"></textarea>
           <div>
             <div class="field-title">Search / Replace <span class="help" tabindex="0" data-tip="搜尋全部字幕；Replace All 會一次替換所有符合的字串，並存到本機 draft。">!</span></div>
@@ -146,7 +146,7 @@
             <textarea id="blockTarget" spellcheck="false" placeholder="Block target text"></textarea>
             <div class="field-title">Speech Text <span class="help" tabindex="0" data-tip="後續拿去 TTS 的口語稿；可以比字幕更像現場口譯，但意思要對齊 source。">!</span></div>
             <textarea id="blockSpeech" spellcheck="false" placeholder="Block speech text"></textarea>
-            <div class="field-title">Block Note <span class="help" tabindex="0" data-tip="記錄這段要合併、拆句、改專有名詞或重新生成語音的指示。">!</span></div>
+            <div class="field-title">Block Note <span class="help" tabindex="0" data-tip="給後續 LLM 針對這個 block 重寫用的 prompt 指示，例如合併、拆句、改專有名詞或改口譯語氣。">!</span></div>
             <textarea id="blockNote" spellcheck="false" placeholder="Block note: merge / split / rewrite"></textarea>
             <div class="controls">
               <button id="approveBlock" title="標記目前 block 已確認">Approve Block</button>
