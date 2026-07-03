@@ -24,9 +24,14 @@
     .controls { display: flex; gap: 8px; flex-wrap: wrap; }
     .workspace { display: grid; grid-template-rows: auto 1fr; gap: 10px; min-height: 0; }
     .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .tab { display: flex; justify-content: center; align-items: center; gap: 6px; }
     .tab.active { background: #405773; border-color: #6c8bb0; }
     .pane { display: none; min-height: 0; overflow: auto; padding-right: 2px; }
     .pane.active { display: grid; gap: 10px; align-content: start; }
+    .field-title { display: flex; align-items: center; gap: 6px; color: #cfcfcf; font-size: 12px; font-weight: 700; text-transform: uppercase; }
+    .help { position: relative; display: inline-grid; place-items: center; flex: 0 0 auto; width: 16px; height: 16px; border: 1px solid #777; border-radius: 50%; color: #ffd27a; font-size: 11px; font-weight: 800; cursor: help; text-transform: none; }
+    .help:hover::after, .help:focus::after { content: attr(data-tip); position: absolute; right: 0; top: 21px; z-index: 20; width: min(280px, calc(100vw - 32px)); padding: 8px 10px; border: 1px solid #555; border-radius: 6px; background: #101010; color: #f4f4f4; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35); font-size: 12px; font-weight: 500; line-height: 1.45; text-align: left; }
+    .help:focus { outline: 2px solid #6c8bb0; outline-offset: 2px; }
     .search { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
     .search input { min-width: 0; border: 1px solid #555; border-radius: 6px; padding: 8px 10px; background: #101010; color: #fff; }
     .search .wide { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -81,48 +86,51 @@
         <span id="scene"></span>
       </div>
       <div>
-        <input id="slider" type="range" min="0" max="0" value="0">
+        <input id="slider" type="range" min="0" max="0" value="0" title="快速跳到另一句字幕。">
       </div>
       <div>
-        <audio id="audio" controls></audio>
-        <div id="risks" class="risks"></div>
+        <audio id="audio" controls title="目前 cue 的音訊片段，用來確認這一句和聲音是否對得上。"></audio>
+        <div id="risks" class="risks" title="這一句可能需要特別聽一次的發音或格式提醒。"></div>
       </div>
       <div class="controls">
-        <button id="prev">←</button>
-        <button id="next">→</button>
-        <button id="play">Play Cue</button>
+        <button id="prev" title="上一句字幕">←</button>
+        <button id="next" title="下一句字幕">→</button>
+        <button id="play" title="播放或暫停目前 cue 的音訊">Play Cue</button>
       </div>
       <div class="workspace">
         <div class="tabs">
-          <button id="tabCue" class="tab active">Cue</button>
-          <button id="tabBlock" class="tab">Block</button>
+          <button id="tabCue" class="tab active">Cue <span class="help" data-tip="逐句字幕模式：改這一句畫面上的字幕、prompt note，並可匯出 SRT 或修改清單。">!</span></button>
+          <button id="tabBlock" class="tab">Block <span class="help" data-tip="語意塊模式：用一整段意思來審稿，適合合併、拆句、改寫成更像口譯的內容。">!</span></button>
         </div>
         <section id="cuePane" class="pane active">
-          <textarea id="editor" spellcheck="false"></textarea>
+          <div class="field-title">Subtitle <span class="help" tabindex="0" data-tip="目前這一句會顯示在影片畫面上，也會進入 SRT 匯出。">!</span></div>
+          <textarea id="editor" spellcheck="false" placeholder="Current subtitle text"></textarea>
+          <div class="field-title">Prompt Note <span class="help" tabindex="0" data-tip="給後續重寫或重新產 TTS 的備註，不會直接顯示在影片字幕上。">!</span></div>
           <textarea id="prompt" spellcheck="false" placeholder="Prompt note for this cue"></textarea>
           <div>
+            <div class="field-title">Search / Replace <span class="help" tabindex="0" data-tip="搜尋全部字幕；Replace All 會一次替換所有符合的字串，並存到本機 draft。">!</span></div>
             <div class="search">
               <input id="searchTerm" type="search" placeholder="Search subtitles">
               <input id="replaceTerm" type="text" placeholder="Replace with">
               <div class="wide">
-                <button id="findNext">Find Next</button>
-                <button id="replaceAll">Replace All</button>
+                <button id="findNext" title="跳到下一個搜尋結果">Find Next</button>
+                <button id="replaceAll" title="替換全部符合的字幕文字">Replace All</button>
                 <span id="searchStatus"></span>
               </div>
             </div>
             <div class="controls">
-              <button id="downloadSrt">Download SRT</button>
-              <button id="downloadChanges">Download Changes</button>
-              <button id="downloadJson">Download JSON</button>
+              <button id="downloadSrt" title="下載目前字幕文字成 SRT">Download SRT</button>
+              <button id="downloadChanges" title="只下載有改過或有 prompt note 的清單">Download Changes</button>
+              <button id="downloadJson" title="下載完整 review package，包含所有 cue">Download JSON</button>
             </div>
           </div>
           <div class="lists">
             <div>
-              <div class="list-title">Risk Cues</div>
+              <div class="list-title">Risk Cues <span class="help" tabindex="0" data-tip="只列出可能有破音字、專有名詞或中英混讀風險的字幕，方便逐一聽。">!</span></div>
               <div id="riskList" class="list"></div>
             </div>
             <div>
-              <div class="list-title">All Cues</div>
+              <div class="list-title">All Cues <span class="help" tabindex="0" data-tip="全部逐句字幕清單；點一列會跳到該句並同步畫面、音訊和編輯框。">!</span></div>
               <div id="list" class="list"></div>
             </div>
           </div>
@@ -130,15 +138,19 @@
         <section id="blockPane" class="pane">
           <div id="blockEmpty" class="list-title">Loading Blocks</div>
           <div id="blockPanel" hidden>
-            <div class="list-title">Blocks <span id="blockStatus"></span></div>
+            <div class="list-title">Blocks <span id="blockStatus"></span> <span class="help" tabindex="0" data-tip="每個 block 是一段語意完整的內容；先在這裡確認口譯稿，再進 TTS。">!</span></div>
             <div id="blockList" class="list"></div>
+            <div class="field-title">Source <span class="help" tabindex="0" data-tip="這個 block 對應的英文原文內容，只供對照，不會被匯出成中文字幕。">!</span></div>
             <div id="blockSource" class="block-source"></div>
+            <div class="field-title">Target Text <span class="help" tabindex="0" data-tip="這段要顯示或保存的中文翻譯內容，偏字幕審稿用。">!</span></div>
             <textarea id="blockTarget" spellcheck="false" placeholder="Block target text"></textarea>
+            <div class="field-title">Speech Text <span class="help" tabindex="0" data-tip="後續拿去 TTS 的口語稿；可以比字幕更像現場口譯，但意思要對齊 source。">!</span></div>
             <textarea id="blockSpeech" spellcheck="false" placeholder="Block speech text"></textarea>
+            <div class="field-title">Block Note <span class="help" tabindex="0" data-tip="記錄這段要合併、拆句、改專有名詞或重新生成語音的指示。">!</span></div>
             <textarea id="blockNote" spellcheck="false" placeholder="Block note: merge / split / rewrite"></textarea>
             <div class="controls">
-              <button id="approveBlock">Approve Block</button>
-              <button id="downloadBlockDecisions">Download Block Decisions</button>
+              <button id="approveBlock" title="標記目前 block 已確認">Approve Block</button>
+              <button id="downloadBlockDecisions" title="下載 block target、speech text、note 與 approve 狀態">Download Block Decisions</button>
             </div>
           </div>
         </section>
