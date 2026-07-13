@@ -42,6 +42,31 @@ Open:
 http://localhost:8000
 ```
 
+## Review Multiple Videos
+
+Put each review package in its own folder and add `framecue_manifest.json` beside `index.html`:
+
+```json
+{
+  "items": [
+    {
+      "id": "openclaw",
+      "label": "OpenClaw",
+      "review_package": "openclaw/review_package.json",
+      "semantic_blocks": "openclaw/semantic_blocks/semantic_blocks.json"
+    },
+    {
+      "id": "video-2",
+      "label": "Video 2",
+      "review_package": "video-2/review_package.json",
+      "semantic_blocks": null
+    }
+  ]
+}
+```
+
+FrameCue adds a review-file selector. Frames and audio are resolved relative to each `review_package.json`; browser drafts and exported filenames are kept separate by item `id`.
+
 ## Audio Options
 
 Prefer per-cue audio when available:

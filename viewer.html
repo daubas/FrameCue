@@ -21,6 +21,9 @@
     .subtitle-line.target { font-size: clamp(22px, 3vw, 44px); line-height: 1.25; font-weight: 750; }
     aside { border-left: 1px solid #303030; padding: 16px; display: grid; grid-template-rows: auto auto auto auto 1fr; gap: 12px; min-height: 0; overflow: hidden; background: #1f1f1f; }
     .meta { display: grid; gap: 4px; color: #cfcfcf; font-size: 14px; }
+    .package-picker { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; margin-bottom: 4px; }
+    .package-picker[hidden] { display: none; }
+    select { min-width: 0; width: 100%; border: 1px solid #555; border-radius: 6px; padding: 7px 9px; background: #101010; color: #fff; }
     .controls { display: flex; gap: 8px; flex-wrap: wrap; }
     .workspace { display: grid; grid-template-rows: auto 1fr; gap: 10px; min-height: 0; }
     .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -85,6 +88,10 @@
     </section>
     <aside>
       <div class="meta">
+        <div id="packagePicker" class="package-picker" hidden>
+          <span>Review file</span>
+          <select id="packageSelect" title="切換另一支影片的 FrameCue review package"></select>
+        </div>
         <strong id="counter">Loading</strong>
         <span id="timing"></span>
         <span id="scene"></span>
@@ -166,10 +173,31 @@
     </aside>
   </main>
   <script>
-    let data, semanticBlocks, index = 0, blockIndex = 0, blockDecisions = {}, activeTab = "cue", cueListTab = "risk";
+    let data, semanticBlocks, index = 0, blockIndex = 0, blockDecisions = {}, activeTab = "cue", cueListTab = "risk", loadVersion = 0;
+    let manifestItems = [];
+    let currentItem = { id: "default", label: "Review", review_package: "review_package.json" };
     const $ = (id) => document.getElementById(id);
-    const storeKey = () => `subtitle-review:${location.pathname}`;
-    const blockStoreKey = () => `subtitle-review-blocks:${location.pathname}`;
+    const itemKey = () => currentItem.id === "default" ? "" : `:${currentItem.id}`;
+    const storeKey = () => `subtitle-review:${location.pathname}${itemKey()}`;
+    const blockStoreKey = () => `subtitle-review-blocks:${location.pathname}${itemKey()}`;
+
+    function directoryOf(path) {
+      const position = path.lastIndexOf("/");
+      return position < 0 ? "" : path.slice(0, position + 1);
+    }
+
+    function itemAssetUrl(path) {
+      if (!path) return "";
+      const base = currentItem.asset_base || directoryOf(currentItem.review_package);
+      const normalizedBase = base && !base.endsWith("/") ? `${base}/` : base;
+      return new URL(path, new URL(normalizedBase || ".", location.href)).href;
+    }
+
+    function exportName(name) {
+      if (currentItem.id === "default") return name;
+      const id = String(currentItem.id).replace(/[^a-z0-9_-]+/gi, "-");
+      return `${id}_${name}`;
+    }
 
     function setTab(name) {
       activeTab = name;
@@ -244,15 +272,16 @@
     }
 
     function go(next) {
+      if (!data?.cues?.length) return;
       index = Math.max(0, Math.min(data.cues.length - 1, next));
       const cue = data.cues[index];
       const scene = data.scenes.find((row) => row.id === cue.scene_id) || data.scenes[0];
       const hasOriginal = Boolean(cue.original_text);
-      $("image").src = scene.image;
+      $("image").src = itemAssetUrl(scene.image);
       $("originalLine").classList.toggle("visible", hasOriginal);
       $("originalOverlay").textContent = cue.original_text || "";
       $("overlay").innerHTML = markedText(cue.text, cue.pronunciation_risks);
-      $("audio").src = cue.audio || "";
+      $("audio").src = itemAssetUrl(cue.audio);
       $("audio").style.display = cue.audio ? "block" : "none";
       $("risks").innerHTML = (cue.pronunciation_risks || []).map((risk) => `<span class="risk">${risk}</span>`).join("");
       $("editor").value = cue.text;
@@ -267,6 +296,7 @@
     }
 
     function saveDraft() {
+      if (!data) return;
       localStorage.setItem(storeKey(), JSON.stringify(data.cues.map((cue) => ({
         text: cue.text,
         prompt_note: cue.prompt_note || "",
@@ -383,7 +413,7 @@
 
     function searchMatches() {
       const term = $("searchTerm").value;
-      if (!term) return [];
+      if (!term || !data) return [];
       return data.cues.map((cue, i) => cue.text.includes(term) ? i : -1).filter((i) => i >= 0);
     }
 
@@ -413,7 +443,7 @@
 
     function replaceAllMatches() {
       const term = $("searchTerm").value;
-      if (!term) {
+      if (!term || !data) {
         updateSearchStatus("");
         return;
       }
@@ -430,11 +460,13 @@
     }
 
     $("editor").addEventListener("input", () => {
+      if (!data) return;
       data.cues[index].text = $("editor").value;
       $("overlay").innerHTML = markedText(data.cues[index].text, data.cues[index].pronunciation_risks);
       saveDraft();
     });
     $("prompt").addEventListener("input", () => {
+      if (!data) return;
       data.cues[index].prompt_note = $("prompt").value;
       saveDraft();
     });
@@ -462,16 +494,16 @@
     }
 
     $("play").onclick = toggleAudio;
-    $("downloadSrt").onclick = () => download("edited_subtitles.srt", "application/x-subrip", srtText());
-    $("downloadChanges").onclick = () => download("subtitle_change_list.json", "application/json", changesText());
-    $("downloadJson").onclick = () => download("edited_review_package.json", "application/json", JSON.stringify(data, null, 2));
+    $("downloadSrt").onclick = () => data && download(exportName("edited_subtitles.srt"), "application/x-subrip", srtText());
+    $("downloadChanges").onclick = () => data && download(exportName("subtitle_change_list.json"), "application/json", changesText());
+    $("downloadJson").onclick = () => data && download(exportName("edited_review_package.json"), "application/json", JSON.stringify(data, null, 2));
     $("approveBlock").onclick = () => {
       const block = semanticBlocks.blocks[blockIndex];
       blockDecision(block).decision = "approved";
       saveBlockDecisions();
       renderBlocks();
     };
-    $("downloadBlockDecisions").onclick = () => download("block_decisions.json", "application/json", blockDecisionText());
+    $("downloadBlockDecisions").onclick = () => semanticBlocks && download(exportName("block_decisions.json"), "application/json", blockDecisionText());
     document.addEventListener("keydown", (event) => {
       if (["INPUT", "TEXTAREA"].includes(event.target.tagName)) return;
       if (["ArrowLeft", "ArrowUp"].includes(event.key)) go(index - 1);
@@ -482,8 +514,38 @@
       }
     });
 
-    fetch("review_package.json").then((res) => res.json()).then((loaded) => {
-      data = loaded;
+    async function loadPackage(item) {
+      const version = ++loadVersion;
+      currentItem = item;
+      data = null;
+      semanticBlocks = null;
+      blockDecisions = {};
+      index = 0;
+      blockIndex = 0;
+      $("packageSelect").disabled = true;
+      $("counter").textContent = `Loading ${item.label || item.id}`;
+      $("timing").textContent = "";
+      $("scene").textContent = "";
+      $("image").removeAttribute("src");
+      $("audio").removeAttribute("src");
+      $("audio").style.display = "none";
+      $("blockPanel").hidden = true;
+      $("blockEmpty").hidden = false;
+      $("blockEmpty").textContent = "Loading Blocks";
+
+      try {
+        const response = await fetch(item.review_package);
+        if (!response.ok) throw new Error(`Unable to load ${item.review_package}`);
+        const loaded = await response.json();
+        if (version !== loadVersion) return;
+        data = loaded;
+      } catch (error) {
+        if (version === loadVersion) $("counter").textContent = error.message;
+        return;
+      } finally {
+        if (version === loadVersion) $("packageSelect").disabled = false;
+      }
+
       const draft = JSON.parse(localStorage.getItem(storeKey()) || "null");
       if (draft && draft.length === data.cues.length) {
         data.cues.forEach((cue, i) => {
@@ -500,14 +562,58 @@
       }
       $("slider").max = data.cues.length - 1;
       go(0);
-    });
-    fetch("semantic_blocks/semantic_blocks.json").then((res) => res.ok ? res.json() : null).then((loaded) => {
-      if (!loaded) return;
-      semanticBlocks = loaded;
-      blockDecisions = JSON.parse(localStorage.getItem(blockStoreKey()) || "{}");
-      renderBlocks();
-      setTab("block");
-    }).catch(() => {});
+
+      const blockPath = Object.hasOwn(item, "semantic_blocks")
+        ? item.semantic_blocks
+        : `${directoryOf(item.review_package)}semantic_blocks/semantic_blocks.json`;
+      if (!blockPath) {
+        $("blockEmpty").textContent = "No Blocks";
+        setTab("cue");
+        return;
+      }
+      try {
+        const response = await fetch(blockPath);
+        if (!response.ok) throw new Error();
+        const loaded = await response.json();
+        if (version !== loadVersion) return;
+        semanticBlocks = loaded;
+        blockDecisions = JSON.parse(localStorage.getItem(blockStoreKey()) || "{}");
+        renderBlocks();
+        setTab("block");
+      } catch {
+        if (version === loadVersion) {
+          $("blockEmpty").textContent = "No Blocks";
+          setTab("cue");
+        }
+      }
+    }
+
+    async function boot() {
+      try {
+        const response = await fetch("framecue_manifest.json");
+        if (response.ok) {
+          const manifest = await response.json();
+          manifestItems = (manifest.items || []).map((item, i) => ({
+            ...item,
+            id: String(item.id || `review-${i + 1}`),
+            label: item.label || item.id || `Review ${i + 1}`,
+          })).filter((item) => item.review_package);
+        }
+      } catch {}
+
+      if (!manifestItems.length) {
+        loadPackage(currentItem);
+        return;
+      }
+      $("packagePicker").hidden = false;
+      $("packageSelect").innerHTML = manifestItems.map((item, i) =>
+        `<option value="${i}">${escapeHtml(String(item.label))}</option>`
+      ).join("");
+      $("packageSelect").onchange = () => loadPackage(manifestItems[Number($("packageSelect").value)]);
+      loadPackage(manifestItems[0]);
+    }
+
+    boot();
   </script>
 </body>
 </html>
