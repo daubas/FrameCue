@@ -6,12 +6,26 @@
   <title>Subtitle Review</title>
   <style>
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body { margin: 0; overflow-x: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #141414; color: #f4f4f4; }
     main { display: grid; grid-template-columns: minmax(0, 1fr) 430px; height: 100vh; }
     main > * { min-width: 0; }
-    .stage { display: grid; place-items: center; min-width: 0; padding: 24px; }
+    .stage { position: relative; display: grid; place-items: center; min-width: 0; min-height: 0; padding: 24px; }
+    .stage.has-player .stage-canvas { padding-top: 42px; }
+    .stage-canvas { display: grid; place-items: center; width: 100%; height: 100%; min-height: 0; }
+    .stage-modes { position: absolute; top: 16px; left: 50%; z-index: 4; display: grid; grid-template-columns: 1fr 1fr; gap: 2px; width: 148px; padding: 3px; border: 1px solid #454545; border-radius: 6px; background: #181818; transform: translateX(-50%); }
+    .stage-modes[hidden] { display: none; }
+    .stage-mode { height: 32px; padding: 0 10px; border: 0; background: transparent; color: #bdbdbd; }
+    .stage-mode.active { background: #405773; color: #fff; }
     .frame { position: relative; width: min(100%, 1180px); aspect-ratio: 16 / 9; background: #000; overflow: hidden; border-radius: 6px; }
+    .frame[hidden] { display: none; }
     .frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .player-surface { position: relative; width: min(100%, 420px); aspect-ratio: 9 / 16; overflow: hidden; border: 1px solid #343b31; border-radius: 6px; background: #0b0d0b; }
+    .player-surface[hidden] { display: none; }
+    .player-surface iframe { display: block; width: 100%; height: 100%; border: 0; background: #0b0d0b; }
+    .player-state { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(11, 13, 11, 0.94); color: #d4dccd; text-align: center; pointer-events: none; }
+    .player-state[hidden] { display: none; }
+    .player-state.error { color: #ffb4b4; }
     .subtitle { position: absolute; left: 7%; right: 7%; bottom: 5%; display: grid; gap: 8px; text-align: center; text-shadow: 0 2px 3px #000; }
     .subtitle-line { display: none; overflow-wrap: anywhere; }
     .subtitle-line span { display: block; width: 100%; overflow-wrap: anywhere; white-space: normal; padding: 0.08em 0.35em; background: rgba(0, 0, 0, 0.58); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
@@ -59,6 +73,8 @@
     #blockList { max-height: 170px; }
     .cue { padding: 8px 10px; border-bottom: 1px solid #333; cursor: pointer; color: #cfcfcf; }
     .cue.active { background: #31475f; color: #fff; }
+    .cue.playing { box-shadow: inset 3px 0 #76b900; color: #fff; }
+    .cue.active.playing { background: #365547; }
     .cue .cue-risks { display: block; color: #ffb4b4; font-size: 12px; margin-top: 3px; }
     .block { padding: 8px 10px; border-bottom: 1px solid #333; cursor: pointer; color: #cfcfcf; }
     .block.active { background: #4a3f2a; color: #fff; }
@@ -70,6 +86,9 @@
     @media (max-width: 900px) {
       main { grid-template-columns: 1fr; height: auto; }
       .stage { padding: 16px; }
+      .stage.has-player { min-height: min(78vh, 760px); }
+      .stage-modes { top: 10px; }
+      .stage.has-player .stage-canvas { padding-top: 38px; }
       .subtitle { left: 4%; right: 4%; }
       aside { border-left: 0; border-top: 1px solid #303030; height: auto; overflow: visible; }
     }
@@ -77,12 +96,22 @@
 </head>
 <body>
   <main>
-    <section class="stage">
-      <div class="frame">
-        <img id="image" alt="">
-        <div class="subtitle">
-          <div id="originalLine" class="subtitle-line original"><span id="originalOverlay"></span></div>
-          <div class="subtitle-line target visible"><span id="overlay"></span></div>
+    <section id="stage" class="stage">
+      <div id="stageModes" class="stage-modes" role="group" aria-label="Preview mode" hidden>
+        <button id="stageStill" class="stage-mode active" type="button" title="檢視目前 cue 的代表畫面" aria-pressed="true">Still</button>
+        <button id="stageVideo" class="stage-mode" type="button" title="檢視完整 HyperFrames 時間軸" aria-pressed="false">Video</button>
+      </div>
+      <div id="stageCanvas" class="stage-canvas">
+        <div id="stillSurface" class="frame">
+          <img id="image" alt="">
+          <div class="subtitle">
+            <div id="originalLine" class="subtitle-line original"><span id="originalOverlay"></span></div>
+            <div class="subtitle-line target visible"><span id="overlay"></span></div>
+          </div>
+        </div>
+        <div id="videoSurface" class="player-surface" hidden>
+          <iframe id="reviewPlayer" title="HyperFrames Review Player" allow="autoplay"></iframe>
+          <div id="reviewPlayerState" class="player-state">Loading video</div>
         </div>
       </div>
     </section>
@@ -174,6 +203,8 @@
   </main>
   <script>
     let data, semanticBlocks, index = 0, blockIndex = 0, blockDecisions = {}, activeTab = "cue", cueListTab = "risk", loadVersion = 0;
+    let stageMode = "still", playerReady = false, playerPlaying = false, playerOrigin = "", playerLoadTimer = null, playbackIndex = -1;
+    let playerDimensions = { width: 1080, height: 1920 };
     let manifestItems = [];
     let currentItem = { id: "default", label: "Review", review_package: "review_package.json" };
     const $ = (id) => document.getElementById(id);
@@ -197,6 +228,153 @@
       if (currentItem.id === "default") return name;
       const id = String(currentItem.id).replace(/[^a-z0-9_-]+/gi, "-");
       return `${id}_${name}`;
+    }
+
+    function pauseCueAudio() {
+      $("audio").pause();
+    }
+
+    function pauseFullVideo() {
+      const video = $("fullVideo");
+      if (video) video.pause();
+    }
+
+    function postPlayer(type, payload = {}) {
+      const frame = $("reviewPlayer");
+      if (!playerOrigin || !frame.contentWindow) return;
+      frame.contentWindow.postMessage({ type, ...payload }, playerOrigin);
+    }
+
+    function pausePlayer() {
+      if (playerOrigin) postPlayer("framecue:pause");
+      playerPlaying = false;
+    }
+
+    function setReviewPlayerState(message, isError = false) {
+      const state = $("reviewPlayerState");
+      state.textContent = message || "";
+      state.hidden = !message;
+      state.classList.toggle("error", isError);
+    }
+
+    function fitReviewPlayer() {
+      const canvas = $("stageCanvas");
+      const surface = $("videoSurface");
+      const ratio = playerDimensions.width / playerDimensions.height;
+      const style = getComputedStyle(canvas);
+      const availableWidth = Math.max(1, canvas.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
+      const availableHeight = Math.max(1, canvas.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom));
+      const width = Math.min(availableWidth, availableHeight * ratio, playerDimensions.width);
+      surface.style.width = `${width}px`;
+      surface.style.height = `${width / ratio}px`;
+    }
+
+    function setStageMode(mode) {
+      if (mode === "video" && $("stageModes").hidden) return;
+      stageMode = mode;
+      const video = mode === "video";
+      $("stageStill").classList.toggle("active", !video);
+      $("stageVideo").classList.toggle("active", video);
+      $("stageStill").setAttribute("aria-pressed", String(!video));
+      $("stageVideo").setAttribute("aria-pressed", String(video));
+      $("stillSurface").hidden = video;
+      $("videoSurface").hidden = !video;
+      if (video) {
+        pauseCueAudio();
+        pauseFullVideo();
+        requestAnimationFrame(fitReviewPlayer);
+        if (playerReady && data?.cues?.[index]) postPlayer("framecue:seek", { time: data.cues[index].start });
+      } else {
+        pausePlayer();
+      }
+    }
+
+    function clearPlaybackHighlight() {
+      playbackIndex = -1;
+      document.querySelectorAll(".cue.playing").forEach((el) => el.classList.remove("playing"));
+    }
+
+    function resetReviewPlayer() {
+      clearTimeout(playerLoadTimer);
+      pausePlayer();
+      playerReady = false;
+      playerPlaying = false;
+      playerOrigin = "";
+      playerDimensions = { width: 1080, height: 1920 };
+      clearPlaybackHighlight();
+      $("stageModes").hidden = true;
+      $("stage").classList.remove("has-player");
+      $("reviewPlayer").removeAttribute("src");
+      setReviewPlayerState("Loading video");
+      setStageMode("still");
+    }
+
+    function configureReviewPlayer(item) {
+      const player = item.review_player;
+      if (!player || player.type !== "hyperframes" || !player.src) return;
+      const url = new URL(player.src, location.href);
+      $("stageModes").hidden = false;
+      $("stage").classList.add("has-player");
+      if (url.origin !== location.origin) {
+        setReviewPlayerState("Player unavailable", true);
+        return;
+      }
+      playerOrigin = url.origin;
+      setReviewPlayerState("Loading video");
+      $("reviewPlayer").src = url.href;
+      playerLoadTimer = setTimeout(() => {
+        if (!playerReady) setReviewPlayerState("Player unavailable", true);
+      }, 12000);
+      requestAnimationFrame(fitReviewPlayer);
+    }
+
+    function setPlaybackCue(seconds) {
+      if (!data?.cues?.length) return;
+      let next = 0;
+      for (let i = 0; i < data.cues.length; i += 1) {
+        if (seconds >= data.cues[i].start) next = i;
+        else break;
+      }
+      if (next === playbackIndex) return;
+      document.querySelectorAll(".cue.playing").forEach((el) => el.classList.remove("playing"));
+      playbackIndex = next;
+      document.querySelectorAll(`.cue[data-i="${next}"]`).forEach((el) => el.classList.add("playing"));
+      if (stageMode === "video" && activeTab === "cue") {
+        if (cueListTab === "risk") scrollInList("riskList", `.cue[data-i="${next}"]`);
+        else scrollInList("list", `.cue[data-i="${next}"]`);
+      }
+    }
+
+    function handlePlayerMessage(event) {
+      const frame = $("reviewPlayer");
+      if (!playerOrigin || event.source !== frame.contentWindow || event.origin !== playerOrigin || !event.data) return;
+      if (event.data.type === "hyperframes:ready") {
+        const width = Number(event.data.width);
+        const height = Number(event.data.height);
+        if (!(Number(event.data.duration) > 0) || !(width > 0) || !(height > 0)) {
+          setReviewPlayerState("Player unavailable", true);
+          return;
+        }
+        clearTimeout(playerLoadTimer);
+        playerReady = true;
+        playerDimensions = { width, height };
+        setReviewPlayerState("");
+        fitReviewPlayer();
+        if (stageMode === "video" && data?.cues?.[index]) postPlayer("framecue:seek", { time: data.cues[index].start });
+      } else if (event.data.type === "hyperframes:error") {
+        clearTimeout(playerLoadTimer);
+        playerReady = false;
+        playerPlaying = false;
+        setReviewPlayerState("Player unavailable", true);
+      } else if (event.data.type === "hyperframes:timeupdate" && playerReady) {
+        playerPlaying = Boolean(event.data.playing);
+        if (playerPlaying) {
+          pauseCueAudio();
+          pauseFullVideo();
+        }
+        const seconds = Number(event.data.time);
+        if (Number.isFinite(seconds)) setPlaybackCue(seconds);
+      }
     }
 
     function setTab(name) {
@@ -227,12 +405,12 @@
 
     function renderList() {
       $("list").innerHTML = data.cues.map((cue, i) =>
-        `<div class="cue ${i === index ? "active" : ""}" data-i="${i}">${cue.id}. ${cue.text.replaceAll("<", "&lt;")}</div>`
+        `<div class="cue ${i === index ? "active" : ""} ${i === playbackIndex ? "playing" : ""}" data-i="${i}">${cue.id}. ${cue.text.replaceAll("<", "&lt;")}</div>`
       ).join("");
       $("riskList").innerHTML = data.cues.map((cue, i) => ({ cue, i }))
         .filter((row) => (row.cue.pronunciation_risks || []).length)
         .map((row) =>
-          `<div class="cue ${row.i === index ? "active" : ""}" data-i="${row.i}">${row.cue.id}. ${escapeHtml(row.cue.text)}<span class="cue-risks">${row.cue.pronunciation_risks.join(" / ")}</span></div>`
+          `<div class="cue ${row.i === index ? "active" : ""} ${row.i === playbackIndex ? "playing" : ""}" data-i="${row.i}">${row.cue.id}. ${escapeHtml(row.cue.text)}<span class="cue-risks">${row.cue.pronunciation_risks.join(" / ")}</span></div>`
         ).join("");
       document.querySelectorAll(".cue").forEach((el) => {
         el.onclick = () => go(Number(el.dataset.i));
@@ -293,6 +471,7 @@
       renderList();
       syncBlockToCue(cue.id);
       scrollCurrentCueList();
+      if (stageMode === "video" && playerReady) postPlayer("framecue:seek", { time: cue.start });
     }
 
     function saveDraft() {
@@ -481,19 +660,41 @@
     $("tabBlock").onclick = () => setTab("block");
     $("tabRiskList").onclick = () => setCueListTab("risk");
     $("tabAllList").onclick = () => setCueListTab("all");
+    $("stageStill").onclick = () => setStageMode("still");
+    $("stageVideo").onclick = () => setStageMode("video");
     $("prev").onclick = () => go(index - 1);
     $("next").onclick = () => go(index + 1);
     function toggleAudio() {
       const audio = $("audio");
       if (!audio.src) return;
       if (audio.paused) {
+        pausePlayer();
+        pauseFullVideo();
         audio.play();
       } else {
         audio.pause();
       }
     }
 
+    function toggleReviewPlayer() {
+      if (!playerReady) return;
+      postPlayer(playerPlaying ? "framecue:pause" : "framecue:play");
+    }
+
     $("play").onclick = toggleAudio;
+    $("audio").addEventListener("play", () => {
+      pausePlayer();
+      pauseFullVideo();
+    });
+    const fullVideo = $("fullVideo");
+    if (fullVideo) {
+      fullVideo.addEventListener("play", () => {
+        pausePlayer();
+        pauseCueAudio();
+      });
+    }
+    window.addEventListener("message", handlePlayerMessage);
+    window.addEventListener("resize", fitReviewPlayer);
     $("downloadSrt").onclick = () => data && download(exportName("edited_subtitles.srt"), "application/x-subrip", srtText());
     $("downloadChanges").onclick = () => data && download(exportName("subtitle_change_list.json"), "application/json", changesText());
     $("downloadJson").onclick = () => data && download(exportName("edited_review_package.json"), "application/json", JSON.stringify(data, null, 2));
@@ -505,17 +706,22 @@
     };
     $("downloadBlockDecisions").onclick = () => semanticBlocks && download(exportName("block_decisions.json"), "application/json", blockDecisionText());
     document.addEventListener("keydown", (event) => {
-      if (["INPUT", "TEXTAREA"].includes(event.target.tagName)) return;
+      if (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName)) return;
+      if (event.key === " " && event.target.tagName === "BUTTON") return;
       if (["ArrowLeft", "ArrowUp"].includes(event.key)) go(index - 1);
       if (["ArrowRight", "ArrowDown"].includes(event.key)) go(index + 1);
       if (event.key === " ") {
         event.preventDefault();
-        toggleAudio();
+        if (stageMode === "video") toggleReviewPlayer();
+        else toggleAudio();
       }
     });
 
     async function loadPackage(item) {
       const version = ++loadVersion;
+      pauseCueAudio();
+      pauseFullVideo();
+      resetReviewPlayer();
       currentItem = item;
       data = null;
       semanticBlocks = null;
@@ -562,6 +768,7 @@
       }
       $("slider").max = data.cues.length - 1;
       go(0);
+      configureReviewPlayer(item);
 
       const blockPath = Object.hasOwn(item, "semantic_blocks")
         ? item.semantic_blocks

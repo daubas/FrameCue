@@ -67,6 +67,37 @@ Put each review package in its own folder and add `framecue_manifest.json` besid
 
 FrameCue adds a review-file selector. Frames and audio are resolved relative to each `review_package.json`; browser drafts and exported filenames are kept separate by item `id`.
 
+## Review A HyperFrames Timeline
+
+Add an optional `review_player` object to a manifest item when the review package has a same-origin HyperFrames Review Player:
+
+```json
+{
+  "items": [
+    {
+      "id": "computex-2026",
+      "label": "COMPUTEX 2026",
+      "review_package": "review/framecue/review_package.json",
+      "semantic_blocks": "review/framecue/semantic_blocks/semantic_blocks.json",
+      "review_player": {
+        "type": "hyperframes",
+        "src": "hyperframes/player.html"
+      }
+    }
+  ]
+}
+```
+
+The `review_player.src` path is relative to the FrameCue page. Serve a common project root so the FrameCue page and Player share one origin. The viewer keeps Still as the default and shows a Still/Video control only for items with a valid Player; Cue and Block editing stay available in both stage modes.
+
+Use a static server that supports HTTP byte-range requests. Range support is required for reliable seeking in the Player's narration audio; Python 3.9's basic `http.server` is not sufficient for this mode. For example:
+
+```bash
+miniserve --interfaces 127.0.0.1 --port 3073 /path/to/project-root
+```
+
+Player configuration and the same-origin message contract are documented in the [implementation note](docs/hyperframes-review-implementation-note.md).
+
 ## Audio Options
 
 Prefer per-cue audio when available:
@@ -109,3 +140,8 @@ The browser viewer can download:
 ## Name
 
 FrameCue means: review each subtitle cue against a representative video frame.
+
+## Architecture Notes
+
+- [HyperFrames Review Player integration proposal](docs/hyperframes-review-integration.md)
+- [HyperFrames Review Player implementation note](docs/hyperframes-review-implementation-note.md)
