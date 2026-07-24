@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <rect width="1280" height="720" fill="#46675d"/>
+  <circle cx="640" cy="290" r="190" fill="#d6c28d"/>
+  <rect x="0" y="620" width="1280" height="100" fill="#29433c"/>
+  <text x="70" y="100" fill="#f1f7e5" font-family="Arial, sans-serif" font-size="48">After</text>
+</svg>

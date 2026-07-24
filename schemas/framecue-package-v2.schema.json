@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://framecue.dev/schemas/framecue-package-v2.schema.json",
+  "title": "FrameCue package v2",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "review_id",
+    "revision",
+    "viewer_version",
+    "content_checksum",
+    "workflow",
+    "subtitle_policy",
+    "scenes",
+    "cues",
+    "blocks",
+    "lineage"
+  ],
+  "properties": {
+    "schema_version": { "const": "framecue_package_v2" },
+    "review_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+    "revision": { "type": "string", "pattern": "^r[1-9][0-9]*$" },
+    "viewer_version": { "type": "string", "minLength": 1 },
+    "content_checksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "created_at": { "type": "string" },
+    "workflow": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["subtitle", "redraw", "boundary", "hyperframes"] },
+        "label": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "subtitle_policy": {
+      "type": "object",
+      "required": ["display_punctuation", "speech_punctuation"],
+      "properties": {
+        "display_punctuation": { "type": "string" },
+        "speech_punctuation": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "media": { "type": "object" },
+    "scenes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/scene" }
+    },
+    "cues": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/cue" }
+    },
+    "blocks": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/block" }
+    },
+    "risks": { "type": "array", "items": { "type": "object" } },
+    "provenance": { "type": "object" },
+    "lineage": {
+      "type": "object",
+      "required": ["previous_package_checksum", "previous_result"],
+      "properties": {
+        "previous_package_checksum": { "type": "string" },
+        "previous_result": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "milliseconds": { "type": "integer", "minimum": 0 },
+    "scene": {
+      "type": "object",
+      "required": ["id", "start_ms", "end_ms", "image"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "start_ms": { "$ref": "#/$defs/milliseconds" },
+        "end_ms": { "$ref": "#/$defs/milliseconds" },
+        "image": { "type": "string" },
+        "redraw": { "type": "object" },
+        "boundary": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "cue": {
+      "type": "object",
+      "required": ["id", "start_ms", "end_ms", "scene_id", "text", "speech_text"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "start_ms": { "$ref": "#/$defs/milliseconds" },
+        "end_ms": { "$ref": "#/$defs/milliseconds" },
+        "scene_id": { "type": "string", "minLength": 1 },
+        "text": { "type": "string" },
+        "speech_text": { "type": "string" },
+        "original_text": { "type": "string" },
+        "audio": { "type": "string" },
+        "risks": { "type": "array", "items": { "type": "string" } },
+        "boundary": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "block": {
+      "type": "object",
+      "required": ["id", "cue_ids", "start_ms", "end_ms", "source_text", "target_text", "speech_text"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "cue_ids": { "type": "array", "items": { "type": "string" } },
+        "start_ms": { "$ref": "#/$defs/milliseconds" },
+        "end_ms": { "$ref": "#/$defs/milliseconds" },
+        "source_text": { "type": "string" },
+        "target_text": { "type": "string" },
+        "speech_text": { "type": "string" },
+        "budget_ms": { "$ref": "#/$defs/milliseconds" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,56 @@
+{
+  "review_id": "fixture-subtitle",
+  "revision": "r1",
+  "workflow": {
+    "kind": "subtitle",
+    "label": "Subtitle review fixture"
+  },
+  "subtitle_policy": {
+    "display_punctuation": "stripped_before_framecue",
+    "speech_punctuation": "preserved"
+  },
+  "scenes": [
+    {
+      "id": "s0001",
+      "start_ms": 0,
+      "end_ms": 3000,
+      "image": "assets/scene.svg"
+    }
+  ],
+  "cues": [
+    {
+      "id": "c0001",
+      "start_ms": 0,
+      "end_ms": 1500,
+      "scene_id": "s0001",
+      "original_text": "OpenClaw keeps the review step explicit.",
+      "text": "OpenClaw 把審稿這一步保留下來",
+      "speech_text": "OpenClaw 把審稿這一步保留下來。",
+      "risks": ["OpenClaw"]
+    },
+    {
+      "id": "c0002",
+      "start_ms": 1500,
+      "end_ms": 3000,
+      "scene_id": "s0001",
+      "original_text": "The reviewer approves a complete revision.",
+      "text": "審稿者確認的是完整 revision",
+      "speech_text": "審稿者確認的是完整 revision。"
+    }
+  ],
+  "blocks": [
+    {
+      "id": "b0001",
+      "cue_ids": ["c0001", "c0002"],
+      "start_ms": 0,
+      "end_ms": 3000,
+      "budget_ms": 3000,
+      "source_text": "OpenClaw keeps the review step explicit. The reviewer approves a complete revision.",
+      "target_text": "OpenClaw 把審稿這一步保留下來 審稿者確認的是完整 revision",
+      "speech_text": "OpenClaw 把審稿這一步保留下來。審稿者確認的是完整 revision。"
+    }
+  ],
+  "provenance": {
+    "fixture": "basic"
+  }
+}

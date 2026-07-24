@@ -1,147 +1,164 @@
 # FrameCue
 
-FrameCue is a small offline subtitle review tool for dubbed video workflows.
+FrameCue is a portable static human-review runtime for media-aligned content.
+It is the review gate between upstream content generation and downstream work
+such as TTS, rendering, image regeneration, or publishing.
 
-It builds a portable browser review package from:
+FrameCue v2 owns the review package, static viewer, draft isolation, final
+approval, and full result export. It does not translate, synthesize speech,
+retime media, render video, or call an AI provider.
 
-- a video
-- target subtitles
-- optional original-language subtitles
-- optional per-cue TTS audio
+## v2 Quick Start
 
-The generated viewer lets reviewers step through cues with representative scene frames, inspect bilingual subtitle overlays, play each cue audio, add prompt notes, edit subtitles, and export a change list.
-
-## Requirements
-
-- Python 3.9+
-- FFmpeg available on `PATH`
-
-No Python packages are required.
-
-## Build A Review Package
+Build the viewer once from this pinned source checkout:
 
 ```bash
-./framecue.py \
-  --video input.mp4 \
-  --subtitle target.srt \
-  --original-subtitle original.srt \
-  --cue-audio-template 'audio/seg_{id:04d}.wav' \
-  --out-dir review
+npm install
+npm run build
 ```
 
-Then serve the folder:
+Build an immutable review bundle from a v2 source JSON:
 
 ```bash
-cd review
-python3 -m http.server 8000
+python3 framecue.py build \
+  --input package.source.json \
+  --out-dir review-r1
 ```
 
-Open:
+The output is self-contained:
 
 ```text
-http://localhost:8000
+review-r1/
+  index.html
+  assets/
+  review_package.json
 ```
 
-## Review Multiple Videos
+Serve it with byte-range support when HyperFrames is present:
 
-Put each review package in its own folder and add `framecue_manifest.json` beside `index.html`:
+```bash
+python3 framecue.py serve --dir review-r1 --port 3069
+```
+
+The reviewer exports one `framecue_review_result_v1` JSON snapshot. Validate
+and retain an approved result before downstream work begins:
+
+```bash
+python3 framecue.py collect \
+  --package review-r1/review_package.json \
+  --result ~/Downloads/framecue_review_result.json \
+  --out approved-review-result.json
+```
+
+`collect` rejects a stale checksum, wrong revision, incomplete snapshot, or
+unapproved result.
+
+## Contract
+
+`framecue_package_v2` is immutable and records:
+
+- stable `review_id`, immutable `revision`, viewer version, and SHA-256 content checksum;
+- relative media assets, scenes, cues, optional semantic blocks, and pronunciation risks;
+- punctuation policy, provenance, and previous-revision lineage.
+
+`framecue_review_result_v1` is a complete snapshot of every cue and block,
+with the selected follow-up action:
+
+- `use_edit`
+- `rewrite`
+- `resegment`
+- `retime`
+
+When blocks exist, they own meaning and `speech_text`; cues own review display
+segmentation. Cue timings are read-only. Each block can be approved, then the
+package receives one final approval. Any content edit invalidates final
+approval.
+
+Schemas live in [schemas](schemas/).
+
+## Supported Workflows
+
+v2 supports one contract across four current review modes:
+
+1. Cue and semantic-block subtitle review.
+2. Redraw before/after review with generation trace.
+3. Subtitle-boundary review.
+4. HyperFrames playback review.
+
+The viewer switches media stage mode without changing the review data model.
+Risk and All are cue filters, not separate viewer implementations.
+
+## Multi-Package Review
+
+Build individual bundles first, then create a dashboard without shared drafts:
+
+```bash
+python3 framecue.py manifest \
+  --out-dir review-dashboard \
+  --item openclaw=/path/to/openclaw-review-r1 \
+  --item computex=/path/to/computex-review-r1
+```
+
+Each package keeps its own review ID, revision, checksum-bound browser draft,
+and exported result.
+
+## HyperFrames
+
+For a portable HyperFrames package, the source JSON declares a project bundle:
 
 ```json
 {
-  "items": [
-    {
-      "id": "openclaw",
-      "label": "OpenClaw",
-      "review_package": "openclaw/review_package.json",
-      "semantic_blocks": "openclaw/semantic_blocks/semantic_blocks.json"
-    },
-    {
-      "id": "video-2",
-      "label": "Video 2",
-      "review_package": "video-2/review_package.json",
-      "semantic_blocks": null
+  "media": {
+    "hyperframes": {
+      "source_dir": "/path/to/hyperframes",
+      "config": "review-player.json"
     }
-  ]
+  }
 }
 ```
 
-FrameCue adds a review-file selector. Frames and audio are resolved relative to each `review_package.json`; browser drafts and exported filenames are kept separate by item `id`.
+FrameCue copies that directory and injects its generic player adapter. The
+project provides only composition, narration, assets, and `review-player.json`.
+The adapter and FrameCue viewer remain same-origin and synchronize by playback
+time.
 
-## Review A HyperFrames Timeline
+## v1 Compatibility
 
-Add an optional `review_player` object to a manifest item when the review package has a same-origin HyperFrames Review Player:
+Existing v1 review directories remain usable because they already contain their
+own viewer. FrameCue v2 intentionally does not load a v1 package in the v2
+viewer.
 
-```json
-{
-  "items": [
-    {
-      "id": "computex-2026",
-      "label": "COMPUTEX 2026",
-      "review_package": "review/framecue/review_package.json",
-      "semantic_blocks": "review/framecue/semantic_blocks/semantic_blocks.json",
-      "review_player": {
-        "type": "hyperframes",
-        "src": "hyperframes/player.html"
-      }
-    }
-  ]
-}
-```
-
-The `review_player.src` path is relative to the FrameCue page. Serve a common project root so the FrameCue page and Player share one origin. The viewer keeps Still as the default and shows a Still/Video control only for items with a valid Player; Cue and Block editing stay available in both stage modes.
-
-Use a static server that supports HTTP byte-range requests. Range support is required for reliable seeking in the Player's narration audio; Python 3.9's basic `http.server` is not sufficient for this mode. For example:
+Create a new v2 revision explicitly when needed:
 
 ```bash
-miniserve --interfaces 127.0.0.1 --port 3073 /path/to/project-root
+python3 framecue.py migrate-v1 \
+  --package old-review/review_package.json \
+  --semantic-blocks old-review/semantic_blocks/semantic_blocks.json \
+  --review-id openclaw-interpreter \
+  --revision r1 \
+  --out-dir openclaw-framecue-v2-r1
 ```
 
-Player configuration and the same-origin message contract are documented in the [implementation note](docs/hyperframes-review-implementation-note.md).
-
-## Audio Options
-
-Prefer per-cue audio when available:
+The frozen v1 builder remains available only for historical package recovery:
 
 ```bash
---cue-audio-template 'audio/seg_{id:04d}.wav'
+python3 framecue.py legacy-build -- --video input.mp4 --subtitle target.srt --out-dir v1-review
 ```
 
-Fallback to cutting from a full audio track:
+Its source lives in [legacy](legacy/); it is not the v2 runtime.
+
+## Development Checks
 
 ```bash
---audio-source dubbed_audio.wav
+npm run build
+python3 -m unittest discover -s tests -v
+python3 framecue.py self-check
 ```
 
-Per-cue audio is more accurate for pronunciation review.
-
-## Hotkeys
-
-- `←` / `↑`: previous cue
-- `→` / `↓`: next cue
-- `Space`: play or pause current cue
-
-## Outputs
-
-The review package contains:
-
-- `index.html`
-- `review_package.json`
-- `frames/*.jpg`
-- `audio/*.mp3` when audio is provided
-
-The browser viewer can download:
-
-- `edited_subtitles.srt`
-- `subtitle_change_list.json`
-- `edited_review_package.json`
-
-`subtitle_change_list.json` includes only cues with changed subtitles or prompt notes.
-
-## Name
-
-FrameCue means: review each subtitle cue against a representative video frame.
+The test fixtures cover subtitle, redraw, boundary, and HyperFrames bundles.
 
 ## Architecture Notes
 
+- [FrameCue v2 refactor implementation note](docs/framecue-v2-refactor-implementation-note.md)
 - [HyperFrames Review Player integration proposal](docs/hyperframes-review-integration.md)
 - [HyperFrames Review Player implementation note](docs/hyperframes-review-implementation-note.md)

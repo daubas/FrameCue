@@ -1,0 +1,39 @@
+{
+  "review_id": "fixture-boundary",
+  "revision": "r1",
+  "workflow": {
+    "kind": "boundary",
+    "label": "Boundary review fixture"
+  },
+  "subtitle_policy": {
+    "display_punctuation": "stripped_before_framecue",
+    "speech_punctuation": "preserved"
+  },
+  "scenes": [
+    {
+      "id": "s0001",
+      "start_ms": 0,
+      "end_ms": 1500,
+      "image": "assets/frame.svg",
+      "boundary": {
+        "before_image": "assets/before.svg",
+        "after_image": "assets/after.svg"
+      }
+    }
+  ],
+  "cues": [
+    {
+      "id": "c0001",
+      "start_ms": 240,
+      "end_ms": 1320,
+      "scene_id": "s0001",
+      "original_text": "A boundary should follow the spoken phrase.",
+      "text": "字幕邊界要跟著完整語意",
+      "speech_text": "字幕邊界要跟著完整語意。"
+    }
+  ],
+  "blocks": [],
+  "provenance": {
+    "fixture": "boundary"
+  }
+}

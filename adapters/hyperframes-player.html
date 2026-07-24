@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HyperFrames Review Player</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; margin: 0; background: #111410; color: #f7f3e8; font-family: Arial, sans-serif; }
+    body { display: grid; min-height: 100vh; grid-template-rows: 1fr auto; overflow: hidden; }
+    .stage-shell { display: grid; min-height: 0; place-items: center; padding: 14px 16px 8px; }
+    .stage {
+      position: relative;
+      width: min(56.25vh, calc(100vw - 32px));
+      max-width: var(--composition-width, 1080px);
+      aspect-ratio: var(--composition-width-number, 1080) / var(--composition-height-number, 1920);
+      overflow: hidden;
+      border: 1px solid #343b31;
+      border-radius: 6px;
+      background: #0b0d0b;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, .35);
+    }
+    iframe {
+      position: absolute;
+      inset: 0 auto auto 0;
+      width: var(--composition-width, 1080px);
+      height: var(--composition-height, 1920px);
+      border: 0;
+      transform: scale(var(--scale, .4));
+      transform-origin: top left;
+      pointer-events: none;
+    }
+    .player-state {
+      position: absolute;
+      inset: 0;
+      z-index: 2;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: rgba(11, 13, 11, .92);
+      color: #d4dccd;
+      text-align: center;
+      pointer-events: none;
+    }
+    .player-state[hidden] { display: none; }
+    .player-state.error { color: #ffb4b4; }
+    .controls {
+      display: grid;
+      grid-template-columns: auto auto auto minmax(160px, 1fr) minmax(150px, 220px) auto;
+      align-items: center;
+      gap: 10px;
+      width: min(960px, calc(100vw - 24px));
+      margin: 0 auto;
+      padding: 10px 0 14px;
+    }
+    button,
+    select {
+      height: 40px;
+      min-width: 0;
+      border: 1px solid #3b4338;
+      border-radius: 6px;
+      background: #1d211b;
+      color: #f7f3e8;
+      font: inherit;
+    }
+    button { width: 44px; padding: 0; font-size: 18px; cursor: pointer; }
+    button:hover { border-color: #76b900; color: #c9f875; }
+    button:focus-visible,
+    select:focus-visible,
+    input:focus-visible { outline: 2px solid #76b900; outline-offset: 2px; }
+    select { width: 100%; padding: 0 34px 0 12px; }
+    input[type="range"] { width: 100%; accent-color: #76b900; }
+    .time { min-width: 116px; color: #d4dccd; font-variant-numeric: tabular-nums; text-align: right; }
+    audio { display: none; }
+    @media (max-width: 720px) {
+      .stage-shell { padding: 6px 6px 4px; }
+      .stage { width: min(56.25vh, calc(100vw - 12px)); }
+      .controls {
+        grid-template-columns: auto minmax(110px, 1fr) minmax(100px, 160px) auto;
+        gap: 6px;
+        width: calc(100vw - 12px);
+        padding: 6px 0 8px;
+      }
+      .jump-back,
+      .jump-forward { display: none; }
+      .time { min-width: 92px; font-size: 13px; }
+    }
+    @media (max-width: 420px) {
+      .controls {
+        grid-template-areas:
+          "play scrub time"
+          "scene scene scene";
+        grid-template-columns: auto minmax(0, 1fr) auto;
+      }
+      #play { grid-area: play; }
+      #scrub { grid-area: scrub; }
+      #scene { grid-area: scene; }
+      #time { grid-area: time; }
+    }
+  </style>
+</head>
+<body>
+  <div class="stage-shell">
+    <div class="stage" id="stage">
+      <iframe id="composition" title="HyperFrames composition"></iframe>
+      <div id="playerState" class="player-state">Loading player</div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="play" type="button" title="播放或暫停" aria-label="播放或暫停">▶</button>
+    <button class="jump-back" id="back" type="button" title="倒退五秒" aria-label="倒退五秒">↺</button>
+    <button class="jump-forward" id="forward" type="button" title="前進五秒" aria-label="前進五秒">↻</button>
+    <input id="scrub" type="range" min="0" max="0" step="0.01" value="0" aria-label="時間軸">
+    <select id="scene" aria-label="切換場景" disabled><option>Timeline</option></select>
+    <div class="time" id="time">00:00 / 00:00</div>
+  </div>
+
+  <audio id="audio" preload="auto"></audio>
+
+  <script>
+    (function () {
+      "use strict";
+
+      var stage = document.getElementById("stage");
+      var frame = document.getElementById("composition");
+      var audio = document.getElementById("audio");
+      var playButton = document.getElementById("play");
+      var scrub = document.getElementById("scrub");
+      var scene = document.getElementById("scene");
+      var time = document.getElementById("time");
+      var playerState = document.getElementById("playerState");
+      var params = new URLSearchParams(window.location.search);
+      var configUrl = new URL(params.get("config") || "review-player.json", window.location.href);
+      var parentOrigin = window.location.origin;
+      var timeline = null;
+      var frameVideos = [];
+      var duration = 0;
+      var width = 1080;
+      var height = 1920;
+      var scenes = [];
+      var ready = false;
+      var failed = false;
+      var raf = null;
+      var lastTimeMessage = 0;
+      var pendingTime = null;
+      var pendingPlay = false;
+
+      function playerError(code, message) {
+        var error = new Error(message);
+        error.code = code;
+        return error;
+      }
+
+      function send(type, payload) {
+        if (window.parent === window) return;
+        window.parent.postMessage(Object.assign({ type: type }, payload || {}), parentOrigin);
+      }
+
+      function setState(message, isError) {
+        playerState.textContent = message || "";
+        playerState.hidden = !message;
+        playerState.classList.toggle("error", Boolean(isError));
+      }
+
+      function reportError(error) {
+        if (failed) return;
+        failed = true;
+        ready = false;
+        pause(false);
+        document.documentElement.dataset.playerReady = "false";
+        document.documentElement.dataset.playerError = error.code || "player_unavailable";
+        setState("Player unavailable: " + (error.code || "player_unavailable"), true);
+        playerState.title = error.message || "Review Player could not start";
+        send("hyperframes:error", {
+          code: error.code || "player_unavailable",
+          message: error.message || "Review Player could not start"
+        });
+      }
+
+      function format(seconds) {
+        var whole = Math.max(0, Math.floor(Number(seconds) || 0));
+        var minutes = Math.floor(whole / 60);
+        var remainder = whole % 60;
+        return String(minutes).padStart(2, "0") + ":" + String(remainder).padStart(2, "0");
+      }
+
+      function clamp(seconds) {
+        if (!duration) return 0;
+        return Math.max(.001, Math.min(duration - .001, Number(seconds) || 0));
+      }
+
+      function fit() {
+        var shell = stage.parentElement;
+        var ratio = width / height;
+        var stageWidth = Math.min(shell.clientWidth - 32, (shell.clientHeight - 22) * ratio, width);
+        stageWidth = Math.max(1, stageWidth);
+        stage.style.width = stageWidth + "px";
+        stage.style.height = (stageWidth / ratio) + "px";
+        var scale = Math.min(stage.clientWidth / width, stage.clientHeight / height);
+        frame.style.setProperty("--scale", String(scale || 1));
+      }
+
+      function selectScene(seconds) {
+        if (!scenes.length) return;
+        var selectedIndex = 0;
+        scenes.forEach(function (item, index) {
+          if (seconds >= item.start) selectedIndex = index;
+        });
+        scene.selectedIndex = selectedIndex;
+      }
+
+      function renderTime(seconds) {
+        if (!timeline) return;
+        var target = clamp(seconds);
+        timeline.seek(target);
+        syncFrameVideos(target, !audio.paused && !audio.ended, false);
+        scrub.value = String(target);
+        selectScene(target);
+        time.textContent = format(target) + " / " + format(duration);
+      }
+
+      function emitTime(force) {
+        if (!ready) return;
+        var now = performance.now();
+        if (!force && now - lastTimeMessage < 50) return;
+        lastTimeMessage = now;
+        send("hyperframes:timeupdate", {
+          time: audio.currentTime,
+          playing: !audio.paused && !audio.ended
+        });
+      }
+
+      function syncFrameVideos(seconds, playing, force) {
+        frameVideos.forEach(function (media) {
+          if (media.readyState < 1) return;
+          var start = Number(media.dataset.start) || 0;
+          var clipDuration = Number(media.dataset.duration) || media.duration;
+          var mediaStart = Number(media.dataset.mediaStart || media.dataset.playbackStart) || 0;
+          var active = seconds >= start && seconds < start + clipDuration;
+          var local = Math.max(mediaStart, Math.min(mediaStart + clipDuration - (1 / 30), seconds - start + mediaStart));
+          var edge = Math.min(.16, clipDuration / 4);
+          var opacity = active ? Math.min(1, (seconds - start) / edge, (start + clipDuration - seconds) / edge) : 0;
+
+          media.style.display = active ? "block" : "none";
+          media.style.opacity = String(Math.max(0, opacity));
+
+          if (force || !playing || Math.abs(media.currentTime - local) > .12) {
+            try { media.currentTime = local; } catch (_) {}
+          }
+
+          if (active && playing) {
+            if (media.paused) media.play().catch(function () {});
+          } else if (!media.paused) {
+            media.pause();
+          }
+        });
+      }
+
+      function seek(seconds, notify) {
+        if (!ready) {
+          pendingTime = Number(seconds) || 0;
+          return;
+        }
+        var target = clamp(seconds);
+        audio.currentTime = target;
+        renderTime(target);
+        if (notify !== false) emitTime(true);
+      }
+
+      function followAudio() {
+        renderTime(audio.currentTime);
+        emitTime(false);
+        if (!audio.paused && !audio.ended) raf = requestAnimationFrame(followAudio);
+      }
+
+      function pause(notify) {
+        audio.pause();
+        if (timeline && typeof timeline.pause === "function") timeline.pause();
+        syncFrameVideos(audio.currentTime, false, true);
+        if (raf) cancelAnimationFrame(raf);
+        raf = null;
+        playButton.textContent = "▶";
+        if (notify !== false) emitTime(true);
+      }
+
+      function play() {
+        if (!ready) {
+          pendingPlay = true;
+          return;
+        }
+        if (audio.ended || audio.currentTime >= duration) seek(0, false);
+        setState("", false);
+        audio.play().then(function () {
+          if (timeline && typeof timeline.play === "function") timeline.play();
+          syncFrameVideos(audio.currentTime, true, true);
+          playButton.textContent = "Ⅱ";
+          if (raf) cancelAnimationFrame(raf);
+          raf = requestAnimationFrame(followAudio);
+          emitTime(true);
+        }).catch(function () {
+          setState("Press play to continue", false);
+        });
+      }
+
+      function jump(seconds) {
+        seek(audio.currentTime + seconds, true);
+      }
+
+      function configure(config) {
+        if (!config || typeof config !== "object") throw playerError("config_invalid", "Player config must be an object");
+        if (!config.composition || !config.audio) throw playerError("config_invalid", "Player config requires composition and audio");
+        width = Number(config.width);
+        height = Number(config.height);
+        if (!(width > 0) || !(height > 0)) throw playerError("config_invalid", "Player config requires positive width and height");
+        scenes = Array.isArray(config.scenes) ? config.scenes.map(function (item, index) {
+          return {
+            id: String(item.id || "scene-" + (index + 1)),
+            label: String(item.label || item.id || "Scene " + (index + 1)),
+            start: Math.max(0, Number(item.start) || 0)
+          };
+        }).sort(function (a, b) { return a.start - b.start; }) : [];
+
+        stage.style.setProperty("--stage-ratio", String(width / height));
+        stage.style.setProperty("--composition-width", width + "px");
+        stage.style.setProperty("--composition-height", height + "px");
+        stage.style.setProperty("--composition-width-number", String(width));
+        stage.style.setProperty("--composition-height-number", String(height));
+        frame.style.setProperty("--composition-width", width + "px");
+        frame.style.setProperty("--composition-height", height + "px");
+        frame.width = width;
+        frame.height = height;
+
+        scene.innerHTML = scenes.length ? scenes.map(function (item) {
+          return '<option value="' + item.start + '">' + escapeHtml(item.label) + "</option>";
+        }).join("") : "<option>Timeline</option>";
+        scene.disabled = !scenes.length;
+        return {
+          composition: new URL(config.composition, configUrl).href,
+          audio: new URL(config.audio, configUrl).href
+        };
+      }
+
+      function escapeHtml(value) {
+        return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+      }
+
+      function waitForComposition(src) {
+        return new Promise(function (resolve, reject) {
+          var poll = null;
+          var attempts = 0;
+
+          function finish() {
+            if (poll) clearInterval(poll);
+            poll = null;
+          }
+
+          function checkTimeline() {
+            try {
+              timeline = frame.contentWindow.__hf;
+              if (!timeline || typeof timeline.seek !== "function") return;
+              finish();
+              Array.prototype.forEach.call(frame.contentDocument.querySelectorAll("audio, video"), function (media) {
+                media.pause();
+                media.muted = true;
+              });
+              frameVideos = Array.prototype.slice.call(frame.contentDocument.querySelectorAll("video.clip[data-start]"));
+              frameVideos.forEach(function (media) {
+                media.addEventListener("loadedmetadata", function () {
+                  syncFrameVideos(audio.currentTime || 0, false, true);
+                });
+              });
+              syncFrameVideos(audio.currentTime || 0, false, true);
+              if (frame.contentDocument.fonts) {
+                frame.contentDocument.fonts.ready.then(function () {
+                  document.documentElement.dataset.compositionFontsReady = "true";
+                });
+              }
+              resolve();
+            } catch (error) {
+              finish();
+              reject(error.code ? error : playerError("composition_unavailable", error.message));
+            }
+          }
+
+          frame.addEventListener("error", function () {
+            finish();
+            reject(playerError("composition_unavailable", "Composition failed to load"));
+          }, { once: true });
+          frame.src = src;
+          poll = setInterval(function () {
+            attempts += 1;
+            checkTimeline();
+            if (attempts >= 200 && poll) {
+              finish();
+              reject(playerError("timeline_unavailable", "Composition did not expose __hf.seek"));
+            }
+          }, 50);
+          checkTimeline();
+        });
+      }
+
+      function waitForAudio(src) {
+        return new Promise(function (resolve, reject) {
+          audio.addEventListener("loadedmetadata", function () {
+            duration = audio.duration;
+            if (!Number.isFinite(duration) || duration <= 0) {
+              reject(playerError("audio_invalid", "Narration duration is invalid"));
+              return;
+            }
+            resolve();
+          }, { once: true });
+          audio.addEventListener("error", function () {
+            reject(playerError("audio_unavailable", "Narration audio failed to load"));
+          }, { once: true });
+          audio.src = src;
+          audio.load();
+        });
+      }
+
+      function withTimeout(promise, milliseconds) {
+        return Promise.race([
+          promise,
+          new Promise(function (_, reject) {
+            setTimeout(function () {
+              reject(playerError("ready_timeout", "Review Player readiness timed out"));
+            }, milliseconds);
+          })
+        ]);
+      }
+
+      function receive(event) {
+        if (event.source !== window.parent || event.origin !== parentOrigin || !event.data) return;
+        if (event.data.type === "framecue:seek") {
+          seek(event.data.time, true);
+        } else if (event.data.type === "framecue:play") {
+          if (Number.isFinite(Number(event.data.time))) seek(Number(event.data.time), false);
+          play();
+        } else if (event.data.type === "framecue:pause") {
+          pendingPlay = false;
+          pause(true);
+        }
+      }
+
+      async function boot() {
+        try {
+          var response = await fetch(configUrl.href);
+          if (!response.ok) throw playerError("config_unavailable", "Unable to load " + configUrl.pathname);
+          var assets = configure(await response.json());
+          await withTimeout(Promise.all([
+            waitForComposition(assets.composition).then(function () {
+              document.documentElement.dataset.compositionReady = "true";
+            }),
+            waitForAudio(assets.audio).then(function () {
+              document.documentElement.dataset.audioReady = "true";
+            })
+          ]), 10000);
+          ready = true;
+          scrub.max = String(duration);
+          document.documentElement.dataset.playerReady = "true";
+          document.documentElement.dataset.playerDuration = String(duration);
+          setState("", false);
+          fit();
+
+          var requested = params.has("t") ? Number(params.get("t")) : NaN;
+          var initial = Number.isFinite(requested) ? requested : (scenes[0] ? scenes[0].start : 0);
+          seek(pendingTime === null ? initial : pendingTime, false);
+          send("hyperframes:ready", { duration: duration, width: width, height: height });
+          emitTime(true);
+          if (pendingPlay) play();
+        } catch (error) {
+          reportError(error);
+        }
+      }
+
+      window.addEventListener("message", receive);
+      window.addEventListener("resize", fit);
+      playButton.addEventListener("click", function () { audio.paused ? play() : pause(true); });
+      document.getElementById("back").addEventListener("click", function () { jump(-5); });
+      document.getElementById("forward").addEventListener("click", function () { jump(5); });
+      scrub.addEventListener("input", function () { seek(Number(scrub.value), true); });
+      scene.addEventListener("change", function () { seek(Number(scene.value), true); });
+      audio.addEventListener("ended", function () { pause(true); });
+      document.addEventListener("keydown", function (event) {
+        if (["SELECT", "INPUT", "BUTTON"].includes(event.target.tagName)) return;
+        if (event.code === "Space") {
+          event.preventDefault();
+          audio.paused ? play() : pause(true);
+        } else if (event.code === "ArrowLeft") {
+          jump(-5);
+        } else if (event.code === "ArrowRight") {
+          jump(5);
+        }
+      });
+
+      fit();
+      boot();
+    }());
+  </script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://framecue.dev/schemas/framecue-review-result-v1.schema.json",
+  "title": "FrameCue review result v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "review_id",
+    "revision",
+    "package_checksum",
+    "viewer_version",
+    "status",
+    "blocks",
+    "cues"
+  ],
+  "properties": {
+    "schema_version": { "const": "framecue_review_result_v1" },
+    "review_id": { "type": "string" },
+    "revision": { "type": "string" },
+    "package_checksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "viewer_version": { "type": "string" },
+    "status": { "enum": ["draft", "approved"] },
+    "approved_at": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "blocks": { "type": "array", "items": { "$ref": "#/$defs/block" } },
+    "cues": { "type": "array", "items": { "$ref": "#/$defs/cue" } }
+  },
+  "$defs": {
+    "action": { "enum": ["use_edit", "rewrite", "resegment", "retime"] },
+    "block": {
+      "type": "object",
+      "required": ["id", "target_text", "speech_text", "action", "instruction", "approved"],
+      "properties": {
+        "id": { "type": "string" },
+        "target_text": { "type": "string" },
+        "speech_text": { "type": "string" },
+        "action": { "$ref": "#/$defs/action" },
+        "instruction": { "type": "string" },
+        "approved": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "cue": {
+      "type": "object",
+      "required": ["id", "text", "speech_text", "action", "instruction"],
+      "properties": {
+        "id": { "type": "string" },
+        "text": { "type": "string" },
+        "speech_text": { "type": "string" },
+        "action": { "$ref": "#/$defs/action" },
+        "instruction": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

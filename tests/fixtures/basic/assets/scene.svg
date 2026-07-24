@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
+  <rect width="1280" height="720" fill="#25443c"/>
+  <rect x="92" y="90" width="1096" height="540" rx="18" fill="#d8e3ce"/>
+  <text x="148" y="240" fill="#25443c" font-family="Arial, sans-serif" font-size="72" font-weight="700">FrameCue</text>
+  <text x="148" y="335" fill="#48655b" font-family="Arial, sans-serif" font-size="40">immutable review fixture</text>
+</svg>

@@ -1,0 +1,13 @@
+{
+  "composition": "composition.html",
+  "audio": "assets/narration.wav",
+  "width": 1080,
+  "height": 1920,
+  "scenes": [
+    {
+      "id": "scene-01",
+      "label": "Fixture scene",
+      "start": 0
+    }
+  ]
+}

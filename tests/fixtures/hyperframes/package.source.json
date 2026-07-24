@@ -1,0 +1,41 @@
+{
+  "review_id": "fixture-hyperframes",
+  "revision": "r1",
+  "workflow": {
+    "kind": "hyperframes",
+    "label": "HyperFrames review fixture"
+  },
+  "subtitle_policy": {
+    "display_punctuation": "stripped_before_framecue",
+    "speech_punctuation": "preserved"
+  },
+  "media": {
+    "hyperframes": {
+      "source_dir": "hyperframes",
+      "config": "review-player.json"
+    }
+  },
+  "scenes": [
+    {
+      "id": "s0001",
+      "start_ms": 0,
+      "end_ms": 1000,
+      "image": "assets/frame.svg"
+    }
+  ],
+  "cues": [
+    {
+      "id": "c0001",
+      "start_ms": 0,
+      "end_ms": 1000,
+      "scene_id": "s0001",
+      "original_text": "The audio clock drives the composition.",
+      "text": "音訊時鐘帶動畫面",
+      "speech_text": "音訊時鐘帶動畫面。"
+    }
+  ],
+  "blocks": [],
+  "provenance": {
+    "fixture": "hyperframes"
+  }
+}
