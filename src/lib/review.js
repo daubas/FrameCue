@@ -98,10 +98,41 @@ export function mergeDraft(packageData, savedDraft) {
   return fresh;
 }
 
-export function withCueChange(draft, cueId, patch) {
+export function contentKey(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[\p{P}\p{Z}\s]/gu, "");
+}
+
+export function blockContentIssue(packageData, draft, blockId) {
+  const block = packageData.blocks.find((item) => item.id === blockId);
+  const state = draft.blocks[blockId];
+  if (!block || !state) return "";
+  const cueText = block.cue_ids.map((cueId) => draft.cues[cueId]?.text || "").join(" ");
+  if (contentKey(state.target_text) !== contentKey(cueText)) {
+    return "Display text differs from its Cues. Reconcile the Block before approval.";
+  }
+  if (contentKey(state.speech_text) !== contentKey(state.target_text)) {
+    return "Speech text differs from display content. Reconcile it before approval.";
+  }
+  return "";
+}
+
+export function withCueChange(packageData, draft, cueId, patch) {
+  const cues = { ...draft.cues, [cueId]: { ...draft.cues[cueId], ...patch } };
+  const blocks = { ...draft.blocks };
+  for (const block of packageData.blocks.filter((item) => item.cue_ids.includes(cueId))) {
+    blocks[block.id] = {
+      ...blocks[block.id],
+      target_text: block.cue_ids.map((childId) => cues[childId]?.text || "").join(" ").trim(),
+      approved: false
+    };
+  }
   return {
     ...draft,
-    cues: { ...draft.cues, [cueId]: { ...draft.cues[cueId], ...patch } },
+    cues,
+    blocks,
     final_approval: null
   };
 }
@@ -117,7 +148,8 @@ export function withBlockChange(draft, blockId, patch) {
   };
 }
 
-export function withBlockApproval(draft, blockId, approved) {
+export function withBlockApproval(packageData, draft, blockId, approved) {
+  if (approved && blockContentIssue(packageData, draft, blockId)) return draft;
   return {
     ...draft,
     blocks: {
@@ -129,7 +161,9 @@ export function withBlockApproval(draft, blockId, approved) {
 }
 
 export function finalApprovalAllowed(packageData, draft) {
-  return !packageData.blocks.length || packageData.blocks.every((block) => draft.blocks[block.id]?.approved);
+  return !packageData.blocks.length || packageData.blocks.every((block) =>
+    draft.blocks[block.id]?.approved && !blockContentIssue(packageData, draft, block.id)
+  );
 }
 
 export function makeResult(packageData, draft, approvedAt = "") {

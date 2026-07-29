@@ -60,6 +60,18 @@ class FrameCueV2Tests(unittest.TestCase):
             framecue.validate_result(result, package, require_approved=True)
         self.assertTrue((out_dir / "review_package.json").is_file())
 
+    def test_approved_result_rejects_cue_block_speech_divergence(self):
+        _, package, _ = self.build_fixture("basic")
+        result = framecue.default_result(package, approved=True)
+        result["cues"][0]["text"] = "OpenClaw 改成另一段字幕"
+        with self.assertRaisesRegex(framecue.FrameCueError, "does not match its cues"):
+            framecue.validate_result(result, package, require_approved=True)
+
+        result = framecue.default_result(package, approved=True)
+        result["blocks"][0]["speech_text"] = "這是沒有同步的舊語音。"
+        with self.assertRaisesRegex(framecue.FrameCueError, "speech_text does not match"):
+            framecue.validate_result(result, package, require_approved=True)
+
     def test_no_block_result_keeps_cue_speech_text(self):
         out_dir, package, _ = self.build_fixture("redraw")
         package["blocks"] = []

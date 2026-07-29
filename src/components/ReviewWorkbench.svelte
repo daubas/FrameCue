@@ -5,6 +5,7 @@
   export let draft;
   export let selectedCue;
   export let selectedBlock;
+  export let blockIssue = "";
   export let activeScope;
   export let cueFilter;
   export let playbackCueId = "";
@@ -94,6 +95,9 @@
           <span>Speech text <span class="info" title="This punctuated interpretation text is the TTS-facing wording, not the subtitle overlay.">!</span></span>
           <textarea value={selectedBlockState.speech_text} on:input={(event) => onBlockChange(selectedBlock.id, { speech_text: event.currentTarget.value })}></textarea>
         </label>
+        {#if blockIssue}
+          <p class="validation-message" role="alert">{blockIssue}</p>
+        {/if}
         <label class="compact-field">
           <span>Follow-up action <span class="info" title="FrameCue records the request. AgenticDub performs any rewrite, resegmentation, or retiming in a new revision.">!</span></span>
           <select value={selectedBlockState.action} on:change={(event) => onBlockChange(selectedBlock.id, { action: event.currentTarget.value })}>
@@ -106,7 +110,7 @@
           <span>Instruction</span>
           <textarea class="short-textarea" value={selectedBlockState.instruction} placeholder="What should upstream change?" on:input={(event) => onBlockChange(selectedBlock.id, { instruction: event.currentTarget.value })}></textarea>
         </label>
-        <button class:approved={selectedBlockState.approved} class="approve-button" type="button" on:click={() => onBlockApproval(selectedBlock.id, !selectedBlockState.approved)}>
+        <button class:approved={selectedBlockState.approved} class="approve-button" disabled={Boolean(blockIssue) && !selectedBlockState.approved} type="button" on:click={() => onBlockApproval(selectedBlock.id, !selectedBlockState.approved)}>
           {selectedBlockState.approved ? "Unapprove block" : "Approve block"}
         </button>
       </div>

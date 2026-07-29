@@ -1,6 +1,6 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: implementation complete; release pinned at `v2.0.0`
+Status: implementation complete; consistency release pinned at `v2.1.0`
 Last updated: 2026-07-24
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
@@ -85,6 +85,8 @@ The result snapshot repeats the package identity, records final approval state, 
 
 - When semantic blocks exist, blocks own meaning and speech text.
 - AgenticDub projects approved block content into display cues.
+- Final approval requires each block's normalized `target_text`, child Cue display text, and `speech_text` to contain the same content; punctuation may differ.
+- Editing or replacing a Cue invalidates its parent block approval. The CLI repeats the invariant check when collecting an approved result.
 - Cues review display wording and visual segmentation; cue timing remains read-only in FrameCue v2.
 - Editing a block invalidates that block's approval and final package approval. Any cues derived from the old block are stale and must be regenerated in a new revision.
 - There is no formal per-cue approval. Blocks may be approved individually, followed by one final package approval.
@@ -287,3 +289,9 @@ Each implementation phase must leave the smallest runnable check that proves its
 - Added eight focused Python checks covering all four workflows, immutable checksum validation, complete approved snapshots, no-block cue `speech_text`, manifest assembly, and v1 migration.
 - Built and validated a real AgenticDub OpenClaw bundle and a real HyperFrames bundle. AgenticDub now requires the exact `v2.0.0` FrameCue tag before building or consuming a v2 result.
 - The local browser runtime was unavailable for interactive screenshots. Static builds, bundled asset checks, byte-range checks, CLI validation, and cross-project result validation passed; visual browser QA remains the only follow-up release check.
+
+### 2026-07-29
+
+- Added the `v2.1.0` consistency gate after production review found that independently editable Cue and Block text could authorize stale TTS wording.
+- Cue edits now invalidate the parent block, browser approval checks normalized Cue/Block/Speech content, and the CLI repeats that validation at collection time.
+- Added one native Node state-transition test and one Python approved-result regression test; no new runtime dependency was introduced.

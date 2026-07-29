@@ -6,6 +6,7 @@
   import { downloadText, resultFileName } from "./lib/download.js";
   import { loadDraft, removeDraft, saveDraft } from "./lib/storage.js";
   import {
+    blockContentIssue,
     changedCount,
     createDraft,
     finalApprovalAllowed,
@@ -32,6 +33,7 @@
   $: selectedBlock = packageData?.blocks.find((block) => block.id === draft?.selected_block_id) || packageData?.blocks[0] || null;
   $: selectedScene = packageData?.scenes.find((scene) => scene.id === selectedCue?.scene_id) || null;
   $: approvalAllowed = packageData && draft ? finalApprovalAllowed(packageData, draft) : false;
+  $: selectedBlockIssue = packageData && draft && selectedBlock ? blockContentIssue(packageData, draft, selectedBlock.id) : "";
   $: changed = packageData && draft ? changedCount(packageData, draft) : 0;
 
   function validateBrowserPackage(value) {
@@ -140,7 +142,7 @@
   function updateCue(cueId, patch) {
     const next = { ...patch };
     if (Object.hasOwn(next, "text")) next.text = textForDisplay(packageData, next.text);
-    persist(withCueChange(draft, cueId, next));
+    persist(withCueChange(packageData, draft, cueId, next));
   }
 
   function updateBlock(blockId, patch) {
@@ -151,20 +153,30 @@
   }
 
   function toggleBlockApproval(blockId, approved) {
-    persist(withBlockApproval(draft, blockId, approved));
+    persist(withBlockApproval(packageData, draft, blockId, approved));
   }
 
   function replaceAll(search, replacement) {
     let count = 0;
-    let next = { ...draft, cues: { ...draft.cues }, final_approval: null };
+    let next = draft;
+    const changedBlocks = new Set();
     for (const cue of packageData.cues) {
       const current = next.cues[cue.id];
       if (!current.text.includes(search)) continue;
-      next.cues[cue.id] = {
-        ...current,
+      next = withCueChange(packageData, next, cue.id, {
         text: textForDisplay(packageData, current.text.split(search).join(replacement))
-      };
+      });
+      packageData.blocks
+        .filter((block) => block.cue_ids.includes(cue.id))
+        .forEach((block) => changedBlocks.add(block.id));
       count += 1;
+    }
+    for (const blockId of changedBlocks) {
+      const block = next.blocks[blockId];
+      next = withBlockChange(next, blockId, {
+        target_text: textForDisplay(packageData, block.target_text.split(search).join(replacement)),
+        speech_text: block.speech_text.split(search).join(replacement)
+      });
     }
     if (count) persist(next);
     return count;
@@ -281,6 +293,7 @@
         {draft}
         {selectedCue}
         {selectedBlock}
+        blockIssue={selectedBlockIssue}
         activeScope={draft.active_scope}
         cueFilter={draft.cue_filter}
         {playbackCueId}

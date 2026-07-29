@@ -11,13 +11,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 ADAPTER_PATH = ROOT / "adapters" / "hyperframes-player.html"
-VIEWER_VERSION = "2.0.0"
+VIEWER_VERSION = "2.1.0"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
@@ -52,6 +53,22 @@ def utc_now():
 
 def canonical_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def content_key(value):
+    return "".join(
+        char for char in unicodedata.normalize("NFKC", value or "").casefold()
+        if not char.isspace() and unicodedata.category(char)[0] not in {"P", "Z"}
+    )
+
+
+def block_content_error(block, cue_by_id):
+    joined = " ".join(cue_by_id[cue_id]["text"] for cue_id in block["cue_ids"])
+    if content_key(block["target_text"]) != content_key(joined):
+        return f"block {block['id']} target_text does not match its cues"
+    if content_key(block["speech_text"]) != content_key(block["target_text"]):
+        return f"block {block['id']} speech_text does not match target_text"
+    return ""
 
 
 def package_checksum(package):
@@ -223,6 +240,7 @@ def validate_package(package, package_dir=None, check_assets=True):
                 asset_exists(package_dir, nested[key], asset_label)
 
     block_ids = set()
+    cue_by_id = {cue["id"]: cue for cue in cues}
     for index, block in enumerate(blocks):
         label = f"package.blocks[{index}]"
         if not isinstance(block, dict):
@@ -242,6 +260,9 @@ def validate_package(package, package_dir=None, check_assets=True):
             as_text(block.get(key, ""), f"{label}.{key}")
         if "budget_ms" in block:
             as_ms(block["budget_ms"], f"{label}.budget_ms")
+        content_error = block_content_error(block, cue_by_id)
+        if content_error:
+            raise FrameCueError(content_error)
 
     hyperframes = package["media"].get("hyperframes")
     if hyperframes:
@@ -312,6 +333,16 @@ def validate_result(result, package, require_approved=False):
             raise FrameCueError("result.blocks[].approved must be boolean")
     if status == "approved" and expected_blocks and not all(row["approved"] for row in result_blocks):
         raise FrameCueError("all blocks must be approved before final approval")
+    if status == "approved":
+        package_blocks = {row["id"]: row for row in package["blocks"]}
+        result_cues_by_id = {row["id"]: row for row in result_cues}
+        for row in result_blocks:
+            content_error = block_content_error(
+                {**row, "cue_ids": package_blocks[row["id"]]["cue_ids"]},
+                result_cues_by_id,
+            )
+            if content_error:
+                raise FrameCueError(content_error)
     return {
         "review_id": result["review_id"],
         "revision": result["revision"],
