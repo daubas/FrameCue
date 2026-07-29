@@ -109,6 +109,10 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
   min-height: calc(100vh - 64px);
 }
 
+.review-grid > *,
+.media-stage,
+.review-workbench { min-width: 0; }
+
 .media-stage {
   display: grid;
   grid-template-rows: auto minmax(360px, 1fr) auto auto;
@@ -138,7 +142,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .still-stage > img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .subtitle-overlay { position: absolute; right: 6%; bottom: 5%; left: 6%; display: grid; gap: 7px; text-align: center; text-shadow: 0 2px 3px #000; }
 .subtitle { display: grid; justify-items: center; overflow-wrap: anywhere; }
-.subtitle span { display: inline; padding: .08em .36em; background: rgba(0, 0, 0, .58); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.subtitle span { display: inline; max-width: 100%; padding: .08em .36em; overflow-wrap: anywhere; background: rgba(0, 0, 0, .58); box-decoration-break: clone; -webkit-box-decoration-break: clone; }
 .subtitle.source { color: #f1f2ee; font-size: 23px; font-weight: 650; line-height: 1.25; }
 .subtitle.target { color: #fff; font-size: 34px; font-weight: 760; line-height: 1.3; }
 
@@ -237,7 +241,8 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
   .identity { width: 100%; }
   .top-toolbar { gap: 9px; }
   .toolbar-actions { width: 100%; }
-  .toolbar-actions button { flex: 1 1 auto; }
+  .toolbar-actions button { flex: 1 1 140px; min-width: 0; }
+  .toolbar-actions .icon-button { flex: 0 0 34px; }
   .stage-topline { align-items: flex-start; gap: 8px; }
   .mode-strip { flex-wrap: wrap; justify-content: flex-end; }
   .media-stage { min-height: 450px; }
