@@ -41,7 +41,21 @@
       },
       "additionalProperties": true
     },
-    "media": { "type": "object" },
+    "media": {
+      "type": "object",
+      "properties": {
+        "video": {
+          "type": "object",
+          "required": ["src", "captions"],
+          "properties": {
+            "src": { "type": "string", "minLength": 1 },
+            "captions": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
     "scenes": {
       "type": "array",
       "items": { "$ref": "#/$defs/scene" }

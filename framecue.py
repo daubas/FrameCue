@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 ADAPTER_PATH = ROOT / "adapters" / "hyperframes-player.html"
-VIEWER_VERSION = "2.1.2"
+VIEWER_VERSION = "2.2.0"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
@@ -275,6 +275,16 @@ def validate_package(package, package_dir=None, check_assets=True):
                 entry_dir = Path(hyperframes["entry"]).parent
                 asset_exists(package_dir, (entry_dir / config).as_posix(), "package.media.hyperframes.config")
 
+    video = package["media"].get("video")
+    if video:
+        if not isinstance(video, dict):
+            raise FrameCueError("package.media.video must be an object")
+        as_text(video.get("src", ""), "package.media.video.src")
+        as_text(video.get("captions", ""), "package.media.video.captions")
+        if check_assets:
+            asset_exists(package_dir, video["src"], "package.media.video.src")
+            asset_exists(package_dir, video["captions"], "package.media.video.captions")
+
     return {
         "review_id": package["review_id"],
         "revision": package["revision"],
@@ -499,6 +509,27 @@ def copy_file(source, out_dir, relative_target):
     return Path(relative_target).as_posix()
 
 
+def vtt_time(milliseconds):
+    milliseconds = max(0, int(round(milliseconds)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
+def write_video_captions(cues, path):
+    lines = ["WEBVTT", ""]
+    for cue in cues:
+        text = "\n".join(value for value in (cue.get("original_text", ""), cue.get("text", "")) if value)
+        lines.extend([
+            cue["id"],
+            f"{vtt_time(cue['start_ms'])} --> {vtt_time(cue['end_ms'])}",
+            text,
+            "",
+        ])
+    Path(path).write_text("\n".join(lines), encoding="utf-8")
+
+
 def copy_nested_assets(row, source_root, out_dir, target_dir, label):
     for nested, key, asset_label in nested_asset_paths(row, label):
         source = resolve_source_path(nested[key], source_root, asset_label)
@@ -529,6 +560,22 @@ def materialize_assets(package, source_root, out_dir):
             suffix = source.suffix or ".bin"
             cue["audio"] = copy_file(source, out_dir, Path("assets/audio") / f"{cue['id']}{suffix}")
         copy_nested_assets(cue, source_root, out_dir, Path("assets/cues") / cue["id"], f"cue {cue['id']}")
+
+    video = package["media"].get("video")
+    if video:
+        if not isinstance(video, dict) or not video.get("source"):
+            raise FrameCueError("media.video.source is required to build a portable bundle")
+        source = resolve_source_path(video["source"], source_root, "media.video.source")
+        if not source.is_file():
+            raise FrameCueError("media.video.source must be a file")
+        output = copy.deepcopy(video)
+        output.pop("source", None)
+        output["src"] = copy_file(source, out_dir, Path("assets/video") / f"source{source.suffix or '.mp4'}")
+        captions = Path(out_dir) / "assets/video/captions.vtt"
+        captions.parent.mkdir(parents=True, exist_ok=True)
+        write_video_captions(package["cues"], captions)
+        output["captions"] = "assets/video/captions.vtt"
+        package["media"]["video"] = output
 
     hyperframes = package["media"].get("hyperframes")
     if not hyperframes:
@@ -827,7 +874,7 @@ def command_serve(args):
     if miniserve:
         subprocess.run([miniserve, "--interfaces", "127.0.0.1", "--port", str(args.port), str(directory)], check=True)
         return
-    print("warning: Python http.server may not support byte ranges needed by HyperFrames", file=sys.stderr)
+    print("warning: Python http.server may not support byte ranges needed by video playback", file=sys.stderr)
     subprocess.run([sys.executable, "-m", "http.server", str(args.port), "--directory", str(directory)], check=True)
 
 

@@ -34,7 +34,7 @@ review-r1/
   review_package.json
 ```
 
-Serve it with byte-range support when HyperFrames is present:
+Serve it with byte-range support when video is present:
 
 ```bash
 python3 framecue.py serve --dir review-r1 --port 3069
@@ -87,6 +87,27 @@ v2 supports one contract across four current review modes:
 
 The viewer switches media stage mode without changing the review data model.
 Risk and All are cue filters, not separate viewer implementations.
+
+## Source Video
+
+Subtitle packages can include the source video without exposing a local path to
+the browser:
+
+```json
+{
+  "media": {
+    "video": {
+      "source": "/path/to/source.mp4"
+    }
+  }
+}
+```
+
+The CLI copies it into the immutable bundle, generates a bilingual WebVTT track,
+and writes `media.video.src` and `media.video.captions` as bundle-relative paths.
+In Video mode, selecting a Cue seeks to its start. `Play cue` and Space stop at
+the Cue end; the native controls remain available for scrubbing or continuous
+playback.
 
 ## Multi-Package Review
 

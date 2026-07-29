@@ -140,6 +140,9 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .stage-canvas { display: grid; min-height: 0; place-items: center; }
 .still-stage { position: relative; width: min(100%, 1180px); aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid #303a32; border-radius: 6px; background: #050605; }
 .still-stage > img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.source-video-stage { position: relative; width: min(100%, 1180px); aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid #303a32; border-radius: 6px; background: #050605; }
+.source-video-stage > video { display: block; width: 100%; height: 100%; object-fit: contain; background: #050605; }
+.source-video-stage .subtitle-overlay { bottom: 12%; }
 .subtitle-overlay { position: absolute; right: 6%; bottom: 5%; left: 6%; display: grid; gap: 7px; text-align: center; text-shadow: 0 2px 3px #000; }
 .subtitle { display: grid; justify-items: center; overflow-wrap: anywhere; }
 .subtitle span { display: inline; max-width: 100%; padding: .08em .36em; overflow-wrap: anywhere; background: rgba(0, 0, 0, .58); box-decoration-break: clone; -webkit-box-decoration-break: clone; }

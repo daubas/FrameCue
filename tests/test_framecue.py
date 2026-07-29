@@ -98,6 +98,23 @@ class FrameCueV2Tests(unittest.TestCase):
         second_package = framecue.read_json(second / "review_package.json")
         self.assertEqual(first_package["content_checksum"], second_package["content_checksum"])
 
+    def test_source_video_is_materialized(self):
+        fixture = FIXTURES / "basic"
+        source_video = self.output / "source.mp4"
+        source_video.write_bytes(b"framecue-video-fixture")
+        source = framecue.read_json(fixture / "package.source.json")
+        source["media"] = {"video": {"source": str(source_video)}}
+        out_dir = self.output / "video"
+
+        framecue.build_package(source, fixture, out_dir)
+
+        package = framecue.read_json(out_dir / "review_package.json")
+        self.assertEqual(package["media"]["video"]["src"], "assets/video/source.mp4")
+        self.assertEqual((out_dir / package["media"]["video"]["src"]).read_bytes(), source_video.read_bytes())
+        captions = out_dir / package["media"]["video"]["captions"]
+        self.assertTrue(captions.read_text(encoding="utf-8").startswith("WEBVTT\n\n"))
+        framecue.validate_package(package, out_dir)
+
     def test_null_legacy_milliseconds_fall_back_to_seconds(self):
         self.assertEqual(framecue.source_ms({"start_ms": None, "start": 1.25}, "start_ms", "fixture"), 1250)
 

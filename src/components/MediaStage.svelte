@@ -11,6 +11,10 @@
   export let onPlaybackCue = () => {};
 
   let cueAudio;
+  let sourceVideoElement;
+  let sourceVideoCueId = "";
+  let cuePlaybackActive = false;
+  let cuePlaybackEndMs = 0;
   let playerFrame;
   let playerReady = false;
   let playerPlaying = false;
@@ -22,18 +26,23 @@
   $: redrawBefore = redraw?.before_image || redraw?.comparison_image || scene?.image || "";
   $: redrawAfter = redraw?.after_image || redraw?.current_image || scene?.image || "";
   $: boundary = cue?.boundary || scene?.boundary || null;
+  $: sourceVideo = packageData?.media?.video || null;
   $: hyperframes = packageData?.media?.hyperframes || null;
   $: availableModes = [
     "still",
     ...(redraw ? ["redraw"] : []),
     ...(boundary ? ["boundary"] : []),
-    ...(hyperframes ? ["video"] : [])
+    ...(sourceVideo || hyperframes ? ["video"] : [])
   ];
   $: if (!availableModes.includes(stageMode)) onStageMode("still");
   $: playerSrc = hyperframes ? `${assetUrl(hyperframes.entry)}${hyperframes.config ? `?config=${encodeURIComponent(hyperframes.config)}` : ""}` : "";
   $: if (playerSrc) playerOrigin = new URL(playerSrc, window.location.href).origin;
   $: if (stageMode === "video" && playerReady && cue) {
     postPlayer("framecue:seek", { time: cue.start_ms / 1000 });
+  }
+  $: if (stageMode === "video" && sourceVideo && sourceVideoElement && cue?.id && cue.id !== sourceVideoCueId) {
+    sourceVideoCueId = cue.id;
+    alignSourceVideo();
   }
 
   function postPlayer(type, payload = {}) {
@@ -43,6 +52,8 @@
 
   function pausePlayer() {
     postPlayer("framecue:pause");
+    sourceVideoElement?.pause();
+    cuePlaybackActive = false;
     playerPlaying = false;
   }
 
@@ -53,6 +64,7 @@
   function setMode(mode) {
     if (mode === "video") {
       pauseCueAudio();
+      sourceVideoCueId = "";
     } else {
       pausePlayer();
     }
@@ -70,9 +82,58 @@
   }
 
   function toggleVideo() {
+    if (sourceVideo) {
+      toggleSourceVideo();
+      return;
+    }
     if (!playerReady) return;
     if (playerPlaying) postPlayer("framecue:pause");
     else postPlayer("framecue:play", { time: cue?.start_ms / 1000 });
+  }
+
+  function alignSourceVideo(force = false) {
+    if (!sourceVideoElement || !cue) return;
+    const currentMs = sourceVideoElement.currentTime * 1000;
+    if (force || currentMs < cue.start_ms - 100 || currentMs >= cue.end_ms + 100) {
+      sourceVideoElement.pause();
+      cuePlaybackActive = false;
+      sourceVideoElement.currentTime = cue.start_ms / 1000;
+    }
+  }
+
+  function toggleSourceVideo() {
+    if (!sourceVideoElement || !cue) return;
+    if (!sourceVideoElement.paused) {
+      sourceVideoElement.pause();
+      cuePlaybackActive = false;
+      return;
+    }
+    const currentMs = sourceVideoElement.currentTime * 1000;
+    if (currentMs < cue.start_ms - 100 || currentMs >= cue.end_ms - 20) {
+      sourceVideoElement.currentTime = cue.start_ms / 1000;
+    }
+    cuePlaybackEndMs = cue.end_ms;
+    cuePlaybackActive = true;
+    pauseCueAudio();
+    sourceVideoElement.play().catch(() => {
+      cuePlaybackActive = false;
+      playerPlaying = false;
+    });
+  }
+
+  function handleSourceTimeUpdate() {
+    if (!sourceVideoElement) return;
+    const currentMs = sourceVideoElement.currentTime * 1000;
+    if (cuePlaybackActive && currentMs >= cuePlaybackEndMs - 20) {
+      cuePlaybackActive = false;
+      sourceVideoElement.pause();
+      const duration = Number.isFinite(sourceVideoElement.duration) ? sourceVideoElement.duration : cuePlaybackEndMs / 1000;
+      sourceVideoElement.currentTime = Math.min(cuePlaybackEndMs / 1000, duration);
+      return;
+    }
+    if (packageData?.cues?.length) {
+      onPlaybackCue(packageData.cues[cueIndexAtTime(packageData.cues, currentMs)]?.id);
+    }
   }
 
   function togglePlayback() {
@@ -122,7 +183,7 @@
   });
 </script>
 
-<section class:portraitStage={stageMode === "video"} class="media-stage" aria-label="Media Stage">
+<section class:portraitStage={stageMode === "video" && hyperframes && !sourceVideo} class="media-stage" aria-label="Media Stage">
   <div class="stage-topline">
     <div>
       <span class="eyebrow">Media Stage</span>
@@ -138,7 +199,37 @@
   </div>
 
   <div class="stage-canvas">
-    {#if stageMode === "video" && hyperframes}
+    {#if stageMode === "video" && sourceVideo}
+      <div class="source-video-stage">
+        <video
+          bind:this={sourceVideoElement}
+          src={assetUrl(sourceVideo.src)}
+          poster={scene?.image ? assetUrl(scene.image) : ""}
+          preload="metadata"
+          controls
+          playsinline
+          on:loadedmetadata={() => alignSourceVideo(true)}
+          on:play={() => { pauseCueAudio(); playerPlaying = true; }}
+          on:pause={() => playerPlaying = false}
+          on:ended={() => { cuePlaybackActive = false; playerPlaying = false; }}
+          on:timeupdate={handleSourceTimeUpdate}
+        >
+          <track kind="captions" src={assetUrl(sourceVideo.captions)} srclang="zh-Hant" label="FrameCue bilingual subtitles" />
+        </video>
+        <div class="subtitle-overlay">
+          {#if cue?.original_text}
+            <div class="subtitle source"><span>{cue.original_text}</span></div>
+          {/if}
+          <div class="subtitle target">
+            <span>
+              {#each markedParts(cueDraft?.text || "", cue?.risks || []) as part}
+                {#if part.risk}<mark>{part.text}</mark>{:else}{part.text}{/if}
+              {/each}
+            </span>
+          </div>
+        </div>
+      </div>
+    {:else if stageMode === "video" && hyperframes}
       <div class="player-shell">
         <iframe bind:this={playerFrame} src={playerSrc} title="HyperFrames review player" allow="autoplay"></iframe>
         {#if !playerReady}
@@ -191,14 +282,13 @@
   <div class="stage-footer">
     <span>{formatTime(cue?.start_ms || 0)} to {formatTime(cue?.end_ms || 0)}</span>
     <div class="stage-actions">
-      {#if cue?.audio}
+      {#if stageMode === "video" && (sourceVideo || hyperframes)}
+        <button type="button" on:click={toggleVideo}>{playerPlaying ? "Pause cue" : "Play cue"}</button>
+      {:else if cue?.audio}
         <button type="button" on:click={toggleCueAudio}>{cueAudio?.paused === false ? "Pause cue" : "Play cue"}</button>
       {/if}
       {#if (cue?.risks || []).length && cue?.audio}
         <button class="warning-button" type="button" on:click={replayRisk}>Replay risk</button>
-      {/if}
-      {#if stageMode === "video"}
-        <button type="button" on:click={toggleVideo}>{playerPlaying ? "Pause video" : "Play video"}</button>
       {/if}
     </div>
   </div>

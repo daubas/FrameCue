@@ -139,6 +139,11 @@
     persist({ ...draft, cue_filter: cueFilter });
   }
 
+  function followPlaybackCue(cueId) {
+    playbackCueId = cueId || "";
+    if (cueId && cueId !== selectedCue?.id) selectCue(cueId);
+  }
+
   function updateCue(cueId, patch) {
     const next = { ...patch };
     if (Object.hasOwn(next, "text")) next.text = textForDisplay(packageData, next.text);
@@ -286,7 +291,7 @@
         {stageMode}
         {assetUrl}
         onStageMode={(mode) => stageMode = mode}
-        onPlaybackCue={(cueId) => playbackCueId = cueId || ""}
+        onPlaybackCue={followPlaybackCue}
       />
       <ReviewWorkbench
         {packageData}
