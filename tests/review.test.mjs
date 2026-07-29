@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   blockContentIssue,
+  cueNeedsSeek,
+  cuePlaybackEnded,
   finalApprovalAllowed,
   withBlockApproval,
   withCueChange
@@ -40,4 +42,13 @@ test("cue edits invalidate the parent block and final approval", () => {
   assert.match(blockContentIssue(packageData, changed, "b0001"), /differs/);
   assert.equal(finalApprovalAllowed(packageData, changed), false);
   assert.equal(withBlockApproval(packageData, changed, "b0001", true), changed);
+});
+
+test("cue playback seeks outside the cue and stops at its end", () => {
+  const cue = { start_ms: 1000, end_ms: 2500 };
+  assert.equal(cueNeedsSeek(cue, 800), true);
+  assert.equal(cueNeedsSeek(cue, 1500), false);
+  assert.equal(cueNeedsSeek(cue, 2700), true);
+  assert.equal(cuePlaybackEnded(2479, cue.end_ms), false);
+  assert.equal(cuePlaybackEnded(2480, cue.end_ms), true);
 });

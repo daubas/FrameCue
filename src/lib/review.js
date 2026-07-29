@@ -226,6 +226,14 @@ export function cueIndexAtTime(cues, milliseconds) {
   return found;
 }
 
+export function cueNeedsSeek(cue, milliseconds, tolerance = 100) {
+  return !cue || milliseconds < cue.start_ms - tolerance || milliseconds >= cue.end_ms + tolerance;
+}
+
+export function cuePlaybackEnded(milliseconds, endMilliseconds, tolerance = 20) {
+  return milliseconds >= endMilliseconds - tolerance;
+}
+
 export function formatTime(milliseconds) {
   const total = Math.max(0, Math.round(Number(milliseconds) || 0));
   const hours = String(Math.floor(total / 3600000)).padStart(2, "0");

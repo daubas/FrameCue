@@ -1,6 +1,6 @@
 <script>
   import { onMount } from "svelte";
-  import { cueIndexAtTime, formatTime, markedParts } from "../lib/review.js";
+  import { cueIndexAtTime, cueNeedsSeek, cuePlaybackEnded, formatTime, markedParts } from "../lib/review.js";
 
   export let packageData;
   export let cue;
@@ -94,7 +94,7 @@
   function alignSourceVideo(force = false) {
     if (!sourceVideoElement || !cue) return;
     const currentMs = sourceVideoElement.currentTime * 1000;
-    if (force || currentMs < cue.start_ms - 100 || currentMs >= cue.end_ms + 100) {
+    if (force || cueNeedsSeek(cue, currentMs)) {
       sourceVideoElement.pause();
       cuePlaybackActive = false;
       sourceVideoElement.currentTime = cue.start_ms / 1000;
@@ -109,7 +109,7 @@
       return;
     }
     const currentMs = sourceVideoElement.currentTime * 1000;
-    if (currentMs < cue.start_ms - 100 || currentMs >= cue.end_ms - 20) {
+    if (currentMs < cue.start_ms - 100 || cuePlaybackEnded(currentMs, cue.end_ms)) {
       sourceVideoElement.currentTime = cue.start_ms / 1000;
     }
     cuePlaybackEndMs = cue.end_ms;
@@ -124,7 +124,7 @@
   function handleSourceTimeUpdate() {
     if (!sourceVideoElement) return;
     const currentMs = sourceVideoElement.currentTime * 1000;
-    if (cuePlaybackActive && currentMs >= cuePlaybackEndMs - 20) {
+    if (cuePlaybackActive && cuePlaybackEnded(currentMs, cuePlaybackEndMs)) {
       cuePlaybackActive = false;
       sourceVideoElement.pause();
       const duration = Number.isFinite(sourceVideoElement.duration) ? sourceVideoElement.duration : cuePlaybackEndMs / 1000;
