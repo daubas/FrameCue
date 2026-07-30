@@ -145,7 +145,7 @@
     if (!playerOrigin || event.source !== playerFrame?.contentWindow || event.origin !== playerOrigin || !event.data) return;
     if (event.data.type === "hyperframes:ready") {
       if (!(Number(event.data.duration) > 0)) {
-        playerError = "Player did not report a usable duration";
+        playerError = "播放器沒有回報可用的影片長度";
         return;
       }
       playerReady = true;
@@ -155,7 +155,7 @@
     if (event.data.type === "hyperframes:error") {
       playerReady = false;
       playerPlaying = false;
-      playerError = event.data.message || "Player unavailable";
+      playerError = "播放器目前無法使用";
       return;
     }
     if (event.data.type === "hyperframes:timeupdate") {
@@ -176,23 +176,25 @@
   onMount(() => {
     window.addEventListener("message", handleMessage);
     window.addEventListener("framecue:toggle-playback", togglePlayback);
+    window.addEventListener("framecue:pause-playback", pausePlayer);
     return () => {
       window.removeEventListener("message", handleMessage);
       window.removeEventListener("framecue:toggle-playback", togglePlayback);
+      window.removeEventListener("framecue:pause-playback", pausePlayer);
     };
   });
 </script>
 
-<section class:portraitStage={stageMode === "video" && hyperframes && !sourceVideo} class="media-stage" aria-label="Media Stage">
+<section class:portraitStage={stageMode === "video" && hyperframes && !sourceVideo} class="media-stage" aria-label="媒體畫面">
   <div class="stage-topline">
     <div>
-      <span class="eyebrow">Media Stage</span>
-      <strong>{cue?.id || "No cue"}</strong>
+      <span class="eyebrow">媒體畫面</span>
+      <strong>{cue?.id || "沒有 Cue"}</strong>
     </div>
-    <div class="mode-strip" aria-label="Media mode">
+    <div class="mode-strip" aria-label="畫面模式">
       {#each availableModes as mode}
         <button class:active={stageMode === mode} type="button" on:click={() => setMode(mode)}>
-          {mode === "still" ? "Still" : mode === "redraw" ? "Redraw" : mode === "boundary" ? "Boundary" : "Video"}
+          {mode === "still" ? "Cue 畫面" : mode === "redraw" ? "重繪比較" : mode === "boundary" ? "切點比較" : "影片"}
         </button>
       {/each}
     </div>
@@ -214,7 +216,7 @@
           on:ended={() => { cuePlaybackActive = false; playerPlaying = false; }}
           on:timeupdate={handleSourceTimeUpdate}
         >
-          <track kind="captions" src={assetUrl(sourceVideo.captions)} srclang="zh-Hant" label="FrameCue bilingual subtitles" />
+          <track kind="captions" src={assetUrl(sourceVideo.captions)} srclang="zh-Hant" label="FrameCue 中英字幕" />
         </video>
         <div class="subtitle-overlay">
           {#if cue?.original_text}
@@ -231,36 +233,36 @@
       </div>
     {:else if stageMode === "video" && hyperframes}
       <div class="player-shell">
-        <iframe bind:this={playerFrame} src={playerSrc} title="HyperFrames review player" allow="autoplay"></iframe>
+        <iframe bind:this={playerFrame} src={playerSrc} title="HyperFrames 審閱播放器" allow="autoplay"></iframe>
         {#if !playerReady}
-          <div class:error={Boolean(playerError)} class="player-overlay">{playerError || "Loading HyperFrames player"}</div>
+          <div class:error={Boolean(playerError)} class="player-overlay">{playerError || "正在載入 HyperFrames 播放器"}</div>
         {/if}
       </div>
     {:else if stageMode === "redraw" && redraw}
       <div class="compare-stage">
         <figure>
-          <img src={assetUrl(redrawBefore)} alt="Redraw comparison" />
-          <figcaption>{redraw.before_image ? "Before" : "Comparison"}</figcaption>
+          <img src={assetUrl(redrawBefore)} alt="重繪比較畫面" />
+          <figcaption>{redraw.before_image ? "修改前" : "比較畫面"}</figcaption>
         </figure>
         <figure>
-          <img src={assetUrl(redrawAfter)} alt="Current redraw" />
-          <figcaption>{redraw.after_image ? "After" : "Current"}</figcaption>
+          <img src={assetUrl(redrawAfter)} alt="目前的重繪畫面" />
+          <figcaption>{redraw.after_image ? "修改後" : "目前畫面"}</figcaption>
         </figure>
       </div>
     {:else if stageMode === "boundary" && boundary}
       <div class="compare-stage">
         <figure>
-          <img src={assetUrl(boundary.before_image || scene?.image)} alt="Before subtitle boundary" />
-          <figcaption>Before {formatTime(cue?.start_ms || 0)}</figcaption>
+          <img src={assetUrl(boundary.before_image || scene?.image)} alt="字幕切點前畫面" />
+          <figcaption>前：{formatTime(cue?.start_ms || 0)}</figcaption>
         </figure>
         <figure>
-          <img src={assetUrl(boundary.after_image || scene?.image)} alt="After subtitle boundary" />
-          <figcaption>After {formatTime(cue?.end_ms || 0)}</figcaption>
+          <img src={assetUrl(boundary.after_image || scene?.image)} alt="字幕切點後畫面" />
+          <figcaption>後：{formatTime(cue?.end_ms || 0)}</figcaption>
         </figure>
       </div>
     {:else if scene}
       <div class="still-stage">
-        <img src={assetUrl(scene.image)} alt={`Representative frame for ${cue.id}`} />
+        <img src={assetUrl(scene.image)} alt={`${cue.id} 的代表畫面`} />
         <div class="subtitle-overlay">
           {#if cue?.original_text}
             <div class="subtitle source"><span>{cue.original_text}</span></div>
@@ -275,20 +277,20 @@
         </div>
       </div>
     {:else}
-      <div class="stage-empty">No scene image is available for this cue.</div>
+      <div class="stage-empty">這個 Cue 沒有可用的代表畫面。</div>
     {/if}
   </div>
 
   <div class="stage-footer">
-    <span>{formatTime(cue?.start_ms || 0)} to {formatTime(cue?.end_ms || 0)}</span>
+    <span>{formatTime(cue?.start_ms || 0)} 至 {formatTime(cue?.end_ms || 0)}</span>
     <div class="stage-actions">
       {#if stageMode === "video" && (sourceVideo || hyperframes)}
-        <button type="button" on:click={toggleVideo}>{playerPlaying ? "Pause cue" : "Play cue"}</button>
+        <button type="button" on:click={toggleVideo}>{playerPlaying ? "暫停 Cue" : "播放 Cue"}</button>
       {:else if cue?.audio}
-        <button type="button" on:click={toggleCueAudio}>{cueAudio?.paused === false ? "Pause cue" : "Play cue"}</button>
+        <button type="button" on:click={toggleCueAudio}>{cueAudio?.paused === false ? "暫停 Cue" : "播放 Cue"}</button>
       {/if}
       {#if (cue?.risks || []).length && cue?.audio}
-        <button class="warning-button" type="button" on:click={replayRisk}>Replay risk</button>
+        <button class="warning-button" type="button" on:click={replayRisk}>重播風險字</button>
       {/if}
     </div>
   </div>

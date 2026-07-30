@@ -38,10 +38,10 @@
 
   function validateBrowserPackage(value) {
     if (!value || value.schema_version !== "framecue_package_v2") {
-      throw new Error("This page only opens immutable FrameCue v2 packages.");
+      throw new Error("這個頁面只能開啟不可變動的 FrameCue v2 審閱套件。");
     }
     if (!value.review_id || !value.revision || !value.content_checksum || !Array.isArray(value.cues) || !Array.isArray(value.blocks)) {
-      throw new Error("The FrameCue v2 package is incomplete.");
+      throw new Error("這份 FrameCue v2 審閱套件不完整。");
     }
   }
 
@@ -62,7 +62,7 @@
     try {
       const packageUrl = new URL(item.review_package, window.location.href);
       const response = await fetch(packageUrl, { cache: "no-store" });
-      if (!response.ok) throw new Error(`Could not load ${item.review_package}`);
+      if (!response.ok) throw new Error(`無法載入 ${item.review_package}`);
       const nextPackage = await response.json();
       validateBrowserPackage(nextPackage);
       packageData = nextPackage;
@@ -72,7 +72,7 @@
     } catch (cause) {
       packageData = null;
       draft = null;
-      error = cause.message || "FrameCue could not load this review package.";
+      error = cause.message || "FrameCue 無法載入這份審閱套件。";
     } finally {
       loading = false;
     }
@@ -84,17 +84,17 @@
       if (response.ok) {
         const manifest = await response.json();
         if (manifest.schema_version !== "framecue_manifest_v2" || !Array.isArray(manifest.items)) {
-          throw new Error("framecue_manifest.json is not a v2 manifest.");
+          throw new Error("framecue_manifest.json 不是 v2 審閱清單。");
         }
         items = manifest.items;
       }
     } catch (cause) {
-      error = cause.message || "FrameCue could not load its manifest.";
+      error = cause.message || "FrameCue 無法載入審閱清單。";
       loading = false;
       return;
     }
     if (!items.length) {
-      items = [{ id: "default", label: "Review", review_package: "review_package.json" }];
+      items = [{ id: "default", label: "字幕審閱", review_package: "review_package.json" }];
     }
     await loadItem(items[0]);
   }
@@ -215,7 +215,7 @@
   }
 
   function resetDraft() {
-    if (!window.confirm("Discard this browser-only draft for the current immutable revision?")) return;
+    if (!window.confirm("要捨棄這個修訂版只存在瀏覽器中的草稿嗎？")) return;
     removeDraft(packageData);
     draft = createDraft(packageData);
     stageMode = "still";
@@ -237,18 +237,28 @@
     }
   }
 
+  function pausePlaybackForEditor(event) {
+    if (event.target?.matches?.("input, textarea, select")) {
+      window.dispatchEvent(new Event("framecue:pause-playback"));
+    }
+  }
+
   onMount(() => {
     window.addEventListener("keydown", handleKeydown);
+    window.addEventListener("focusin", pausePlaybackForEditor);
     boot();
-    return () => window.removeEventListener("keydown", handleKeydown);
+    return () => {
+      window.removeEventListener("keydown", handleKeydown);
+      window.removeEventListener("focusin", pausePlaybackForEditor);
+    };
   });
 </script>
 
 {#if loading}
-  <main class="loading-state">Loading FrameCue review package</main>
+  <main class="loading-state">正在載入 FrameCue 審閱套件</main>
 {:else if error}
   <main class="error-state">
-    <h1>FrameCue could not open this package</h1>
+    <h1>FrameCue 無法開啟這份套件</h1>
     <p>{error}</p>
   </main>
 {:else if packageData && draft}
@@ -262,7 +272,7 @@
       <div class="toolbar-center">
         {#if items.length > 1}
           <label class="package-select">
-            <span>Package</span>
+            <span>套件</span>
             <select value={currentItemId} on:change={(event) => loadItem(items.find((item) => item.id === event.currentTarget.value))}>
               {#each items as item}
                 <option value={item.id}>{item.label}</option>
@@ -271,15 +281,15 @@
           </label>
         {/if}
         <span class="progress">{selectedCue ? `${packageData.cues.findIndex((cue) => cue.id === selectedCue.id) + 1} / ${packageData.cues.length}` : "0 / 0"}</span>
-        <span class="change-count">{changed} changed</span>
+        <span class="change-count">已變更 {changed} 項</span>
       </div>
       <div class="toolbar-actions">
-        <button type="button" on:click={downloadSrt}>Export SRT</button>
-        <button type="button" on:click={downloadResult}>Export result</button>
+        <button type="button" on:click={downloadSrt}>輸出 SRT</button>
+        <button type="button" on:click={downloadResult}>輸出審閱結果</button>
         <button class:approved={Boolean(draft.final_approval)} class="approve-package" disabled={!approvalAllowed || Boolean(draft.final_approval)} type="button" on:click={approvePackage}>
-          {draft.final_approval ? "Package approved" : "Approve package"}
+          {draft.final_approval ? "套件已核准" : "核准套件"}
         </button>
-        <button class="icon-button" type="button" title="Discard only the browser draft for this revision" aria-label="Discard browser draft" on:click={resetDraft}>↺</button>
+        <button class="icon-button" type="button" title="只捨棄這個修訂版的瀏覽器草稿" aria-label="捨棄瀏覽器草稿" on:click={resetDraft}>↺</button>
       </div>
     </header>
 

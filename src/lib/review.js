@@ -1,8 +1,8 @@
 export const ACTIONS = [
-  { value: "use_edit", label: "Use edit" },
-  { value: "rewrite", label: "Rewrite content" },
-  { value: "resegment", label: "Resegment" },
-  { value: "retime", label: "Retime upstream" }
+  { value: "use_edit", label: "採用直接修改" },
+  { value: "rewrite", label: "重新改寫內容" },
+  { value: "resegment", label: "重新切分" },
+  { value: "retime", label: "回上游調整時間" }
 ];
 
 const protectedLatinToken = /(?<![A-Za-z0-9])(?:[A-Za-z0-9]+(?:[._/+\-][A-Za-z0-9+#]+)+|[A-Za-z][+#]{1,2})(?![A-Za-z0-9])/g;
@@ -111,10 +111,10 @@ export function blockContentIssue(packageData, draft, blockId) {
   if (!block || !state) return "";
   const cueText = block.cue_ids.map((cueId) => draft.cues[cueId]?.text || "").join(" ");
   if (contentKey(state.target_text) !== contentKey(cueText)) {
-    return "Display text differs from its Cues. Reconcile the Block before approval.";
+    return "顯示文字與所屬 Cue 不一致，請先統整語意塊再核准。";
   }
   if (contentKey(state.speech_text) !== contentKey(state.target_text)) {
-    return "Speech text differs from display content. Reconcile it before approval.";
+    return "語音文字與顯示內容不一致，請先統整再核准。";
   }
   return "";
 }
