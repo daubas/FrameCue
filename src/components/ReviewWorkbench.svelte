@@ -1,6 +1,6 @@
 <script>
   import { tick } from "svelte";
-  import { ACTIONS, formatTime, markedParts } from "../lib/review.js";
+  import { actionsForWorkflow, formatTime, markedParts } from "../lib/review.js";
 
   export let packageData;
   export let draft;
@@ -27,6 +27,12 @@
 
   $: riskCues = packageData.cues.filter((cue) => cue.risks?.length);
   $: listedCues = cueFilter === "risk" ? riskCues : packageData.cues;
+  $: workflowKind = packageData.workflow.kind;
+  $: actions = actionsForWorkflow(workflowKind);
+  $: isCarousel = workflowKind === "image_carousel";
+  $: isMarkdown = workflowKind === "markdown";
+  $: cueLabel = isCarousel ? "圖卡" : isMarkdown ? "Markdown 區塊" : "字幕 Cue";
+  $: blockKind = selectedCue?.markdown?.kind === "heading" ? "標題" : selectedCue?.markdown?.kind === "list" ? "清單" : "段落";
   $: selectedCueState = selectedCue ? draft.cues[selectedCue.id] : null;
   $: selectedBlockState = selectedBlock ? draft.blocks[selectedBlock.id] : null;
   $: if (selectedCue?.id && selectedCue.id !== followedCueId) {
@@ -68,11 +74,11 @@
   <div class="workbench-header">
     <div>
       <span class="eyebrow">審閱工作區</span>
-      <strong>{activeScope === "block" ? "語意塊" : "字幕 Cue"}</strong>
+      <strong>{activeScope === "block" ? "語意塊" : cueLabel}</strong>
     </div>
     <div class="segmented" aria-label="審閱範圍">
       <button class:active={activeScope === "block"} disabled={!packageData.blocks.length} type="button" on:click={() => onScopeChange("block")}>語意塊 <span class="info" title="先審閱一個完整的口譯意思，再檢查它包含的顯示 Cue。">!</span></button>
-      <button class:active={activeScope === "cue"} type="button" on:click={() => onScopeChange("cue")}>Cue <span class="info" title="審閱目前媒體畫面上顯示的單句字幕。">!</span></button>
+      <button class:active={activeScope === "cue"} type="button" on:click={() => onScopeChange("cue")}>{isCarousel ? "圖卡" : isMarkdown ? "區塊" : "Cue"} <span class="info" title="審閱目前選取的內容。">!</span></button>
     </div>
   </div>
 
@@ -112,7 +118,7 @@
         <label class="compact-field">
           <span>後續動作 <span class="info" title="FrameCue 只記錄需求；改寫、重新切分或調整時間會由 AgenticDub 在新修訂版完成。">!</span></span>
           <select value={selectedBlockState.action} on:change={(event) => onBlockChange(selectedBlock.id, { action: event.currentTarget.value })}>
-            {#each ACTIONS as action}
+            {#each actions as action}
               <option value={action.value}>{action.label}</option>
             {/each}
           </select>
@@ -128,10 +134,10 @@
     </div>
   {:else if selectedCue}
     <div class="workbench-layout">
-      <nav class="review-list cue-list" aria-label="字幕 Cue">
+      <nav class="review-list cue-list" aria-label={cueLabel}>
         <div class="list-filter" aria-label="Cue 篩選">
-          <button class:active={cueFilter === "risk"} type="button" on:click={() => onFilterChange("risk")}>風險 Cue {riskCues.length}</button>
-          <button class:active={cueFilter === "all"} type="button" on:click={() => onFilterChange("all")}>全部 Cue {packageData.cues.length}</button>
+          <button class:active={cueFilter === "risk"} type="button" on:click={() => onFilterChange("risk")}>需留意 {riskCues.length}</button>
+          <button class:active={cueFilter === "all"} type="button" on:click={() => onFilterChange("all")}>全部 {packageData.cues.length}</button>
         </div>
         {#if !listedCues.length}
           <p class="empty-list">這份套件沒有風險 Cue。</p>
@@ -158,14 +164,14 @@
           {/if}
         </div>
         <div class="read-only-field">
-          <span>原始字幕</span>
-          <div class="source-text">{selectedCue.original_text || "沒有原始字幕"}</div>
+          <span>{isCarousel ? "圖卡資產" : isMarkdown ? "區塊類型" : "原始字幕"}</span>
+          <div class="source-text">{isCarousel ? selectedCue.text : isMarkdown ? blockKind : selectedCue.original_text || "沒有原始字幕"}</div>
         </div>
         <label>
-          <span>顯示字幕 <span class="info" title="這會出現在畫面上，並遵循套件的標點政策。">!</span></span>
+          <span>{isCarousel ? "圖卡標籤" : isMarkdown ? "Markdown 內容" : "顯示字幕"} <span class="info" title="這段內容會寫入完整審閱結果。">!</span></span>
           <textarea value={selectedCueState.text} on:input={(event) => onCueChange(selectedCue.id, { text: event.currentTarget.value })}></textarea>
         </label>
-        {#if !packageData.blocks.length}
+        {#if !packageData.blocks.length && !isCarousel && !isMarkdown}
           <label>
             <span>語音文字 <span class="info" title="沒有語意塊時，這段保留標點的文字會直接交給 TTS。">!</span></span>
             <textarea value={selectedCueState.speech_text} on:input={(event) => onCueChange(selectedCue.id, { speech_text: event.currentTarget.value })}></textarea>
@@ -174,7 +180,7 @@
         <label class="compact-field">
           <span>後續動作 <span class="info" title="這個 Cue 若需要上游處理而非直接修改，請選擇下一步。">!</span></span>
           <select value={selectedCueState.action} on:change={(event) => onCueChange(selectedCue.id, { action: event.currentTarget.value })}>
-            {#each ACTIONS as action}
+            {#each actions as action}
               <option value={action.value}>{action.label}</option>
             {/each}
           </select>
@@ -183,16 +189,18 @@
           <span>註記</span>
           <textarea class="short-textarea" value={selectedCueState.instruction} placeholder="可選填，說明下一版要處理什麼" on:input={(event) => onCueChange(selectedCue.id, { instruction: event.currentTarget.value })}></textarea>
         </label>
-        <div class="replace-tools">
-          <div class="field-label">搜尋與取代 <span class="info" title="會套用目前的顯示文字規則到所有變更的 Cue，並取消最終核准。">!</span></div>
-          <input bind:value={searchTerm} type="search" placeholder="搜尋全部顯示字幕" />
-          <input bind:value={replaceTerm} type="text" placeholder="取代為" />
-          <div class="inline-actions">
-            <button type="button" on:click={findNext}>尋找下一個</button>
-            <button type="button" on:click={replaceAll}>全部取代</button>
-            <span class="status-text">{searchMessage}</span>
+        {#if !isCarousel}
+          <div class="replace-tools">
+            <div class="field-label">搜尋與取代 <span class="info" title="會套用目前的顯示文字規則到所有變更的 Cue，並取消最終核准。">!</span></div>
+            <input bind:value={searchTerm} type="search" placeholder={isMarkdown ? "搜尋全部 Markdown 區塊" : "搜尋全部顯示字幕"} />
+            <input bind:value={replaceTerm} type="text" placeholder="取代為" />
+            <div class="inline-actions">
+              <button type="button" on:click={findNext}>尋找下一個</button>
+              <button type="button" on:click={replaceAll}>全部取代</button>
+              <span class="status-text">{searchMessage}</span>
+            </div>
           </div>
-        </div>
+        {/if}
       </div>
     </div>
   {:else}

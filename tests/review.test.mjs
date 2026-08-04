@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  actionsForWorkflow,
+  approveBlockAndAdvance,
   blockContentIssue,
+  createDraft,
   cueIndexAtTime,
   cueNeedsSeek,
   cuePlaybackEnded,
   finalApprovalAllowed,
+  makeResult,
   withBlockApproval,
   withCueChange
 } from "../src/lib/review.js";
@@ -45,6 +49,41 @@ test("cue edits invalidate the parent block and final approval", () => {
   assert.equal(withBlockApproval(packageData, changed, "b0001", true), changed);
 });
 
+test("semantic block approval advances only after validation passes", () => {
+  const reviewPackage = {
+    blocks: [
+      { id: "b0001", cue_ids: ["c0001"] },
+      { id: "b0002", cue_ids: ["c0002"] }
+    ]
+  };
+  const draft = {
+    selected_block_id: "b0001",
+    selected_cue_id: "c0001",
+    active_scope: "block",
+    cues: {
+      c0001: { text: "第一句" },
+      c0002: { text: "第二句" }
+    },
+    blocks: {
+      b0001: { target_text: "第一句", speech_text: "第一句。", approved: false },
+      b0002: { target_text: "第二句", speech_text: "第二句。", approved: false }
+    },
+    final_approval: null
+  };
+
+  const advanced = approveBlockAndAdvance(reviewPackage, draft, "b0001");
+  assert.equal(advanced.blocks.b0001.approved, true);
+  assert.equal(advanced.selected_block_id, "b0002");
+  assert.equal(advanced.selected_cue_id, "c0002");
+
+  const invalid = approveBlockAndAdvance(reviewPackage, {
+    ...draft,
+    blocks: { ...draft.blocks, b0001: { ...draft.blocks.b0001, speech_text: "不同內容" } }
+  }, "b0001");
+  assert.equal(invalid.blocks.b0001.approved, false);
+  assert.equal(invalid.selected_block_id, "b0001");
+});
+
 test("cue playback seeks outside the cue and stops at its end", () => {
   const cue = { start_ms: 1000, end_ms: 2500 };
   assert.equal(cueNeedsSeek(cue, 800), true);
@@ -65,4 +104,38 @@ test("video time selects the current cue at each boundary", () => {
   assert.equal(cueIndexAtTime(cues, 999), 0);
   assert.equal(cueIndexAtTime(cues, 1000), 1);
   assert.equal(cueIndexAtTime(cues, 2500), 2);
+});
+
+test("new workflows expose only their own follow-up actions", () => {
+  assert.deepEqual(actionsForWorkflow("subtitle").map((action) => action.value), ["use_edit", "rewrite", "resegment", "retime"]);
+  assert.deepEqual(actionsForWorkflow("image_carousel").map((action) => action.value), ["use_edit", "replace_asset", "rewrite_copy", "recrop", "reorder"]);
+  assert.deepEqual(actionsForWorkflow("markdown").map((action) => action.value), ["use_edit", "rewrite", "cut", "split", "needs_source"]);
+});
+
+test("packages without risks open the complete cue list", () => {
+  const draft = createDraft({
+    workflow: { kind: "markdown" },
+    cues: [{ id: "c0001", text: "段落", speech_text: "段落", risks: [] }],
+    blocks: []
+  });
+  assert.equal(draft.cue_filter, "all");
+});
+
+test("new-mode browser drafts export the frozen result contract", () => {
+  const packageData = {
+    review_id: "cards",
+    revision: "r1",
+    content_checksum: "a".repeat(64),
+    viewer_version: "2.4.0",
+    workflow: { kind: "image_carousel" },
+    cues: [{ id: "c0001", text: "slide-01.png", speech_text: "slide-01.png", risks: [] }],
+    blocks: []
+  };
+  const draft = createDraft(packageData);
+  draft.cues.c0001.action = "reorder";
+  draft.cues.c0001.instruction = "整組意見寫在第一張";
+  const result = makeResult(packageData, draft, "2026-08-04T00:00:00Z");
+  assert.equal(result.schema_version, "framecue_review_result_v1");
+  assert.equal(result.cues[0].action, "reorder");
+  assert.equal(result.cues.length, 1);
 });

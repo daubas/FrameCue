@@ -26,7 +26,10 @@
     "cues": { "type": "array", "items": { "$ref": "#/$defs/cue" } }
   },
   "$defs": {
-    "action": { "enum": ["use_edit", "rewrite", "resegment", "retime"] },
+    "action": {
+      "description": "The package-aware validator restricts this vocabulary by workflow kind.",
+      "enum": ["use_edit", "rewrite", "resegment", "retime", "replace_asset", "rewrite_copy", "recrop", "reorder", "cut", "split", "needs_source"]
+    },
     "block": {
       "type": "object",
       "required": ["id", "target_text", "speech_text", "action", "instruction", "approved"],

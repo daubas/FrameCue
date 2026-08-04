@@ -28,6 +28,11 @@
   $: boundary = cue?.boundary || scene?.boundary || null;
   $: sourceVideo = packageData?.media?.video || null;
   $: hyperframes = packageData?.media?.hyperframes || null;
+  $: carousel = packageData?.media?.carousel || null;
+  $: markdown = packageData?.media?.markdown || null;
+  $: workflowKind = packageData?.workflow?.kind || "subtitle";
+  $: cueNumber = Math.max(0, packageData?.cues?.findIndex((item) => item.id === cue?.id) + 1);
+  $: markdownKind = cue?.markdown?.kind === "heading" ? "標題" : cue?.markdown?.kind === "list" ? "清單" : "段落";
   $: availableModes = [
     "still",
     ...(redraw ? ["redraw"] : []),
@@ -185,10 +190,10 @@
   });
 </script>
 
-<section class:portraitStage={stageMode === "video" && hyperframes && !sourceVideo} class="media-stage" aria-label="媒體畫面">
+<section class:portraitStage={stageMode === "video" && hyperframes && !sourceVideo} class:contextMedia={Boolean(carousel || markdown)} class="media-stage" aria-label="媒體畫面">
   <div class="stage-topline">
     <div>
-      <span class="eyebrow">媒體畫面</span>
+      <span class="eyebrow">{carousel ? "圖卡審閱" : markdown ? "Markdown 審閱" : "媒體畫面"}</span>
       <strong>{cue?.id || "沒有 Cue"}</strong>
     </div>
     <div class="mode-strip" aria-label="畫面模式">
@@ -260,6 +265,16 @@
           <figcaption>後：{formatTime(cue?.end_ms || 0)}</figcaption>
         </figure>
       </div>
+    {:else if carousel && scene}
+      <figure class="carousel-stage">
+        <img src={assetUrl(scene.image)} alt={`${cue?.text || cue?.id} 圖卡`} />
+        <figcaption>{cue?.text}</figcaption>
+      </figure>
+    {:else if markdown && cue}
+      <article class="markdown-stage">
+        <span>{markdownKind}</span>
+        <div class:heading={cue?.markdown?.kind === "heading"} class="markdown-block">{cueDraft?.text || ""}</div>
+      </article>
     {:else if scene}
       <div class="still-stage">
         <img src={assetUrl(scene.image)} alt={`${cue.id} 的代表畫面`} />
@@ -281,8 +296,36 @@
     {/if}
   </div>
 
+  {#if carousel}
+    <aside class="context-strip" aria-label="圖卡組參考畫面">
+      <span class="context-label">參考（不列入審閱）</span>
+      <div class="context-images">
+        <a href={assetUrl(carousel.contact_sheet)} target="_blank" rel="noreferrer">
+          <img src={assetUrl(carousel.contact_sheet)} alt="整組圖卡 contact sheet" />
+          <span>整組順序</span>
+        </a>
+        <a href={assetUrl(carousel.mobile_audit)} target="_blank" rel="noreferrer">
+          <img src={assetUrl(carousel.mobile_audit)} alt="390px 手機可讀性檢查" />
+          <span>390px 手機檢查</span>
+        </a>
+      </div>
+    </aside>
+  {:else if markdown}
+    <aside class="markdown-context" aria-label="文章參考內容">
+      <span class="context-label">參考（不列入審閱） · {markdown.source_name}</span>
+      <details>
+        <summary>YAML frontmatter</summary>
+        <pre>{markdown.frontmatter || "沒有 frontmatter"}</pre>
+      </details>
+      <details>
+        <summary>編輯備註</summary>
+        <pre>{markdown.editorial_notes || "沒有編輯備註"}</pre>
+      </details>
+    </aside>
+  {/if}
+
   <div class="stage-footer">
-    <span>{formatTime(cue?.start_ms || 0)} 至 {formatTime(cue?.end_ms || 0)}</span>
+    <span>{carousel ? `第 ${cueNumber} 張，共 ${packageData.cues.length} 張` : markdown ? `第 ${cueNumber} 個區塊，共 ${packageData.cues.length} 個` : `${formatTime(cue?.start_ms || 0)} 至 ${formatTime(cue?.end_ms || 0)}`}</span>
     <div class="stage-actions">
       {#if stageMode === "video" && (sourceVideo || hyperframes)}
         <button type="button" on:click={toggleVideo}>{playerPlaying ? "暫停 Cue" : "播放 Cue"}</button>

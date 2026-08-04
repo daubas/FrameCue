@@ -18,13 +18,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 ADAPTER_PATH = ROOT / "adapters" / "hyperframes-player.html"
-VIEWER_VERSION = "2.3.0"
+VIEWER_VERSION = "2.4.0"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
-WORKFLOW_KINDS = {"subtitle", "redraw", "boundary", "hyperframes"}
-ACTIONS = {"use_edit", "rewrite", "resegment", "retime"}
+WORKFLOW_ACTIONS = {
+    "subtitle": {"use_edit", "rewrite", "resegment", "retime"},
+    "redraw": {"use_edit", "rewrite", "resegment", "retime"},
+    "boundary": {"use_edit", "rewrite", "resegment", "retime"},
+    "hyperframes": {"use_edit", "rewrite", "resegment", "retime"},
+    "image_carousel": {"use_edit", "replace_asset", "rewrite_copy", "recrop", "reorder"},
+    "markdown": {"use_edit", "rewrite", "cut", "split", "needs_source"},
+}
+WORKFLOW_KINDS = set(WORKFLOW_ACTIONS)
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SLIDE_PATTERN = re.compile(r"^slide-(\d+)\.png$", re.IGNORECASE)
+LIST_PATTERN = re.compile(r"^\s*(?:[-*+] |\d+\. )")
+HORIZONTAL_RULE_PATTERN = re.compile(r"^\s{0,3}([-*_])(?:\s*\1){2,}\s*$")
 
 
 class FrameCueError(ValueError):
@@ -127,6 +137,157 @@ def ensure_list(value, label):
     return value
 
 
+def markdown_parts(value):
+    lines = str(value).splitlines()
+    frontmatter = ""
+    if lines[:1] == ["---"]:
+        try:
+            end = lines.index("---", 1)
+        except ValueError as error:
+            raise FrameCueError("Markdown frontmatter is missing its closing ---") from error
+        frontmatter = "\n".join(lines[:end + 1])
+        lines = lines[end + 1:]
+
+    notes_at = next(
+        (index for index, line in enumerate(lines) if line.strip().startswith("## 編輯備註")),
+        None,
+    )
+    editorial_notes = ""
+    if notes_at is not None:
+        editorial_notes = "\n".join(lines[notes_at:]).strip()
+        lines = lines[:notes_at]
+    while lines and (not lines[-1].strip() or HORIZONTAL_RULE_PATTERN.fullmatch(lines[-1])):
+        lines.pop()
+
+    blocks = []
+    current = []
+    current_kind = ""
+
+    def flush():
+        nonlocal current, current_kind
+        text = "\n".join(current).strip()
+        if text:
+            blocks.append({"kind": current_kind or "paragraph", "text": text})
+        current = []
+        current_kind = ""
+
+    for line in lines:
+        if not line.strip():
+            flush()
+            continue
+        if HORIZONTAL_RULE_PATTERN.fullmatch(line):
+            flush()
+            continue
+        if re.match(r"^#{1,6}\s+", line):
+            flush()
+            blocks.append({"kind": "heading", "text": line.strip()})
+            continue
+        if LIST_PATTERN.match(line):
+            if current_kind != "list":
+                flush()
+                current_kind = "list"
+            current.append(line)
+            continue
+        if current_kind == "list" or current_kind == "paragraph":
+            current.append(line)
+        else:
+            flush()
+            current_kind = "paragraph"
+            current.append(line)
+    flush()
+    if not blocks:
+        raise FrameCueError("Markdown article has no reviewable content blocks")
+    return frontmatter, editorial_notes, blocks
+
+
+def markdown_source(article_path, review_id, revision="r1", label=""):
+    article_path = Path(article_path).expanduser().resolve()
+    try:
+        article = article_path.read_text(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise FrameCueError(f"file not found: {article_path}") from error
+    frontmatter, editorial_notes, blocks = markdown_parts(article)
+    scenes = []
+    cues = []
+    for index, block in enumerate(blocks, 1):
+        start = (index - 1) * 1000
+        scene_id = f"s{index:04d}"
+        cue_id = f"c{index:04d}"
+        scenes.append({"id": scene_id, "start_ms": start, "end_ms": start + 1000, "image": ""})
+        cues.append({
+            "id": cue_id,
+            "start_ms": start,
+            "end_ms": start + 1000,
+            "scene_id": scene_id,
+            "text": block["text"],
+            "speech_text": block["text"],
+            "original_text": "",
+            "markdown": {"kind": block["kind"]},
+        })
+    return {
+        "review_id": review_id,
+        "revision": revision,
+        "workflow": {"kind": "markdown", "label": label or article_path.stem},
+        "subtitle_policy": {"display_punctuation": "preserved", "speech_punctuation": "preserved"},
+        "media": {"markdown": {
+            "source_name": article_path.name,
+            "frontmatter": frontmatter,
+            "editorial_notes": editorial_notes,
+        }},
+        "scenes": scenes,
+        "cues": cues,
+        "blocks": [],
+        "provenance": {"source_article": str(article_path)},
+    }
+
+
+def carousel_source(cards_dir, review_id, revision="r1", label=""):
+    cards_dir = Path(cards_dir).expanduser().resolve()
+    if not cards_dir.is_dir():
+        raise FrameCueError(f"cards directory not found: {cards_dir}")
+    slides = sorted(
+        (path for path in cards_dir.iterdir() if path.is_file() and SLIDE_PATTERN.fullmatch(path.name)),
+        key=lambda path: int(SLIDE_PATTERN.fullmatch(path.name).group(1)),
+    )
+    if not slides:
+        raise FrameCueError("cards directory has no slide-NN.png files")
+    contact_sheets = sorted(cards_dir.glob("contact-sheet*.png"))
+    mobile_audits = sorted(cards_dir.glob("mobile-audit*.png"))
+    if len(contact_sheets) != 1 or len(mobile_audits) != 1:
+        raise FrameCueError("cards directory must contain one contact-sheet*.png and one mobile-audit*.png")
+
+    scenes = []
+    cues = []
+    for index, slide in enumerate(slides, 1):
+        start = (index - 1) * 1000
+        scene_id = f"s{index:04d}"
+        cue_id = f"c{index:04d}"
+        scenes.append({"id": scene_id, "start_ms": start, "end_ms": start + 1000, "image": slide.name})
+        cues.append({
+            "id": cue_id,
+            "start_ms": start,
+            "end_ms": start + 1000,
+            "scene_id": scene_id,
+            "text": slide.name,
+            "speech_text": slide.name,
+            "original_text": "",
+        })
+    return {
+        "review_id": review_id,
+        "revision": revision,
+        "workflow": {"kind": "image_carousel", "label": label or cards_dir.parent.name},
+        "subtitle_policy": {"display_punctuation": "preserved", "speech_punctuation": "preserved"},
+        "media": {"carousel": {
+            "contact_sheet": contact_sheets[0].name,
+            "mobile_audit": mobile_audits[0].name,
+        }},
+        "scenes": scenes,
+        "cues": cues,
+        "blocks": [],
+        "provenance": {"source_cards_dir": str(cards_dir)},
+    }
+
+
 def relative_path(value, label):
     value = as_text(value, label)
     path = Path(value)
@@ -180,6 +341,7 @@ def validate_package(package, package_dir=None, check_assets=True):
     workflow = package.get("workflow")
     if not isinstance(workflow, dict) or workflow.get("kind") not in WORKFLOW_KINDS:
         raise FrameCueError("package.workflow.kind is invalid")
+    workflow_kind = workflow["kind"]
     policy = package.get("subtitle_policy")
     if not isinstance(policy, dict) or not policy.get("display_punctuation") or not policy.get("speech_punctuation"):
         raise FrameCueError("package.subtitle_policy is incomplete")
@@ -208,8 +370,11 @@ def validate_package(package, package_dir=None, check_assets=True):
         end = as_ms(scene.get("end_ms"), f"{label}.end_ms")
         if end < start:
             raise FrameCueError(f"{label}.end_ms must not precede start_ms")
-        if check_assets:
-            asset_exists(package_dir, scene.get("image", ""), f"{label}.image")
+        image = as_text(scene.get("image", ""), f"{label}.image")
+        if not image and workflow_kind != "markdown":
+            raise FrameCueError(f"{label}.image must not be empty")
+        if check_assets and image:
+            asset_exists(package_dir, image, f"{label}.image")
             for nested, key, asset_label in nested_asset_paths(scene, label):
                 asset_exists(package_dir, nested[key], asset_label)
 
@@ -235,6 +400,10 @@ def validate_package(package, package_dir=None, check_assets=True):
         risks = cue.get("risks", [])
         if not isinstance(risks, list) or not all(isinstance(item, str) for item in risks):
             raise FrameCueError(f"{label}.risks must be a string array")
+        markdown = cue.get("markdown")
+        if workflow_kind == "markdown":
+            if not isinstance(markdown, dict) or markdown.get("kind") not in {"paragraph", "heading", "list"}:
+                raise FrameCueError(f"{label}.markdown.kind is invalid")
         if check_assets:
             for nested, key, asset_label in nested_asset_paths(cue, label):
                 asset_exists(package_dir, nested[key], asset_label)
@@ -285,12 +454,32 @@ def validate_package(package, package_dir=None, check_assets=True):
             asset_exists(package_dir, video["src"], "package.media.video.src")
             asset_exists(package_dir, video["captions"], "package.media.video.captions")
 
+    if workflow_kind == "image_carousel":
+        carousel = package["media"].get("carousel")
+        if not isinstance(carousel, dict):
+            raise FrameCueError("package.media.carousel must be an object")
+        if len(scenes) != len(cues) or len({cue["scene_id"] for cue in cues}) != len(cues):
+            raise FrameCueError("image carousel must contain one independent cue per scene")
+        for key in ("contact_sheet", "mobile_audit"):
+            as_text(carousel.get(key, ""), f"package.media.carousel.{key}")
+            if check_assets:
+                asset_exists(package_dir, carousel[key], f"package.media.carousel.{key}")
+
+    if workflow_kind == "markdown":
+        markdown = package["media"].get("markdown")
+        if not isinstance(markdown, dict):
+            raise FrameCueError("package.media.markdown must be an object")
+        for key in ("source_name", "frontmatter", "editorial_notes"):
+            as_text(markdown.get(key, ""), f"package.media.markdown.{key}")
+        if len(scenes) != len(cues) or len({cue["scene_id"] for cue in cues}) != len(cues):
+            raise FrameCueError("Markdown mode must contain one cue per content block")
+
     return {
         "review_id": package["review_id"],
         "revision": package["revision"],
         "cue_count": len(cues),
         "block_count": len(blocks),
-        "workflow": workflow["kind"],
+        "workflow": workflow_kind,
     }
 
 
@@ -314,6 +503,7 @@ def validate_result(result, package, require_approved=False):
 
     result_cues = ensure_list(result.get("cues"), "result.cues")
     result_blocks = ensure_list(result.get("blocks"), "result.blocks")
+    actions = WORKFLOW_ACTIONS[package["workflow"]["kind"]]
     expected_cues = {cue["id"] for cue in package["cues"]}
     expected_blocks = {block["id"] for block in package["blocks"]}
     cue_ids = [as_text(row.get("id", ""), "result.cues[].id") for row in result_cues if isinstance(row, dict)]
@@ -328,16 +518,16 @@ def validate_result(result, package, require_approved=False):
             raise FrameCueError("result.cues entries must be objects")
         as_text(row.get("text", ""), "result.cues[].text")
         as_text(row.get("speech_text", ""), "result.cues[].speech_text")
-        if row.get("action") not in ACTIONS:
-            raise FrameCueError("result.cues[].action is invalid")
+        if row.get("action") not in actions:
+            raise FrameCueError(f"result.cues[].action is invalid for {package['workflow']['kind']}")
         as_text(row.get("instruction", ""), "result.cues[].instruction")
     for row in result_blocks:
         if not isinstance(row, dict):
             raise FrameCueError("result.blocks entries must be objects")
         as_text(row.get("target_text", ""), "result.blocks[].target_text")
         as_text(row.get("speech_text", ""), "result.blocks[].speech_text")
-        if row.get("action") not in ACTIONS:
-            raise FrameCueError("result.blocks[].action is invalid")
+        if row.get("action") not in actions:
+            raise FrameCueError(f"result.blocks[].action is invalid for {package['workflow']['kind']}")
         as_text(row.get("instruction", ""), "result.blocks[].instruction")
         if not isinstance(row.get("approved"), bool):
             raise FrameCueError("result.blocks[].approved must be boolean")
@@ -550,9 +740,10 @@ def copy_viewer(out_dir):
 
 def materialize_assets(package, source_root, out_dir):
     for scene in package["scenes"]:
-        source = resolve_source_path(scene["image"], source_root, f"scene {scene['id']} image")
-        suffix = source.suffix or ".bin"
-        scene["image"] = copy_file(source, out_dir, Path("assets/scenes") / f"{scene['id']}{suffix}")
+        if scene["image"]:
+            source = resolve_source_path(scene["image"], source_root, f"scene {scene['id']} image")
+            suffix = source.suffix or ".bin"
+            scene["image"] = copy_file(source, out_dir, Path("assets/scenes") / f"{scene['id']}{suffix}")
         copy_nested_assets(scene, source_root, out_dir, Path("assets/scenes") / scene["id"], f"scene {scene['id']}")
     for cue in package["cues"]:
         if cue.get("audio"):
@@ -576,6 +767,16 @@ def materialize_assets(package, source_root, out_dir):
         write_video_captions(package["cues"], captions)
         output["captions"] = "assets/video/captions.vtt"
         package["media"]["video"] = output
+
+    carousel = package["media"].get("carousel")
+    if carousel:
+        if not isinstance(carousel, dict):
+            raise FrameCueError("media.carousel must be an object")
+        output = copy.deepcopy(carousel)
+        for key in ("contact_sheet", "mobile_audit"):
+            source = resolve_source_path(carousel.get(key, ""), source_root, f"media.carousel.{key}")
+            output[key] = copy_file(source, out_dir, Path("assets/context") / f"{key}{source.suffix or '.png'}")
+        package["media"]["carousel"] = output
 
     hyperframes = package["media"].get("hyperframes")
     if not hyperframes:
@@ -833,6 +1034,20 @@ def command_build(args):
     print(json.dumps(summary, ensure_ascii=False))
 
 
+def command_build_carousel(args):
+    cards_dir = Path(args.cards_dir).expanduser().resolve()
+    source = carousel_source(cards_dir, args.review_id, args.revision, args.label)
+    summary = build_package(source, cards_dir, args.out_dir, args.viewer_version)
+    print(json.dumps(summary, ensure_ascii=False))
+
+
+def command_build_markdown(args):
+    article = Path(args.article).expanduser().resolve()
+    source = markdown_source(article, args.review_id, args.revision, args.label)
+    summary = build_package(source, article.parent, args.out_dir, args.viewer_version)
+    print(json.dumps(summary, ensure_ascii=False))
+
+
 def command_validate(args):
     package, summary = bundle_summary(args.package)
     if args.result:
@@ -888,6 +1103,24 @@ def parser():
     build.add_argument("--out-dir", required=True)
     build.add_argument("--viewer-version", default=VIEWER_VERSION)
     build.set_defaults(func=command_build)
+
+    carousel = commands.add_parser("build-carousel", help="build one independent review cue per slide-NN.png")
+    carousel.add_argument("--cards-dir", required=True)
+    carousel.add_argument("--review-id", required=True)
+    carousel.add_argument("--revision", default="r1")
+    carousel.add_argument("--label", default="")
+    carousel.add_argument("--out-dir", required=True)
+    carousel.add_argument("--viewer-version", default=VIEWER_VERSION)
+    carousel.set_defaults(func=command_build_carousel)
+
+    markdown = commands.add_parser("build-markdown", help="build one review cue per Markdown content block")
+    markdown.add_argument("--article", required=True)
+    markdown.add_argument("--review-id", required=True)
+    markdown.add_argument("--revision", default="r1")
+    markdown.add_argument("--label", default="")
+    markdown.add_argument("--out-dir", required=True)
+    markdown.add_argument("--viewer-version", default=VIEWER_VERSION)
+    markdown.set_defaults(func=command_build_markdown)
 
     validate = commands.add_parser("validate", help="validate a v2 package and optional result")
     validate.add_argument("--package", required=True)

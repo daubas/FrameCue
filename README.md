@@ -25,6 +25,27 @@ python3 framecue.py build \
   --out-dir review-r1
 ```
 
+The two content-first modes also have deterministic builders:
+
+```bash
+python3 framecue.py build-carousel \
+  --cards-dir /path/to/cards \
+  --review-id ep01-cards \
+  --out-dir review-ep01-cards-r1
+
+python3 framecue.py build-markdown \
+  --article /path/to/article.md \
+  --review-id ep01-article \
+  --out-dir review-ep01-article-r1
+```
+
+`build-carousel` reviews only `slide-NN.png` files. One contact sheet and one
+`mobile-audit*.png` are bundled as non-reviewable context. A whole-set note,
+such as an ordering issue, belongs in the first Cue's free-text instruction.
+`build-markdown`
+reviews headings, paragraphs, and lists as independent Cues; YAML frontmatter
+and the trailing `## 編輯備註` section remain read-only context.
+
 The output is self-contained:
 
 ```text
@@ -61,13 +82,19 @@ unapproved result.
 - relative media assets, scenes, cues, optional semantic blocks, and pronunciation risks;
 - punctuation policy, provenance, and previous-revision lineage.
 
-`framecue_review_result_v1` is a complete snapshot of every cue and block,
-with the selected follow-up action:
+`framecue_review_result_v1` is a complete snapshot of every cue and block.
+Follow-up actions are restricted by the package workflow:
 
-- `use_edit`
-- `rewrite`
-- `resegment`
-- `retime`
+| Workflow | Actions |
+|---|---|
+| Subtitle, redraw, boundary, HyperFrames | `use_edit`, `rewrite`, `resegment`, `retime` |
+| Image carousel | `use_edit`, `replace_asset`, `rewrite_copy`, `recrop`, `reorder` |
+| Markdown | `use_edit`, `rewrite`, `cut`, `split`, `needs_source` |
+
+The result schema lists the legal tokens because the result intentionally does
+not repeat the workflow kind. The package-aware validator and `collect` enforce
+the narrower per-mode vocabulary, so existing subtitle packages retain their
+original validation behavior.
 
 When blocks exist, they own meaning and `speech_text`; cues own review display
 segmentation. Cue timings are read-only. Each block can be approved, then the
@@ -78,12 +105,14 @@ Schemas live in [schemas](schemas/).
 
 ## Supported Workflows
 
-v2 supports one contract across four current review modes:
+v2 supports one contract across six review modes:
 
 1. Cue and semantic-block subtitle review.
 2. Redraw before/after review with generation trace.
 3. Subtitle-boundary review.
 4. HyperFrames playback review.
+5. Image-carousel review with one independent Cue per image and no set verdict.
+6. Traditional-Chinese Markdown review with one Cue per content block.
 
 The viewer switches media stage mode without changing the review data model.
 Risk and All are cue filters, not separate viewer implementations.
@@ -105,9 +134,10 @@ the browser:
 
 The CLI copies it into the immutable bundle, generates a bilingual WebVTT track,
 and writes `media.video.src` and `media.video.captions` as bundle-relative paths.
-In Video mode, selecting a Cue seeks to its start. `Play cue` and Space stop at
-the Cue end; the native controls remain available for scrubbing or continuous
-playback.
+In Video mode, selecting a Cue seeks to its start. In Cue scope, `Play cue` and
+Space stop at the Cue end; in semantic-block scope, Space approves a valid block
+and selects the next block. The native controls remain available for scrubbing
+or continuous playback.
 
 ## Multi-Package Review
 
@@ -176,7 +206,8 @@ python3 -m unittest discover -s tests -v
 python3 framecue.py self-check
 ```
 
-The test fixtures cover subtitle, redraw, boundary, and HyperFrames bundles.
+The checks cover subtitle, redraw, boundary, HyperFrames, image-carousel, and
+Markdown bundles, including workflow-specific result actions.
 
 ## Architecture Notes
 

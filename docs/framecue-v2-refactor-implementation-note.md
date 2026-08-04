@@ -1,7 +1,7 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: implementation complete; consistency release pinned at `v2.1.0`
-Last updated: 2026-07-24
+Status: implementation complete; latest validated runtime pinned at `v2.3.0`
+Last updated: 2026-07-30
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
 
@@ -295,3 +295,11 @@ Each implementation phase must leave the smallest runnable check that proves its
 - Added the `v2.1.0` consistency gate after production review found that independently editable Cue and Block text could authorize stale TTS wording.
 - Cue edits now invalidate the parent block, browser approval checks normalized Cue/Block/Speech content, and the CLI repeats that validation at collection time.
 - Added one native Node state-transition test and one Python approved-result regression test; no new runtime dependency was introduced.
+
+### 2026-07-30 - AgenticDub production pilot
+
+- Released `v2.3.0`: Traditional Chinese controls, source-video playback that follows the active Cue and Block, representative Cue imagery, bilingual subtitle presentation, and editor-focus playback pause. The release remains a static portable viewer with no new runtime dependency.
+- Completed the Jensen Startup School production pilot at immutable revision `r12`: 414 Cues, 232 semantic blocks, an approved complete result, and an AgenticDub output that passed the two-provider STT cross-audit for all 232 blocks.
+- The pilot confirmed that post-approval TTS pronunciation guidance is not subtitle content. When that guidance changes, AgenticDub creates a new immutable package and records an inherited-content approval only after asserting Cue, Block, Scene, Media, Risk, and subtitle-policy payloads are unchanged from the approved revision.
+- The final QC video is a separate human gate. FrameCue approval authorizes reviewed subtitle content; it does not silently authorize publication. The r12 QC artifact is available through the read-only FBR handoff and remains `final_qc_pending`.
+- Production timing did not clip speech: maximum fitted speed was `1.0714x`, the voice ended before the original-video fade, and visual checks confirmed video and bilingual captions after late Cue `c0359` and at the ending.

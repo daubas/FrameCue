@@ -1,7 +1,7 @@
 # HyperFrames Review Player Integration - Implementation Note
 
 Status: implementation candidate complete; pilot cutover deferred until existing browser drafts are exported or explicitly retired
-Last updated: 2026-07-15
+Last updated: 2026-07-24
 Related proposal: [hyperframes-review-integration.md](hyperframes-review-integration.md)
 
 ## Purpose
@@ -213,7 +213,7 @@ Send playback time at about 20 Hz while playing. This keeps cue highlighting wit
 - Leaving Video pauses the Review Player.
 - Playing a per-cue clip pauses the Review Player and `fullVideo` first.
 - Playing `fullVideo` pauses the Review Player and per-cue audio first.
-- The global Space shortcut routes to the active review context: Review Player in Video stage mode, per-cue audio in Still stage mode, and never both.
+- In Cue scope, the global Space shortcut routes to the active playback context: Review Player in Video stage mode, per-cue audio in Still stage mode, and never both. In semantic-block scope, Space pauses playback, approves a valid block, and selects the next block.
 - At no time may more than one of the Review Player narration, composition narration, per-cue audio, or redraw `fullVideo` be audible.
 
 ### UI behavior
@@ -284,6 +284,33 @@ Send playback time at about 20 Hz while playing. This keeps cue highlighting wit
 - Decide whether the long-term review bundle should serve the project root or copy HyperFrames under a portable review directory.
 - Export or explicitly retire the browser drafts under the existing pilot route before replacing `review/framecue/index.html` with the validated candidate.
 
+## External Components Evaluated
+
+The viewer refactor should not replace FrameCue with a full subtitle editor or
+video editor. FrameCue needs a portable, package-local review surface with Cue,
+Block, redraw, and optional HyperFrames playback. No evaluated full application
+matches that boundary without adding a server, a framework runtime, or an
+unrelated editing model.
+
+| Component | Adopt only when | Decision |
+|---|---|---|
+| [wavesurfer.js](https://github.com/katspaugh/wavesurfer.js) with its [Regions plugin](https://wavesurfer-js.pages.dev/docs/classes/plugins_regions.RegionsPlugin) | Reviewers must directly inspect or drag Cue start/end timing against a waveform | Best future addition. Keep the native cue-audio control until that requirement is accepted. For long audio, generate pre-decoded peaks; do not depend on a CDN. |
+| [Video.js](https://github.com/videojs/video.js) | FrameCue must play ordinary MP4/HLS/DASH media with standard text tracks across browsers | Defer. Native media elements remain smaller for current package assets, and Video.js does not replace the HyperFrames iframe protocol. |
+| [webvtt.js](https://github.com/annevk/webvtt) | FrameCue needs spec-compliant WebVTT import, parsing, or serialization | Defer. It is a parser/validator, not a review UI; current SRT packaging does not need it. |
+
+Keep [Subtitle Edit](https://github.com/SubtitleEdit/subtitleedit) as an
+external specialist tool for exceptional timing repair, not an embeddable
+dependency. Do not adopt server-backed review apps such as
+[OpenVidReview](https://github.com/davidguva/OpenVidReview), or React/Remotion
+video-editor foundations such as
+[React Video Editor](https://github.com/reactvideoeditor/free-react-video-editor),
+for the canonical viewer. They solve a different product problem and would make
+review packages less portable.
+
+The default refactor path is therefore: one canonical FrameCue viewer, native
+browser media controls, and no new dependency. Revisit only when a concrete
+timing-edit, standards-playback, or WebVTT-import requirement is accepted.
+
 ## Implementation Log
 
 ### 2026-07-15 - Baseline audit
@@ -318,3 +345,11 @@ Send playback time at about 20 Hz while playing. This keeps cue highlighting wit
 - Re-ran HyperFrames 0.6.55 lint, compositions, inspect, and isolated snapshots. Results: 0 lint errors, 3 non-blocking warnings, one 81.1-second 1080x1920 composition, 0 inspect issues, and 5 snapshots with a non-blocking `Huninn` fallback warning.
 - The Codex in-app browser was unavailable, so browser checks used a local headless Chrome CDP session against the same served pages.
 - No TTS, final render, publishing, review-package rebuild, or original-pilot cutover was performed.
+
+### 2026-07-24 - External viewer component assessment
+
+- Reviewed open-source subtitle editors, video-review applications, browser media players, a waveform/region component, and a WebVTT parser.
+- Recorded wavesurfer.js as the only candidate worth adding when direct Cue timing review becomes a confirmed requirement.
+- Deferred Video.js and webvtt.js behind explicit standards-playback and WebVTT-import requirements.
+- Rejected full-editor and server-backed replacements for the portable FrameCue viewer boundary.
+- No dependency, viewer, package, TTS, render, or publishing change was made.

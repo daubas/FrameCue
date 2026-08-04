@@ -6,6 +6,7 @@
   import { downloadText, resultFileName } from "./lib/download.js";
   import { loadDraft, removeDraft, saveDraft } from "./lib/storage.js";
   import {
+    approveBlockAndAdvance,
     blockContentIssue,
     changedCount,
     createDraft,
@@ -147,6 +148,9 @@
   function updateCue(cueId, patch) {
     const next = { ...patch };
     if (Object.hasOwn(next, "text")) next.text = textForDisplay(packageData, next.text);
+    if (["image_carousel", "markdown"].includes(packageData.workflow.kind) && Object.hasOwn(next, "text")) {
+      next.speech_text = next.text;
+    }
     persist(withCueChange(packageData, draft, cueId, next));
   }
 
@@ -233,6 +237,12 @@
     }
     if (event.key === " ") {
       event.preventDefault();
+      if (draft?.active_scope === "block" && selectedBlock) {
+        if (event.repeat) return;
+        window.dispatchEvent(new Event("framecue:pause-playback"));
+        persist(approveBlockAndAdvance(packageData, draft, selectedBlock.id));
+        return;
+      }
       window.dispatchEvent(new Event("framecue:toggle-playback"));
     }
   }
@@ -284,7 +294,9 @@
         <span class="change-count">已變更 {changed} 項</span>
       </div>
       <div class="toolbar-actions">
-        <button type="button" on:click={downloadSrt}>輸出 SRT</button>
+        {#if ["subtitle", "redraw", "boundary", "hyperframes"].includes(packageData.workflow.kind)}
+          <button type="button" on:click={downloadSrt}>輸出 SRT</button>
+        {/if}
         <button type="button" on:click={downloadResult}>輸出審閱結果</button>
         <button class:approved={Boolean(draft.final_approval)} class="approve-package" disabled={!approvalAllowed || Boolean(draft.final_approval)} type="button" on:click={approvePackage}>
           {draft.final_approval ? "套件已核准" : "核准套件"}

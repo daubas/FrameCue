@@ -27,7 +27,7 @@
       "type": "object",
       "required": ["kind"],
       "properties": {
-        "kind": { "enum": ["subtitle", "redraw", "boundary", "hyperframes"] },
+        "kind": { "enum": ["subtitle", "redraw", "boundary", "hyperframes", "image_carousel", "markdown"] },
         "label": { "type": "string" }
       },
       "additionalProperties": true
@@ -50,6 +50,25 @@
           "properties": {
             "src": { "type": "string", "minLength": 1 },
             "captions": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": true
+        },
+        "carousel": {
+          "type": "object",
+          "required": ["contact_sheet", "mobile_audit"],
+          "properties": {
+            "contact_sheet": { "type": "string", "minLength": 1 },
+            "mobile_audit": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": true
+        },
+        "markdown": {
+          "type": "object",
+          "required": ["source_name", "frontmatter", "editorial_notes"],
+          "properties": {
+            "source_name": { "type": "string" },
+            "frontmatter": { "type": "string" },
+            "editorial_notes": { "type": "string" }
           },
           "additionalProperties": true
         }
@@ -109,7 +128,15 @@
         "original_text": { "type": "string" },
         "audio": { "type": "string" },
         "risks": { "type": "array", "items": { "type": "string" } },
-        "boundary": { "type": "object" }
+        "boundary": { "type": "object" },
+        "markdown": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["paragraph", "heading", "list"] }
+          },
+          "additionalProperties": true
+        }
       },
       "additionalProperties": true
     },

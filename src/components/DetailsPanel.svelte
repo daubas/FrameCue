@@ -20,7 +20,7 @@
       <div><dt>流程</dt><dd>{packageData.workflow.kind}</dd></div>
       <div><dt>檢視器</dt><dd>{packageData.viewer_version}</dd></div>
       <div><dt>變更</dt><dd>{changed}</dd></div>
-      <div><dt>語意塊門檻</dt><dd>{approvalAllowed ? "可核准" : "請先審閱語意塊"}</dd></div>
+      <div><dt>核准門檻</dt><dd>{approvalAllowed ? "可核准" : "請先完成必要審閱"}</dd></div>
       <div><dt>最終核准</dt><dd>{approvedAt || "尚未核准"}</dd></div>
       <div><dt>校驗碼</dt><dd class="checksum">{packageData.content_checksum}</dd></div>
     </dl>

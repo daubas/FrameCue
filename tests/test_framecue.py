@@ -60,6 +60,49 @@ class FrameCueV2Tests(unittest.TestCase):
             framecue.validate_result(result, package, require_approved=True)
         self.assertTrue((out_dir / "review_package.json").is_file())
 
+    def test_new_modes_build_from_carousel_and_markdown_inputs(self):
+        cards = self.output / "cards"
+        cards.mkdir()
+        for name in ("slide-01.png", "slide-02.png", "contact-sheet-v1.png", "mobile-audit-390.png"):
+            (cards / name).write_bytes(b"framecue-png")
+        carousel_source = framecue.carousel_source(cards, "fixture-carousel")
+        carousel_dir = self.output / "carousel"
+        framecue.build_package(carousel_source, cards, carousel_dir)
+        carousel = framecue.read_json(carousel_dir / "review_package.json")
+        self.assertEqual(carousel["workflow"]["kind"], "image_carousel")
+        self.assertEqual(len(carousel["cues"]), 2)
+        self.assertTrue((carousel_dir / carousel["media"]["carousel"]["contact_sheet"]).is_file())
+
+        article = self.output / "article.md"
+        article.write_text(
+            "---\nepisode: Ep01\n---\n\n# 黃仁勳在晶圓上寫了一句話\n\n請多做一點。\n\n- 算力\n- 電力\n\n---\n\n## 編輯備註（Gate B 自審）\n\n- 這裡不是審閱目標。\n",
+            encoding="utf-8",
+        )
+        markdown_source = framecue.markdown_source(article, "fixture-markdown")
+        markdown_dir = self.output / "markdown"
+        framecue.build_package(markdown_source, article.parent, markdown_dir)
+        markdown = framecue.read_json(markdown_dir / "review_package.json")
+        self.assertEqual([cue["markdown"]["kind"] for cue in markdown["cues"]], ["heading", "paragraph", "list"])
+        self.assertIn("episode: Ep01", markdown["media"]["markdown"]["frontmatter"])
+        self.assertIn("編輯備註", markdown["media"]["markdown"]["editorial_notes"])
+        self.assertNotIn("編輯備註", "\n".join(cue["text"] for cue in markdown["cues"]))
+
+    def test_result_actions_are_restricted_by_workflow(self):
+        _, package, _ = self.build_fixture("redraw")
+        result = framecue.default_result(package, approved=True)
+        result["cues"][0]["action"] = "replace_asset"
+        with self.assertRaisesRegex(framecue.FrameCueError, "invalid for redraw"):
+            framecue.validate_result(result, package, require_approved=True)
+
+        package["workflow"]["kind"] = "image_carousel"
+        package["content_checksum"] = framecue.package_checksum(package)
+        result["package_checksum"] = package["content_checksum"]
+        self.assertEqual(framecue.validate_result(result, package, require_approved=True)["status"], "approved")
+
+        result["cues"][0]["action"] = "needs_source"
+        with self.assertRaisesRegex(framecue.FrameCueError, "invalid for image_carousel"):
+            framecue.validate_result(result, package, require_approved=True)
+
     def test_approved_result_rejects_cue_block_speech_divergence(self):
         _, package, _ = self.build_fixture("basic")
         result = framecue.default_result(package, approved=True)

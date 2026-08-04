@@ -1,9 +1,34 @@
-export const ACTIONS = [
+const subtitleActions = [
   { value: "use_edit", label: "採用直接修改" },
   { value: "rewrite", label: "重新改寫內容" },
   { value: "resegment", label: "重新切分" },
   { value: "retime", label: "回上游調整時間" }
 ];
+
+export const ACTIONS_BY_WORKFLOW = {
+  subtitle: subtitleActions,
+  redraw: subtitleActions,
+  boundary: subtitleActions,
+  hyperframes: subtitleActions,
+  image_carousel: [
+    { value: "use_edit", label: "無需後續處理" },
+    { value: "replace_asset", label: "替換素材" },
+    { value: "rewrite_copy", label: "改寫圖卡文案" },
+    { value: "recrop", label: "重新裁切" },
+    { value: "reorder", label: "調整順序" }
+  ],
+  markdown: [
+    { value: "use_edit", label: "採用直接修改" },
+    { value: "rewrite", label: "改寫" },
+    { value: "cut", label: "刪減" },
+    { value: "split", label: "拆分區塊" },
+    { value: "needs_source", label: "需要來源" }
+  ]
+};
+
+export function actionsForWorkflow(kind) {
+  return ACTIONS_BY_WORKFLOW[kind] || subtitleActions;
+}
 
 const protectedLatinToken = /(?<![A-Za-z0-9])(?:[A-Za-z0-9]+(?:[._/+\-][A-Za-z0-9+#]+)+|[A-Za-z][+#]{1,2})(?![A-Za-z0-9])/g;
 const displayPunctuation = /[，。？！、；："'（）【】《》「」『』·・･•…—–\-!?,.:;()\[\]<>’]+/g;
@@ -43,7 +68,7 @@ export function createDraft(packageData) {
     selected_cue_id: packageData.cues[0]?.id || "",
     selected_block_id: packageData.blocks[0]?.id || "",
     active_scope: packageData.blocks.length ? "block" : "cue",
-    cue_filter: "risk",
+    cue_filter: packageData.cues.some((cue) => cue.risks?.length) ? "risk" : "all",
     cues: Object.fromEntries(packageData.cues.map((cue) => [cue.id, {
       text: cue.text,
       speech_text: cue.speech_text,
@@ -64,13 +89,14 @@ export function createDraft(packageData) {
 export function mergeDraft(packageData, savedDraft) {
   const fresh = createDraft(packageData);
   if (!savedDraft || savedDraft.schema_version !== fresh.schema_version) return fresh;
+  const actions = actionsForWorkflow(packageData.workflow?.kind);
   for (const cue of packageData.cues) {
     const saved = savedDraft.cues?.[cue.id];
     if (!saved) continue;
     fresh.cues[cue.id] = {
       text: textForDisplay(packageData, saved.text ?? cue.text),
       speech_text: String(saved.speech_text ?? cue.speech_text),
-      action: ACTIONS.some((action) => action.value === saved.action) ? saved.action : "use_edit",
+      action: actions.some((action) => action.value === saved.action) ? saved.action : "use_edit",
       instruction: String(saved.instruction || "")
     };
   }
@@ -80,7 +106,7 @@ export function mergeDraft(packageData, savedDraft) {
     fresh.blocks[block.id] = {
       target_text: textForDisplay(packageData, saved.target_text ?? block.target_text),
       speech_text: String(saved.speech_text ?? block.speech_text),
-      action: ACTIONS.some((action) => action.value === saved.action) ? saved.action : "use_edit",
+      action: actions.some((action) => action.value === saved.action) ? saved.action : "use_edit",
       instruction: String(saved.instruction || ""),
       approved: Boolean(saved.approved)
     };
@@ -157,6 +183,19 @@ export function withBlockApproval(packageData, draft, blockId, approved) {
       [blockId]: { ...draft.blocks[blockId], approved }
     },
     final_approval: null
+  };
+}
+
+export function approveBlockAndAdvance(packageData, draft, blockId) {
+  const nextDraft = draft.blocks[blockId]?.approved ? draft : withBlockApproval(packageData, draft, blockId, true);
+  if (!nextDraft.blocks[blockId]?.approved || blockContentIssue(packageData, nextDraft, blockId)) return nextDraft;
+  const nextBlock = packageData.blocks[packageData.blocks.findIndex((block) => block.id === blockId) + 1];
+  if (!nextBlock) return nextDraft;
+  return {
+    ...nextDraft,
+    active_scope: "block",
+    selected_block_id: nextBlock.id,
+    selected_cue_id: nextBlock.cue_ids[0] || nextDraft.selected_cue_id
   };
 }
 
