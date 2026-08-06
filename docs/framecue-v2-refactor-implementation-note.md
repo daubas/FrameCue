@@ -1,6 +1,6 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: implementation complete; latest validated runtime pinned at `v2.4.0`
+Status: implementation complete; latest validated runtime pinned at `v2.5.0`
 Last updated: 2026-08-06
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
