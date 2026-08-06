@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -22,6 +23,11 @@ const packageData = {
   cues: [{ id: "c0001" }, { id: "c0002" }],
   blocks: [{ id: "b0001", cue_ids: ["c0001", "c0002"] }]
 };
+
+test("App wires the search replacement callback into the workbench", () => {
+  const app = readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8");
+  assert.match(app, /onReplaceAll=\{replaceAll\}/);
+});
 
 function approvedDraft() {
   return {

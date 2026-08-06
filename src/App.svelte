@@ -304,7 +304,7 @@
         onSelectCue={selectCue}
         onCueChange={updateCue}
         onBlockChange={updateBlock}
-        {replaceAll}
+        onReplaceAll={replaceAll}
       />
     </div>
     <DetailsPanel
