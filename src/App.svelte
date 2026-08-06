@@ -6,7 +6,7 @@
   import { downloadText, resultFileName } from "./lib/download.js";
   import { loadDraft, removeDraft, saveDraft } from "./lib/storage.js";
   import {
-    approveBlockAndAdvance,
+    approveReviewedBlock,
     blockContentIssue,
     changedCount,
     createDraft,
@@ -14,8 +14,9 @@
     formatTime,
     makeResult,
     mergeDraft,
+    reviewedCueCount,
+    reviewCueAndAdvance,
     textForDisplay,
-    withBlockApproval,
     withBlockChange,
     withCueChange
   } from "./lib/review.js";
@@ -36,6 +37,7 @@
   $: approvalAllowed = packageData && draft ? finalApprovalAllowed(packageData, draft) : false;
   $: selectedBlockIssue = packageData && draft && selectedBlock ? blockContentIssue(packageData, draft, selectedBlock.id) : "";
   $: changed = packageData && draft ? changedCount(packageData, draft) : 0;
+  $: reviewed = packageData && draft ? reviewedCueCount(packageData, draft) : 0;
 
   function validateBrowserPackage(value) {
     if (!value || value.schema_version !== "framecue_package_v2") {
@@ -112,28 +114,11 @@
     });
   }
 
-  function selectBlock(blockId) {
-    if (!packageData || !draft) return;
-    const block = packageData.blocks.find((item) => item.id === blockId);
-    if (!block) return;
-    persist({
-      ...draft,
-      active_scope: "block",
-      selected_block_id: blockId,
-      selected_cue_id: block.cue_ids[0] || draft.selected_cue_id
-    });
-  }
-
   function navigateCue(direction) {
     if (!packageData || !selectedCue) return;
     const current = packageData.cues.findIndex((cue) => cue.id === selectedCue.id);
     const next = Math.max(0, Math.min(packageData.cues.length - 1, current + direction));
     selectCue(packageData.cues[next].id);
-  }
-
-  function setScope(scope) {
-    if (scope === "block" && !packageData.blocks.length) return;
-    persist({ ...draft, active_scope: scope });
   }
 
   function setFilter(cueFilter) {
@@ -158,11 +143,7 @@
     const next = { ...patch };
     if (Object.hasOwn(next, "target_text")) next.target_text = textForDisplay(packageData, next.target_text);
     if (Object.hasOwn(next, "speech_text")) next.speech_text = String(next.speech_text || "");
-    persist(withBlockChange(draft, blockId, next));
-  }
-
-  function toggleBlockApproval(blockId, approved) {
-    persist(withBlockApproval(packageData, draft, blockId, approved));
+    persist(approveReviewedBlock(packageData, withBlockChange(draft, blockId, next), blockId));
   }
 
   function replaceAll(search, replacement) {
@@ -237,13 +218,9 @@
     }
     if (event.key === " ") {
       event.preventDefault();
-      if (draft?.active_scope === "block" && selectedBlock) {
-        if (event.repeat) return;
-        window.dispatchEvent(new Event("framecue:pause-playback"));
-        persist(approveBlockAndAdvance(packageData, draft, selectedBlock.id));
-        return;
-      }
-      window.dispatchEvent(new Event("framecue:toggle-playback"));
+      if (event.repeat || !selectedCue) return;
+      window.dispatchEvent(new Event("framecue:pause-playback"));
+      persist(reviewCueAndAdvance(packageData, draft, selectedCue.id));
     }
   }
 
@@ -290,7 +267,7 @@
             </select>
           </label>
         {/if}
-        <span class="progress">{selectedCue ? `${packageData.cues.findIndex((cue) => cue.id === selectedCue.id) + 1} / ${packageData.cues.length}` : "0 / 0"}</span>
+        <span class="progress">已審 {reviewed} / {packageData.cues.length}</span>
         <span class="change-count">已變更 {changed} 項</span>
       </div>
       <div class="toolbar-actions">
@@ -321,16 +298,12 @@
         {selectedCue}
         {selectedBlock}
         blockIssue={selectedBlockIssue}
-        activeScope={draft.active_scope}
         cueFilter={draft.cue_filter}
         {playbackCueId}
-        onScopeChange={setScope}
         onFilterChange={setFilter}
         onSelectCue={selectCue}
-        onSelectBlock={selectBlock}
         onCueChange={updateCue}
         onBlockChange={updateBlock}
-        onBlockApproval={toggleBlockApproval}
         {replaceAll}
       />
     </div>

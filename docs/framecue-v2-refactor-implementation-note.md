@@ -1,7 +1,7 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: implementation complete; latest validated runtime pinned at `v2.3.0`
-Last updated: 2026-07-30
+Status: implementation complete; latest validated runtime pinned at `v2.4.0`
+Last updated: 2026-08-06
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
 
@@ -81,7 +81,7 @@ Exact JSON property names and validation constraints are frozen when the schemas
 
 The result snapshot repeats the package identity, records final approval state, and contains the complete reviewed blocks, cues, and follow-up actions. A checksum mismatch is a hard rejection, not a warning.
 
-### Block-first semantics
+### Block-owned semantics
 
 - When semantic blocks exist, blocks own meaning and speech text.
 - AgenticDub projects approved block content into display cues.
@@ -89,7 +89,8 @@ The result snapshot repeats the package identity, records final approval state, 
 - Editing or replacing a Cue invalidates its parent block approval. The CLI repeats the invariant check when collecting an approved result.
 - Cues review display wording and visual segmentation; cue timing remains read-only in FrameCue v2.
 - Editing a block invalidates that block's approval and final package approval. Any cues derived from the old block are stale and must be regenerated in a new revision.
-- There is no formal per-cue approval. Blocks may be approved individually, followed by one final package approval.
+- Cue review state is browser-draft workflow state, not a new result-contract approval type. The formal result remains block approval followed by final package approval.
+- The reviewer works Cue-first. Once every child Cue has been reviewed and the content invariant passes, FrameCue approves the parent block automatically.
 - Packages without blocks use cues as the review source directly.
 - Any edit after final approval invalidates final approval.
 
@@ -131,7 +132,7 @@ All workflows use the same four areas:
 
 1. **Top toolbar**: package selector, progress, final approval, and export.
 2. **Media Stage**: still image, redraw comparison, boundary context, or HyperFrames playback.
-3. **Review Workbench**: Block first when present, then Cue. Risk and All are filters, not competing review modes.
+3. **Review Workbench**: Cue-first list and editor. Semantic-block meaning and speech text stay in collapsible context; Risk and All are filters, not competing review modes.
 4. **Details**: collapsible provenance, trace, policy, and advanced metadata.
 
 Controls that require an upstream LLM or pipeline rerun must include an inline explanation marker. Explanations must remain visible without covering the media stage.
@@ -303,3 +304,10 @@ Each implementation phase must leave the smallest runnable check that proves its
 - The pilot confirmed that post-approval TTS pronunciation guidance is not subtitle content. When that guidance changes, AgenticDub creates a new immutable package and records an inherited-content approval only after asserting Cue, Block, Scene, Media, Risk, and subtitle-policy payloads are unchanged from the approved revision.
 - The final QC video is a separate human gate. FrameCue approval authorizes reviewed subtitle content; it does not silently authorize publication. The r12 QC artifact is available through the read-only FBR handoff and remains `final_qc_pending`.
 - Production timing did not clip speech: maximum fitted speed was `1.0714x`, the voice ended before the original-video fade, and visual checks confirmed video and bilingual captions after late Cue `c0359` and at the ending.
+
+### 2026-08-06 - Cue-first review
+
+- Removed Block as a competing review mode. The workbench now reviews Cues directly, while semantic blocks remain the meaning, speech, validation, and formal approval boundary.
+- Space marks the current Cue reviewed and advances. A valid parent block is approved automatically after all of its child Cues have been reviewed; editing a Cue resets that Cue and invalidates the parent and final approval.
+- Block text, speech text, actions, and notes remain available as progressive disclosure under the selected Cue. Content mismatches open that context automatically.
+- Fixed the local server root to open `index.html` instead of a directory listing and validated the UI against the 526-Cue AgenticDub r5 package.

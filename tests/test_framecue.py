@@ -3,6 +3,8 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import sys
 
@@ -157,6 +159,17 @@ class FrameCueV2Tests(unittest.TestCase):
         captions = out_dir / package["media"]["video"]["captions"]
         self.assertTrue(captions.read_text(encoding="utf-8").startswith("WEBVTT\n\n"))
         framecue.validate_package(package, out_dir)
+
+    def test_serve_uses_bundle_index_at_root(self):
+        bundle = self.output / "serve"
+        bundle.mkdir()
+        (bundle / "index.html").write_text("FrameCue", encoding="utf-8")
+        args = SimpleNamespace(dir=str(bundle), port=3069)
+        with patch.object(framecue.shutil, "which", return_value="/opt/homebrew/bin/miniserve"), patch.object(framecue.subprocess, "run") as run:
+            framecue.command_serve(args)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--index") + 1], "index.html")
+        self.assertEqual(command[-1], str(bundle.resolve()))
 
     def test_null_legacy_milliseconds_fall_back_to_seconds(self):
         self.assertEqual(framecue.source_ms({"start_ms": None, "start": 1.25}, "start_ms", "fixture"), 1250)

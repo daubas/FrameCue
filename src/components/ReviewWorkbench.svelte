@@ -7,23 +7,18 @@
   export let selectedCue;
   export let selectedBlock;
   export let blockIssue = "";
-  export let activeScope;
   export let cueFilter;
   export let playbackCueId = "";
-  export let onScopeChange = () => {};
   export let onFilterChange = () => {};
   export let onSelectCue = () => {};
-  export let onSelectBlock = () => {};
   export let onCueChange = () => {};
   export let onBlockChange = () => {};
-  export let onBlockApproval = () => {};
   export let onReplaceAll = () => {};
 
   let searchTerm = "";
   let replaceTerm = "";
   let searchMessage = "";
   let followedCueId = "";
-  let followedBlockId = "";
 
   $: riskCues = packageData.cues.filter((cue) => cue.risks?.length);
   $: listedCues = cueFilter === "risk" ? riskCues : packageData.cues;
@@ -38,10 +33,6 @@
   $: if (selectedCue?.id && selectedCue.id !== followedCueId) {
     followedCueId = selectedCue.id;
     tick().then(() => document.getElementById(`cue-${followedCueId}`)?.scrollIntoView({ block: "nearest" }));
-  }
-  $: if (selectedBlock?.id && selectedBlock.id !== followedBlockId) {
-    followedBlockId = selectedBlock.id;
-    tick().then(() => document.getElementById(`block-${followedBlockId}`)?.scrollIntoView({ block: "nearest" }));
   }
 
   function findNext() {
@@ -74,65 +65,12 @@
   <div class="workbench-header">
     <div>
       <span class="eyebrow">審閱工作區</span>
-      <strong>{activeScope === "block" ? "語意塊" : cueLabel}</strong>
+      <strong>{cueLabel}</strong>
     </div>
-    <div class="segmented" aria-label="審閱範圍">
-      <button class:active={activeScope === "block"} disabled={!packageData.blocks.length} type="button" on:click={() => onScopeChange("block")}>語意塊 <span class="info" title="先審閱一個完整的口譯意思，再檢查它包含的顯示 Cue。">!</span></button>
-      <button class:active={activeScope === "cue"} type="button" on:click={() => onScopeChange("cue")}>{isCarousel ? "圖卡" : isMarkdown ? "區塊" : "Cue"} <span class="info" title="審閱目前選取的內容。">!</span></button>
-    </div>
+    <span class="shortcut-hint">空白鍵：核准並下一句</span>
   </div>
 
-  {#if activeScope === "block" && selectedBlock}
-    <div class="workbench-layout">
-      <nav class="review-list" aria-label="語意塊">
-        {#each packageData.blocks as block}
-          {@const blockState = draft.blocks[block.id]}
-          <button id={`block-${block.id}`} class:active={block.id === selectedBlock.id} class:approved={blockState.approved} type="button" on:click={() => onSelectBlock(block.id)}>
-            <span>{block.id}</span>
-            <strong>{blockState.target_text || "空白語意塊"}</strong>
-            <small>{formatTime(block.start_ms)} 至 {formatTime(block.end_ms)}</small>
-          </button>
-        {/each}
-      </nav>
-
-      <div class="editor-pane">
-        <div class="editor-heading">
-          <span>{selectedBlock.id}</span>
-          <span class:approved={selectedBlockState.approved} class="approval-pill">{selectedBlockState.approved ? "已核准" : "待審閱"}</span>
-        </div>
-        <div class="read-only-field">
-          <span>原文 <span class="info" title="原文只能閱讀，用來核對意思與專有名詞。">!</span></span>
-          <div class="source-text">{selectedBlock.source_text || "沒有原文"}</div>
-        </div>
-        <label>
-          <span>顯示文字 <span class="info" title="這是去除標點的字幕文字，可在上游回寫到所屬的 Cue。">!</span></span>
-          <textarea value={selectedBlockState.target_text} on:input={(event) => onBlockChange(selectedBlock.id, { target_text: event.currentTarget.value })}></textarea>
-        </label>
-        <label>
-          <span>語音文字 <span class="info" title="這是保留標點、供 TTS 使用的口譯文字，不是畫面上的字幕。">!</span></span>
-          <textarea value={selectedBlockState.speech_text} on:input={(event) => onBlockChange(selectedBlock.id, { speech_text: event.currentTarget.value })}></textarea>
-        </label>
-        {#if blockIssue}
-          <p class="validation-message" role="alert">{blockIssue}</p>
-        {/if}
-        <label class="compact-field">
-          <span>後續動作 <span class="info" title="FrameCue 只記錄需求；改寫、重新切分或調整時間會由 AgenticDub 在新修訂版完成。">!</span></span>
-          <select value={selectedBlockState.action} on:change={(event) => onBlockChange(selectedBlock.id, { action: event.currentTarget.value })}>
-            {#each actions as action}
-              <option value={action.value}>{action.label}</option>
-            {/each}
-          </select>
-        </label>
-        <label>
-          <span>註記</span>
-          <textarea class="short-textarea" value={selectedBlockState.instruction} placeholder="請說明上游要調整什麼" on:input={(event) => onBlockChange(selectedBlock.id, { instruction: event.currentTarget.value })}></textarea>
-        </label>
-        <button class:approved={selectedBlockState.approved} class="approve-button" disabled={Boolean(blockIssue) && !selectedBlockState.approved} type="button" on:click={() => onBlockApproval(selectedBlock.id, !selectedBlockState.approved)}>
-          {selectedBlockState.approved ? "取消核准語意塊" : "核准語意塊"}
-        </button>
-      </div>
-    </div>
-  {:else if selectedCue}
+  {#if selectedCue}
     <div class="workbench-layout">
       <nav class="review-list cue-list" aria-label={cueLabel}>
         <div class="list-filter" aria-label="Cue 篩選">
@@ -144,7 +82,7 @@
         {/if}
         {#each listedCues as cue}
           {@const cueState = draft.cues[cue.id]}
-          <button id={`cue-${cue.id}`} class:active={cue.id === selectedCue.id} class:playing={cue.id === playbackCueId} type="button" on:click={() => onSelectCue(cue.id)}>
+          <button id={`cue-${cue.id}`} class:active={cue.id === selectedCue.id} class:playing={cue.id === playbackCueId} class:reviewed={draft.reviewed_cues?.[cue.id]} type="button" on:click={() => onSelectCue(cue.id)}>
             <span>{cue.id}</span>
             <strong>
               {#each markedParts(cueState.text, cue.risks) as part}
@@ -159,9 +97,10 @@
       <div class="editor-pane">
         <div class="editor-heading">
           <span>{selectedCue.id}</span>
-          {#if selectedCue.risks?.length}
-            <span class="risk-summary">{selectedCue.risks.join(" · ")}</span>
-          {/if}
+          <div class="editor-status">
+            {#if selectedCue.risks?.length}<span class="risk-summary">{selectedCue.risks.join(" · ")}</span>{/if}
+            <span class:approved={draft.reviewed_cues?.[selectedCue.id]} class="approval-pill">{draft.reviewed_cues?.[selectedCue.id] ? "已審" : "待審"}</span>
+          </div>
         </div>
         <div class="read-only-field">
           <span>{isCarousel ? "圖卡資產" : isMarkdown ? "區塊類型" : "原始字幕"}</span>
@@ -176,6 +115,39 @@
             <span>語音文字 <span class="info" title="沒有語意塊時，這段保留標點的文字會直接交給 TTS。">!</span></span>
             <textarea value={selectedCueState.speech_text} on:input={(event) => onCueChange(selectedCue.id, { speech_text: event.currentTarget.value })}></textarea>
           </label>
+        {/if}
+        {#if selectedBlock}
+          <details class:issue={Boolean(blockIssue)} class="block-context" open={Boolean(blockIssue)}>
+            <summary>
+              <span>整句與配音稿 · {selectedBlock.id}</span>
+              <span class:approved={selectedBlockState.approved} class="approval-pill">{selectedBlockState.approved ? "已自動核准" : "隨 Cue 自動核准"}</span>
+            </summary>
+            <div class="block-context-body">
+              <div class="read-only-field">
+                <span>整句原文</span>
+                <div class="source-text">{selectedBlock.source_text || "沒有原文"}</div>
+              </div>
+              <div class="read-only-field">
+                <span>合併顯示文字</span>
+                <div class="source-text">{selectedBlockState.target_text}</div>
+              </div>
+              <label>
+                <span>配音文字 <span class="info" title="保留標點、供 TTS 使用；內容必須與這組 Cue 一致。">!</span></span>
+                <textarea value={selectedBlockState.speech_text} on:input={(event) => onBlockChange(selectedBlock.id, { speech_text: event.currentTarget.value })}></textarea>
+              </label>
+              {#if blockIssue}<p class="validation-message" role="alert">{blockIssue}</p>{/if}
+              <label class="compact-field">
+                <span>整句後續動作</span>
+                <select value={selectedBlockState.action} on:change={(event) => onBlockChange(selectedBlock.id, { action: event.currentTarget.value })}>
+                  {#each actions as action}<option value={action.value}>{action.label}</option>{/each}
+                </select>
+              </label>
+              <label>
+                <span>整句註記</span>
+                <textarea class="short-textarea" value={selectedBlockState.instruction} placeholder="只有需要上游處理時填寫" on:input={(event) => onBlockChange(selectedBlock.id, { instruction: event.currentTarget.value })}></textarea>
+              </label>
+            </div>
+          </details>
         {/if}
         <label class="compact-field">
           <span>後續動作 <span class="info" title="這個 Cue 若需要上游處理而非直接修改，請選擇下一步。">!</span></span>

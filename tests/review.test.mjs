@@ -11,12 +11,15 @@ import {
   cuePlaybackEnded,
   finalApprovalAllowed,
   makeResult,
+  reviewCueAndAdvance,
+  reviewedCueCount,
   withBlockApproval,
   withCueChange
 } from "../src/lib/review.js";
 
 
 const packageData = {
+  cues: [{ id: "c0001" }, { id: "c0002" }],
   blocks: [{ id: "b0001", cue_ids: ["c0001", "c0002"] }]
 };
 
@@ -33,6 +36,7 @@ function approvedDraft() {
         approved: true
       }
     },
+    reviewed_cues: { c0001: true, c0002: true },
     final_approval: { approved_at: "2026-07-29T00:00:00Z" }
   };
 }
@@ -47,6 +51,35 @@ test("cue edits invalidate the parent block and final approval", () => {
   assert.match(blockContentIssue(packageData, changed, "b0001"), /不一致/);
   assert.equal(finalApprovalAllowed(packageData, changed), false);
   assert.equal(withBlockApproval(packageData, changed, "b0001", true), changed);
+});
+
+test("cue-first review advances one cue and auto-approves a valid completed block", () => {
+  const reviewPackage = {
+    workflow: { kind: "subtitle" },
+    cues: [
+      { id: "c0001", text: "第一句", speech_text: "第一句。", risks: [] },
+      { id: "c0002", text: "第二句", speech_text: "第二句。", risks: [] },
+      { id: "c0003", text: "第三句", speech_text: "第三句。", risks: [] }
+    ],
+    blocks: [
+      { id: "b0001", cue_ids: ["c0001", "c0002"], target_text: "第一句 第二句", speech_text: "第一句。第二句。" },
+      { id: "b0002", cue_ids: ["c0003"], target_text: "第三句", speech_text: "第三句。" }
+    ]
+  };
+  let draft = createDraft(reviewPackage);
+  draft = reviewCueAndAdvance(reviewPackage, draft, "c0001");
+  assert.equal(reviewedCueCount(reviewPackage, draft), 1);
+  assert.equal(draft.blocks.b0001.approved, false);
+  assert.equal(draft.selected_cue_id, "c0002");
+
+  draft = reviewCueAndAdvance(reviewPackage, draft, "c0002");
+  assert.equal(draft.blocks.b0001.approved, true);
+  assert.equal(draft.selected_cue_id, "c0003");
+  assert.equal(finalApprovalAllowed(reviewPackage, draft), false);
+
+  draft = withCueChange(reviewPackage, draft, "c0001", { text: "修改第一句" });
+  assert.equal(draft.reviewed_cues.c0001, false);
+  assert.equal(draft.blocks.b0001.approved, false);
 });
 
 test("semantic block approval advances only after validation passes", () => {
@@ -112,10 +145,10 @@ test("new workflows expose only their own follow-up actions", () => {
   assert.deepEqual(actionsForWorkflow("markdown").map((action) => action.value), ["use_edit", "rewrite", "cut", "split", "needs_source"]);
 });
 
-test("packages without risks open the complete cue list", () => {
+test("cue-first drafts always open the complete cue list", () => {
   const draft = createDraft({
     workflow: { kind: "markdown" },
-    cues: [{ id: "c0001", text: "段落", speech_text: "段落", risks: [] }],
+    cues: [{ id: "c0001", text: "Waymo", speech_text: "Waymo", risks: ["Waymo"] }],
     blocks: []
   });
   assert.equal(draft.cue_filter, "all");

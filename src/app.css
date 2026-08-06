@@ -104,7 +104,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 
 .review-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(370px, 480px);
+  grid-template-columns: minmax(0, 1fr) minmax(440px, 600px);
   height: calc(100vh - 64px);
   min-height: calc(100vh - 64px);
 }
@@ -188,6 +188,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .workbench-header { justify-content: space-between; min-height: 65px; padding: 12px 14px; border-bottom: 1px solid #3b443d; }
 .workbench-header > div:first-child { display: grid; gap: 2px; }
 .workbench-header strong { font-size: 15px; }
+.shortcut-hint { color: #aeb9ad; font-size: 11px; white-space: nowrap; }
 .info { display: inline-grid; width: 15px; height: 15px; place-items: center; border: 1px solid #7d8c7b; border-radius: 50%; color: #eac477; font-size: 10px; font-weight: 800; text-transform: none; cursor: help; }
 
 .workbench-layout { display: grid; grid-template-columns: minmax(155px, .72fr) minmax(0, 1.28fr); min-height: 0; }
@@ -196,6 +197,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .review-list > button:hover { background: #232b25; }
 .review-list > button.active { background: #394f40; color: #fff; }
 .review-list > button.approved { box-shadow: inset 3px 0 #92b17e; }
+.review-list > button.reviewed { box-shadow: inset 3px 0 #92b17e; }
 .review-list > button.playing { box-shadow: inset 3px 0 #e2b759; }
 .review-list button > span { color: #aebbac; font-size: 11px; font-variant-numeric: tabular-nums; }
 .review-list button > strong { overflow: hidden; overflow-wrap: anywhere; word-break: normal; line-break: auto; font-size: 13px; font-weight: 620; line-height: 1.35; text-overflow: ellipsis; }
@@ -206,6 +208,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 
 .editor-pane { min-height: 0; overflow: auto; padding: 15px; }
 .editor-heading { justify-content: space-between; margin-bottom: 13px; color: #d8e0d5; font-size: 13px; font-weight: 700; }
+.editor-status { display: flex; align-items: center; justify-content: flex-end; gap: 7px; min-width: 0; }
 .approval-pill,
 .risk-summary { max-width: 70%; overflow-wrap: anywhere; color: #e9c97f; font-size: 11px; font-weight: 600; }
 .approval-pill.approved { color: #bfe3ae; }
@@ -220,6 +223,11 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .short-textarea { min-height: 72px; }
 .approve-button { width: 100%; border-color: #77946b; background: #30422e; }
 .approve-button.approved { border-color: #86a678; color: #e2f3db; }
+
+.block-context { margin: 2px 0 13px; border: 1px solid #3b463e; border-radius: 6px; background: #151a16; }
+.block-context.issue { border-color: #9d6259; }
+.block-context summary { display: flex; min-height: 40px; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 10px; color: #d4ddd1; font-size: 12px; font-weight: 700; cursor: pointer; }
+.block-context-body { padding: 10px; border-top: 1px solid #3b463e; }
 
 .replace-tools { display: grid; gap: 7px; padding-top: 4px; border-top: 1px solid #3b443d; }
 .inline-actions { flex-wrap: wrap; }
@@ -242,7 +250,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 @media (max-width: 1080px) {
   .top-toolbar { grid-template-columns: 1fr auto; }
   .toolbar-center { order: 3; grid-column: 1 / -1; justify-content: flex-start; }
-  .review-grid { grid-template-columns: minmax(0, 1fr) 390px; }
+  .review-grid { grid-template-columns: minmax(0, 1fr) 430px; }
   .workbench-layout { grid-template-columns: 145px minmax(0, 1fr); }
 }
 

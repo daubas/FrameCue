@@ -67,8 +67,9 @@ export function createDraft(packageData) {
     schema_version: "framecue_browser_draft_v1",
     selected_cue_id: packageData.cues[0]?.id || "",
     selected_block_id: packageData.blocks[0]?.id || "",
-    active_scope: packageData.blocks.length ? "block" : "cue",
-    cue_filter: packageData.cues.some((cue) => cue.risks?.length) ? "risk" : "all",
+    active_scope: "cue",
+    cue_filter: "all",
+    reviewed_cues: Object.fromEntries(packageData.cues.map((cue) => [cue.id, false])),
     cues: Object.fromEntries(packageData.cues.map((cue) => [cue.id, {
       text: cue.text,
       speech_text: cue.speech_text,
@@ -99,6 +100,7 @@ export function mergeDraft(packageData, savedDraft) {
       action: actions.some((action) => action.value === saved.action) ? saved.action : "use_edit",
       instruction: String(saved.instruction || "")
     };
+    fresh.reviewed_cues[cue.id] = Boolean(savedDraft.reviewed_cues?.[cue.id]);
   }
   for (const block of packageData.blocks) {
     const saved = savedDraft.blocks?.[block.id];
@@ -117,10 +119,8 @@ export function mergeDraft(packageData, savedDraft) {
   fresh.selected_block_id = packageData.blocks.some((block) => block.id === savedDraft.selected_block_id)
     ? savedDraft.selected_block_id
     : fresh.selected_block_id;
-  fresh.active_scope = savedDraft.active_scope === "cue" || (savedDraft.active_scope === "block" && packageData.blocks.length)
-    ? savedDraft.active_scope
-    : fresh.active_scope;
-  fresh.cue_filter = savedDraft.cue_filter === "all" ? "all" : "risk";
+  fresh.active_scope = "cue";
+  fresh.cue_filter = "all";
   return fresh;
 }
 
@@ -159,6 +159,7 @@ export function withCueChange(packageData, draft, cueId, patch) {
     ...draft,
     cues,
     blocks,
+    reviewed_cues: { ...draft.reviewed_cues, [cueId]: false },
     final_approval: null
   };
 }
@@ -186,6 +187,12 @@ export function withBlockApproval(packageData, draft, blockId, approved) {
   };
 }
 
+export function approveReviewedBlock(packageData, draft, blockId) {
+  const block = packageData.blocks.find((item) => item.id === blockId);
+  if (!block || !block.cue_ids.every((cueId) => draft.reviewed_cues?.[cueId])) return draft;
+  return withBlockApproval(packageData, draft, blockId, true);
+}
+
 export function approveBlockAndAdvance(packageData, draft, blockId) {
   const nextDraft = draft.blocks[blockId]?.approved ? draft : withBlockApproval(packageData, draft, blockId, true);
   if (!nextDraft.blocks[blockId]?.approved || blockContentIssue(packageData, nextDraft, blockId)) return nextDraft;
@@ -199,7 +206,34 @@ export function approveBlockAndAdvance(packageData, draft, blockId) {
   };
 }
 
+export function reviewedCueCount(packageData, draft) {
+  return packageData.cues.filter((cue) => draft.reviewed_cues?.[cue.id]).length;
+}
+
+export function reviewCueAndAdvance(packageData, draft, cueId) {
+  const cueIndex = packageData.cues.findIndex((cue) => cue.id === cueId);
+  if (cueIndex < 0) return draft;
+  const reviewedCues = { ...draft.reviewed_cues, [cueId]: true };
+  let nextDraft = { ...draft, active_scope: "cue", reviewed_cues: reviewedCues };
+  const blocks = { ...draft.blocks };
+  for (const block of packageData.blocks.filter((item) => item.cue_ids.includes(cueId))) {
+    if (block.cue_ids.every((childId) => reviewedCues[childId]) && !blockContentIssue(packageData, nextDraft, block.id)) {
+      blocks[block.id] = { ...blocks[block.id], approved: true };
+    }
+  }
+  nextDraft = { ...nextDraft, blocks };
+  const nextCue = packageData.cues[cueIndex + 1];
+  if (!nextCue) return nextDraft;
+  const nextBlock = packageData.blocks.find((block) => block.cue_ids.includes(nextCue.id));
+  return {
+    ...nextDraft,
+    selected_cue_id: nextCue.id,
+    selected_block_id: nextBlock?.id || nextDraft.selected_block_id
+  };
+}
+
 export function finalApprovalAllowed(packageData, draft) {
+  if (reviewedCueCount(packageData, draft) !== packageData.cues.length) return false;
   return !packageData.blocks.length || packageData.blocks.every((block) =>
     draft.blocks[block.id]?.approved && !blockContentIssue(packageData, draft, block.id)
   );

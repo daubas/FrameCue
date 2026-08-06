@@ -134,10 +134,11 @@ the browser:
 
 The CLI copies it into the immutable bundle, generates a bilingual WebVTT track,
 and writes `media.video.src` and `media.video.captions` as bundle-relative paths.
-In Video mode, selecting a Cue seeks to its start. In Cue scope, `Play cue` and
-Space stop at the Cue end; in semantic-block scope, Space approves a valid block
-and selects the next block. The native controls remain available for scrubbing
-or continuous playback.
+In Video mode, selecting a Cue seeks to its start. `Play cue` stops at the Cue
+end. Space marks the current Cue reviewed and selects the next Cue; once every
+Cue in a valid semantic block is reviewed, FrameCue approves that block
+automatically. The native controls remain available for scrubbing or continuous
+playback.
 
 ## Multi-Package Review
 

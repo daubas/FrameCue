@@ -1087,7 +1087,7 @@ def command_serve(args):
         raise FrameCueError(f"not a FrameCue bundle: {directory}")
     miniserve = shutil.which("miniserve")
     if miniserve:
-        subprocess.run([miniserve, "--interfaces", "127.0.0.1", "--port", str(args.port), str(directory)], check=True)
+        subprocess.run([miniserve, "--interfaces", "127.0.0.1", "--port", str(args.port), "--index", "index.html", str(directory)], check=True)
         return
     print("warning: Python http.server may not support byte ranges needed by video playback", file=sys.stderr)
     subprocess.run([sys.executable, "-m", "http.server", str(args.port), "--directory", str(directory)], check=True)
