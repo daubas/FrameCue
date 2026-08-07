@@ -12,6 +12,7 @@ import {
   cuePlaybackEnded,
   finalApprovalAllowed,
   makeResult,
+  rangeNeedsConfirmation,
   reviewCueAndAdvance,
   reviewedCueCount,
   withBlockApproval,
@@ -69,6 +70,17 @@ test("range resegment marks every selected Cue with one upstream instruction", (
   }
   assert.equal(changed.blocks.b0001.approved, false);
   assert.equal(changed.final_approval, null);
+});
+
+test("large or long cue ranges require confirmation", () => {
+  assert.equal(rangeNeedsConfirmation(Array.from({ length: 13 }, (_, index) => ({ start_ms: index * 1000, end_ms: (index + 1) * 1000 }))), true);
+  assert.equal(rangeNeedsConfirmation([{ start_ms: 0, end_ms: 1000 }, { start_ms: 61000, end_ms: 62000 }]), true);
+  assert.equal(rangeNeedsConfirmation([{ start_ms: 0, end_ms: 1000 }, { start_ms: 1000, end_ms: 2000 }]), false);
+});
+
+test("range selection uses the current cue after external navigation", () => {
+  const workbench = readFileSync(new URL("../src/components/ReviewWorkbench.svelte", import.meta.url), "utf8");
+  assert.match(workbench, /keepRangeAnchor \? rangeAnchorId : selectedCue\?\.id/);
 });
 
 test("cue-first review advances one cue and auto-approves a valid completed block", () => {

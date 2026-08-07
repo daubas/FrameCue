@@ -1,6 +1,6 @@
 <script>
   import { tick } from "svelte";
-  import { actionsForWorkflow, formatTime, markedParts } from "../lib/review.js";
+  import { actionsForWorkflow, formatTime, markedParts, rangeNeedsConfirmation } from "../lib/review.js";
   import InfoTip from "./InfoTip.svelte";
 
   export let packageData;
@@ -74,7 +74,8 @@
 
   function selectCueRange(cue, event) {
     const cueIndex = packageData.cues.findIndex((item) => item.id === cue.id);
-    const anchorIndex = packageData.cues.findIndex((item) => item.id === rangeAnchorId);
+    const keepRangeAnchor = selectedCueIds.length > 1 && selectedCueIds.includes(selectedCue?.id);
+    const anchorIndex = packageData.cues.findIndex((item) => item.id === (keepRangeAnchor ? rangeAnchorId : selectedCue?.id));
     if (event.shiftKey && anchorIndex >= 0) {
       const [start, end] = [anchorIndex, cueIndex].sort((left, right) => left - right);
       selectedCueIds = packageData.cues.slice(start, end + 1).map((item) => item.id);
@@ -99,6 +100,7 @@
 
   function markRangeForResegment() {
     if (selectedCueIds.length < 2) return;
+    if (rangeNeedsConfirmation(selectedRangeCues) && !window.confirm(`這次會標記 ${selectedRangeCues.length} 個 Cue，確定要繼續嗎？`)) return;
     onResegmentRange(selectedCueIds, rangeInstruction.trim() || "請重新切分這段內容，避免將句子或專有名詞切開。");
   }
 </script>

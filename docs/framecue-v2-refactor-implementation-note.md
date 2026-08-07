@@ -1,6 +1,6 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: implementation complete; latest validated runtime pinned at `v2.5.0`
+Status: implementation complete; latest validated runtime pinned at `v2.6.0`
 Last updated: 2026-08-07
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
@@ -308,6 +308,11 @@ Each implementation phase must leave the smallest runnable check that proves its
 ### 2026-08-06 - Cue-first review
 
 - Removed Block as a competing review mode. The workbench now reviews Cues directly, while semantic blocks remain the meaning, speech, validation, and formal approval boundary.
+
+### 2026-08-07 - Safe range resegmentation
+
+- Added Shift-click Cue range resegmentation without changing the package/result schemas.
+- Reset stale one-Cue anchors after keyboard or search navigation and require confirmation when a range exceeds 12 Cues or 60 seconds.
 - Space marks the current Cue reviewed and advances. A valid parent block is approved automatically after all of its child Cues have been reviewed; editing a Cue resets that Cue and invalidates the parent and final approval.
 - Block text, speech text, actions, and notes remain available as progressive disclosure under the selected Cue. Content mismatches open that context automatically.
 - Fixed the local server root to open `index.html` instead of a directory listing and validated the UI against the 526-Cue AgenticDub r5 package.

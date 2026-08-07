@@ -170,6 +170,12 @@ export function withCueRangeAction(packageData, draft, cueIds, action, instructi
   ), draft);
 }
 
+export function rangeNeedsConfirmation(cues) {
+  if (cues.length > 12) return true;
+  if (cues.length < 2) return false;
+  return cues.at(-1).end_ms - cues[0].start_ms > 60000;
+}
+
 export function withBlockChange(draft, blockId, patch) {
   return {
     ...draft,
