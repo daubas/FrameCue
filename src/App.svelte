@@ -18,7 +18,8 @@
     reviewCueAndAdvance,
     textForDisplay,
     withBlockChange,
-    withCueChange
+    withCueChange,
+    withCueRangeAction
   } from "./lib/review.js";
 
   let packageData = null;
@@ -144,6 +145,11 @@
     if (Object.hasOwn(next, "target_text")) next.target_text = textForDisplay(packageData, next.target_text);
     if (Object.hasOwn(next, "speech_text")) next.speech_text = String(next.speech_text || "");
     persist(approveReviewedBlock(packageData, withBlockChange(draft, blockId, next), blockId));
+  }
+
+  function resegmentRange(cueIds, instruction) {
+    if (cueIds.length < 2) return;
+    persist(withCueRangeAction(packageData, draft, cueIds, "resegment", instruction));
   }
 
   function replaceAll(search, replacement) {
@@ -305,6 +311,7 @@
         onCueChange={updateCue}
         onBlockChange={updateBlock}
         onReplaceAll={replaceAll}
+        onResegmentRange={resegmentRange}
       />
     </div>
     <DetailsPanel

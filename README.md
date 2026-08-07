@@ -140,6 +140,15 @@ Cue in a valid semantic block is reviewed, FrameCue approves that block
 automatically. The native controls remain available for scrubbing or continuous
 playback.
 
+## Cue Range Resegment
+
+For a badly split sentence or protected name, click the first Cue and
+Shift-click the last. FrameCue shows the selected range as a small timeline
+with combined source, display, and speech text. `標記這段為重新切分` writes the
+existing `resegment` action and one shared instruction to every selected Cue.
+It does not alter timing or the immutable package; AgenticDub must create a new
+revision before downstream work continues.
+
 ## Multi-Package Review
 
 Build individual bundles first, then create a dashboard without shared drafts:

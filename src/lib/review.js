@@ -164,6 +164,12 @@ export function withCueChange(packageData, draft, cueId, patch) {
   };
 }
 
+export function withCueRangeAction(packageData, draft, cueIds, action, instruction) {
+  return [...new Set(cueIds)].reduce((next, cueId) => (
+    next.cues[cueId] ? withCueChange(packageData, next, cueId, { action, instruction }) : next
+  ), draft);
+}
+
 export function withBlockChange(draft, blockId, patch) {
   return {
     ...draft,

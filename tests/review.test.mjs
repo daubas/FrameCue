@@ -15,7 +15,8 @@ import {
   reviewCueAndAdvance,
   reviewedCueCount,
   withBlockApproval,
-  withCueChange
+  withCueChange,
+  withCueRangeAction
 } from "../src/lib/review.js";
 
 
@@ -57,6 +58,17 @@ test("cue edits invalidate the parent block and final approval", () => {
   assert.match(blockContentIssue(packageData, changed, "b0001"), /不一致/);
   assert.equal(finalApprovalAllowed(packageData, changed), false);
   assert.equal(withBlockApproval(packageData, changed, "b0001", true), changed);
+});
+
+test("range resegment marks every selected Cue with one upstream instruction", () => {
+  const changed = withCueRangeAction(packageData, approvedDraft(), ["c0001", "c0002", "missing"], "resegment", "請避免在專有名詞中斷開。");
+  for (const cueId of ["c0001", "c0002"]) {
+    assert.equal(changed.cues[cueId].action, "resegment");
+    assert.equal(changed.cues[cueId].instruction, "請避免在專有名詞中斷開。");
+    assert.equal(changed.reviewed_cues[cueId], false);
+  }
+  assert.equal(changed.blocks.b0001.approved, false);
+  assert.equal(changed.final_approval, null);
 });
 
 test("cue-first review advances one cue and auto-approves a valid completed block", () => {

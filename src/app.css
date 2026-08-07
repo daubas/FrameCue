@@ -189,7 +189,10 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .workbench-header > div:first-child { display: grid; gap: 2px; }
 .workbench-header strong { font-size: 15px; }
 .shortcut-hint { color: #aeb9ad; font-size: 11px; white-space: nowrap; }
-.info { display: inline-grid; width: 15px; height: 15px; place-items: center; border: 1px solid #7d8c7b; border-radius: 50%; color: #eac477; font-size: 10px; font-weight: 800; text-transform: none; cursor: help; }
+.info-tip { position: relative; display: inline-flex; vertical-align: middle; }
+.info { display: inline-grid; width: 17px; min-width: 17px; height: 17px; min-height: 17px; place-items: center; padding: 0; border: 1px solid #7d8c7b; border-radius: 50%; background: transparent; color: #eac477; font-size: 10px; font-weight: 800; line-height: 1; text-transform: none; cursor: help; }
+.info:hover, .info:focus-visible { border-color: #eac477; background: #2f372f; outline: 0; }
+.info-popover { position: absolute; z-index: 4; top: calc(100% + 6px); right: 0; width: min(260px, 70vw); padding: 8px 9px; border: 1px solid #758a71; border-radius: 6px; background: #202820; color: #eef5ea; box-shadow: 0 8px 20px #0008; font-size: 12px; font-weight: 500; line-height: 1.45; text-transform: none; }
 
 .workbench-layout { display: grid; grid-template-columns: minmax(155px, .72fr) minmax(0, 1.28fr); min-height: 0; }
 .review-list { min-height: 0; overflow: auto; border-right: 1px solid #3b443d; background: #171b18; }
@@ -199,6 +202,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .review-list > button.approved { box-shadow: inset 3px 0 #92b17e; }
 .review-list > button.reviewed { box-shadow: inset 3px 0 #92b17e; }
 .review-list > button.playing { box-shadow: inset 3px 0 #e2b759; }
+.review-list > button.in-range { background: #34443a; }
 .review-list button > span { color: #aebbac; font-size: 11px; font-variant-numeric: tabular-nums; }
 .review-list button > strong { overflow: hidden; overflow-wrap: anywhere; word-break: normal; line-break: auto; font-size: 13px; font-weight: 620; line-height: 1.35; text-overflow: ellipsis; }
 .review-list button > small { color: #9ba79b; font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -223,6 +227,19 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .short-textarea { min-height: 72px; }
 .approve-button { width: 100%; border-color: #77946b; background: #30422e; }
 .approve-button.approved { border-color: #86a678; color: #e2f3db; }
+
+.segment-range { display: grid; gap: 8px; margin: 0 0 13px; padding: 11px; border: 1px solid #806d3f; border-radius: 7px; background: #211f18; }
+.segment-range-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: #f0d78c; font-size: 12px; }
+.segment-range-heading span { color: #d0c49e; font-size: 11px; }
+.segment-track { display: flex; overflow: auto; border-radius: 5px; background: #151812; }
+.segment-track > span { display: grid; flex: 1 0 118px; gap: 3px; padding: 7px 8px; border-right: 1px solid #665d43; color: #e6dfca; }
+.segment-track > span:last-child { border-right: 0; }
+.segment-track b { font-size: 11px; }
+.segment-track small { color: #bdb699; font-size: 10px; white-space: nowrap; }
+.range-preview { display: grid; gap: 4px; }
+.range-preview > span { color: #c8bd9b; font-size: 11px; font-weight: 700; }
+.range-preview p { max-height: 88px; margin: 0; overflow: auto; padding: 7px 8px; border: 1px solid #4d4a3b; border-radius: 5px; background: #171811; color: #e6e1d2; font-size: 12px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.segment-range label { margin: 0; }
 
 .block-context { margin: 2px 0 13px; border: 1px solid #3b463e; border-radius: 6px; background: #151a16; }
 .block-context.issue { border-color: #9d6259; }

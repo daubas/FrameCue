@@ -1,7 +1,7 @@
 # FrameCue v2 Refactor - Implementation Note
 
 Status: implementation complete; latest validated runtime pinned at `v2.5.0`
-Last updated: 2026-08-06
+Last updated: 2026-08-07
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
 
@@ -311,3 +311,9 @@ Each implementation phase must leave the smallest runnable check that proves its
 - Space marks the current Cue reviewed and advances. A valid parent block is approved automatically after all of its child Cues have been reviewed; editing a Cue resets that Cue and invalidates the parent and final approval.
 - Block text, speech text, actions, and notes remain available as progressive disclosure under the selected Cue. Content mismatches open that context automatically.
 - Fixed the local server root to open `index.html` instead of a directory listing and validated the UI against the 526-Cue AgenticDub r5 package.
+
+### 2026-08-07 - Cue-range resegment and interactive help
+
+- Added Shift-based contiguous Cue-range selection for subtitle-family review. The workbench shows an STL-style time track with combined source, display, and speech context before a reviewer marks the range for `resegment`.
+- The batch action writes the existing `resegment` action and one shared instruction to every selected Cue. It does not edit timing, merge Cues, or change the package/result schema; AgenticDub creates a new immutable revision for the actual segmentation work.
+- Replaced native-title `!` markers with click/focus-accessible help popovers. The same component is used for display text, speech text, follow-up action, range instruction, and search/replace help.
