@@ -90,11 +90,31 @@ Follow-up actions are restricted by the package workflow:
 | Subtitle, redraw, boundary, HyperFrames | `use_edit`, `rewrite`, `resegment`, `retime` |
 | Image carousel | `use_edit`, `replace_asset`, `rewrite_copy`, `recrop`, `reorder` |
 | Markdown | `use_edit`, `rewrite`, `cut`, `split`, `needs_source` |
+| Paper edit | `use_edit`, `rewrite`, `needs_source` (derived from the Beat decision) |
 
 The result schema lists the legal tokens because the result intentionally does
 not repeat the workflow kind. The package-aware validator and `collect` enforce
 the narrower per-mode vocabulary, so existing subtitle packages retain their
 original validation behavior.
+
+`paper_edit` keeps the common Cue array for complete, checksum-bound results,
+but the viewer calls each Cue a **Beat**. A Beat carries `teaching_purpose`,
+`spoken_content_summary`, `narration_spine`, `source_ranges`, `visual_slots`,
+`duration_ms`, and `unresolved_work`; only Beats are review items. Each source
+range and visual slot independently declares `availability` (`existing`,
+`planned`, or `gap`) and `role` (`evidence`, `illustration`, or
+`reference-only`). Input media uses `media.paper_edit.sources[]` with `id` and
+`source`; the portable bundle replaces `source` with bundle-relative `src`.
+Paper-edit results add a Cue `decision`: `approve` maps to `use_edit`, `revise`
+to `rewrite`, and `block` to `needs_source`. Revise and Block require a note;
+only all-Approve Beats can receive final approval. `evidence` is always
+`existing` and carries `source_id` plus a range; planned/gap slots carry no
+source reference. A planned/gap-only package may use empty `sources` and
+`source_ranges` with its representative placeholder image. Planned/gap slots
+may also carry non-empty `production_method`, `duration`, and `acceptance`.
+An object-form `narration_spine` supports the same optional review details.
+The viewer groups Beats by `chapter_id` and `chapter_title` as higher-level
+Sections; Section status is a read-only summary, while decisions remain Beat-level.
 
 When blocks exist, they own meaning and `speech_text`; cues own review display
 segmentation. Cue timings are read-only. Each block can be approved, then the
@@ -105,7 +125,7 @@ Schemas live in [schemas](schemas/).
 
 ## Supported Workflows
 
-v2 supports one contract across six review modes:
+v2 supports one contract across seven review modes:
 
 1. Cue and semantic-block subtitle review.
 2. Redraw before/after review with generation trace.
@@ -113,11 +133,12 @@ v2 supports one contract across six review modes:
 4. HyperFrames playback review.
 5. Image-carousel review with one independent Cue per image and no set verdict.
 6. Traditional-Chinese Markdown review with one Cue per content block.
+7. Paper-edit review with one Beat per Cue and source-safe multi-video playback.
 
 The viewer switches media stage mode without changing the review data model.
 Risk and All are cue filters, not separate viewer implementations.
 
-## Source Video
+## Source Video and Paper Edit
 
 Subtitle packages can include the source video without exposing a local path to
 the browser:
@@ -138,6 +159,34 @@ In Video mode, selecting a Cue seeks to its start. In Cue scope, `Play cue` and
 Space stop at the Cue end; in semantic-block scope, Space approves a valid block
 and selects the next block. The native controls remain available for scrubbing
 or continuous playback.
+
+Paper-edit sources are independently copied, while a Beat keeps its paper
+timeline in the Cue and its playback alternatives in `source_ranges`:
+
+```json
+{
+  "workflow": { "kind": "paper_edit" },
+  "media": {
+    "paper_edit": {
+      "sources": [{ "id": "lesson-a", "source": "lesson-a.mp4" }]
+    }
+  },
+  "cues": [{
+    "id": "c0001",
+    "start_ms": 0,
+    "end_ms": 3000,
+    "beat": {
+      "teaching_purpose": "Explain the problem",
+      "spoken_content_summary": "Why this matters",
+      "narration_spine": { "source_id": "lesson-a", "start_ms": 1000, "end_ms": 2500 },
+      "source_ranges": [{ "source_id": "lesson-a", "start_ms": 1000, "end_ms": 2500, "availability": "existing", "role": "evidence" }],
+      "visual_slots": [{ "id": "placeholder", "availability": "planned", "role": "illustration" }],
+      "duration_ms": 3000,
+      "unresolved_work": []
+    }
+  }]
+}
+```
 
 ## Multi-Package Review
 
@@ -206,8 +255,8 @@ python3 -m unittest discover -s tests -v
 python3 framecue.py self-check
 ```
 
-The checks cover subtitle, redraw, boundary, HyperFrames, image-carousel, and
-Markdown bundles, including workflow-specific result actions.
+The checks cover subtitle, redraw, boundary, HyperFrames, image-carousel,
+Markdown, and paper-edit bundles, including workflow-specific result actions.
 
 ## Architecture Notes
 

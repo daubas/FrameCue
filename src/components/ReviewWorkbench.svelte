@@ -1,6 +1,6 @@
 <script>
   import { tick } from "svelte";
-  import { actionsForWorkflow, formatTime, markedParts } from "../lib/review.js";
+  import { actionsForWorkflow, formatTime, markedParts, paperDecisionIssue, paperEditSections } from "../lib/review.js";
 
   export let packageData;
   export let draft;
@@ -31,10 +31,14 @@
   $: actions = actionsForWorkflow(workflowKind);
   $: isCarousel = workflowKind === "image_carousel";
   $: isMarkdown = workflowKind === "markdown";
-  $: cueLabel = isCarousel ? "圖卡" : isMarkdown ? "Markdown 區塊" : "字幕 Cue";
+  $: isPaperEdit = workflowKind === "paper_edit";
+  $: cueLabel = isPaperEdit ? "Beat" : isCarousel ? "圖卡" : isMarkdown ? "Markdown 區塊" : "字幕 Cue";
   $: blockKind = selectedCue?.markdown?.kind === "heading" ? "標題" : selectedCue?.markdown?.kind === "list" ? "清單" : "段落";
   $: selectedCueState = selectedCue ? draft.cues[selectedCue.id] : null;
   $: selectedBlockState = selectedBlock ? draft.blocks[selectedBlock.id] : null;
+  $: selectedPaperIssue = isPaperEdit ? paperDecisionIssue(selectedCueState) : "";
+  $: paperSections = isPaperEdit ? paperEditSections(packageData.cues, draft.cues) : [];
+  $: selectedPaperSection = isPaperEdit ? paperSections.find((section) => section.cues.some((cue) => cue.id === selectedCue?.id)) : null;
   $: if (selectedCue?.id && selectedCue.id !== followedCueId) {
     followedCueId = selectedCue.id;
     tick().then(() => document.getElementById(`cue-${followedCueId}`)?.scrollIntoView({ block: "nearest" }));
@@ -68,18 +72,56 @@
     const count = onReplaceAll(searchTerm, replaceTerm);
     searchMessage = `已更新 ${count} 個 Cue`;
   }
+
+  function paperSourceLabel(sourceId) {
+    const source = packageData.media?.paper_edit?.sources?.find((item) => item.id === sourceId);
+    return source?.label || sourceId || "未定來源";
+  }
+
+  function paperRangeText(range) {
+    const times = Number.isFinite(range?.start_ms) && Number.isFinite(range?.end_ms)
+      ? `${formatTime(range.start_ms)} 至 ${formatTime(range.end_ms)}`
+      : "時間待定";
+    return `${paperSourceLabel(range?.source_id)} · ${times}${range?.availability ? ` · ${range.availability}` : ""}${range?.role ? ` · ${range.role}` : ""}`;
+  }
+
+  function narrationSpineRows(spine) {
+    if (typeof spine === "string") return [spine];
+    if (!spine) return ["未指定"];
+    const reference = spine.source_id ? paperRangeText(spine) : "";
+    return [
+      spine.text,
+      reference,
+      spine.production_method ? `製作方式：${spine.production_method}` : "",
+      spine.duration ? `時長：${spine.duration}` : "",
+      spine.acceptance ? `驗收：${spine.acceptance}` : ""
+    ].filter(Boolean) || ["未指定"];
+  }
+
+  function paperSlotRows(slot) {
+    return [
+      slot?.description || slot?.id || "未命名項目",
+      paperRangeText(slot),
+      slot?.production_method ? `製作方式：${slot.production_method}` : "",
+      slot?.duration ? `時長：${slot.duration}` : "",
+      slot?.acceptance ? `驗收：${slot.acceptance}` : ""
+    ].filter(Boolean);
+  }
 </script>
 
 <section class="review-workbench" aria-label="審閱工作區">
   <div class="workbench-header">
     <div>
       <span class="eyebrow">審閱工作區</span>
-      <strong>{activeScope === "block" ? "語意塊" : cueLabel}</strong>
+      <strong>{isPaperEdit && selectedPaperSection ? `Section ${selectedPaperSection.id} · ${selectedPaperSection.title}` : activeScope === "block" ? "語意塊" : cueLabel}</strong>
+      {#if selectedPaperSection}<small>{selectedPaperSection.approved} / {selectedPaperSection.cues.length} Beats approved</small>{/if}
     </div>
-    <div class="segmented" aria-label="審閱範圍">
-      <button class:active={activeScope === "block"} disabled={!packageData.blocks.length} type="button" on:click={() => onScopeChange("block")}>語意塊 <span class="info" title="先審閱一個完整的口譯意思，再檢查它包含的顯示 Cue。">!</span></button>
-      <button class:active={activeScope === "cue"} type="button" on:click={() => onScopeChange("cue")}>{isCarousel ? "圖卡" : isMarkdown ? "區塊" : "Cue"} <span class="info" title="審閱目前選取的內容。">!</span></button>
-    </div>
+    {#if !isPaperEdit}
+      <div class="segmented" aria-label="審閱範圍">
+        <button class:active={activeScope === "block"} disabled={!packageData.blocks.length} type="button" on:click={() => onScopeChange("block")}>語意塊 <span class="info" title="先審閱一個完整的口譯意思，再檢查它包含的顯示 Cue。">!</span></button>
+        <button class:active={activeScope === "cue"} type="button" on:click={() => onScopeChange("cue")}>{isCarousel ? "圖卡" : isMarkdown ? "區塊" : "Cue"} <span class="info" title="審閱目前選取的內容。">!</span></button>
+      </div>
+    {/if}
   </div>
 
   {#if activeScope === "block" && selectedBlock}
@@ -130,6 +172,78 @@
         <button class:approved={selectedBlockState.approved} class="approve-button" disabled={Boolean(blockIssue) && !selectedBlockState.approved} type="button" on:click={() => onBlockApproval(selectedBlock.id, !selectedBlockState.approved)}>
           {selectedBlockState.approved ? "取消核准語意塊" : "核准語意塊"}
         </button>
+      </div>
+    </div>
+  {:else if isPaperEdit && selectedCue}
+    <div class="workbench-layout">
+      <nav class="review-list paper-review-list" aria-label="Sections 與 Beats">
+        {#each paperSections as section}
+          <div class:active={section.id === selectedPaperSection?.id} class:approved={section.status === "approve"} class:needs-work={section.status === "revise" || section.status === "block"} class="paper-section">
+            <button class="section-heading" type="button" on:click={() => onSelectCue(section.cues[0].id)}>
+              <span>Section {section.id}</span>
+              <strong>{section.title}</strong>
+              <small>{section.approved} / {section.cues.length} approved{section.block ? ` · ${section.block} blocked` : section.revise ? ` · ${section.revise} revise` : ""}</small>
+            </button>
+            <div class="section-beats">
+              {#each section.cues as beatCue}
+                {@const beatState = draft.cues[beatCue.id]}
+                <button id={`cue-${beatCue.id}`} class:active={beatCue.id === selectedCue.id} class:approved={beatState.decision === "approve"} class:needs-work={beatState.decision === "revise" || beatState.decision === "block"} type="button" on:click={() => onSelectCue(beatCue.id)}>
+                  <span>Beat {beatCue.id.replace(/^beat-/, "")}</span>
+                  <strong>{beatCue.beat?.teaching_purpose || beatCue.text}</strong>
+                  <small>{formatTime(beatCue.start_ms)} 至 {formatTime(beatCue.end_ms)}</small>
+                </button>
+              {/each}
+            </div>
+          </div>
+        {/each}
+      </nav>
+
+      <div class="editor-pane">
+        <div class="editor-heading">
+          <span>Section {selectedCue.beat?.chapter_id} · Beat {selectedCue.id.replace(/^beat-/, "")}</span>
+          <span class:approved={selectedCueState.decision === "approve"} class="approval-pill">{selectedCueState.decision === "pending" ? "待審閱" : selectedCueState.decision}</span>
+        </div>
+        <div class="read-only-field">
+          <span>教學目的</span>
+          <div class="source-text">{selectedCue.beat?.teaching_purpose || "未指定"}</div>
+        </div>
+        <div class="read-only-field">
+          <span>口說內容摘要</span>
+          <div class="source-text">{selectedCue.beat?.spoken_content_summary || "未指定"}</div>
+        </div>
+        <div class="read-only-field">
+          <span>敘事主線</span>
+          <div class="source-text">{#each narrationSpineRows(selectedCue.beat?.narration_spine) as row}<div>{row}</div>{/each}</div>
+        </div>
+        <div class="read-only-field">
+          <span>來源範圍</span>
+          <div class="source-text">{#each selectedCue.beat?.source_ranges || [] as range}<div>{paperRangeText(range)}</div>{:else}<div>沒有</div>{/each}</div>
+        </div>
+        <div class="read-only-field">
+          <span>視覺欄位</span>
+          <div class="source-text">{#each selectedCue.beat?.visual_slots || [] as slot}{#each paperSlotRows(slot) as row}<div>{row}</div>{/each}{/each}</div>
+        </div>
+        <div class="read-only-field">
+          <span>時長</span>
+          <div class="source-text">{formatTime(selectedCue.beat?.duration_ms || 0)}</div>
+        </div>
+        <div class="read-only-field">
+          <span>未解工作</span>
+          <div class="source-text">{#each selectedCue.beat?.unresolved_work || [] as item}<div>{item}</div>{:else}<div>沒有</div>{/each}</div>
+        </div>
+        <div class="field-label">決策</div>
+        <div class="segmented" aria-label="Beat 決策">
+          <button class:active={selectedCueState.decision === "approve"} type="button" on:click={() => onCueChange(selectedCue.id, { decision: "approve" })}>Approve</button>
+          <button class:active={selectedCueState.decision === "revise"} type="button" on:click={() => onCueChange(selectedCue.id, { decision: "revise" })}>Revise</button>
+          <button class:active={selectedCueState.decision === "block"} type="button" on:click={() => onCueChange(selectedCue.id, { decision: "block" })}>Block</button>
+        </div>
+        <label>
+          <span>註記（Revise / Block 必填）</span>
+          <textarea class="short-textarea" value={selectedCueState.instruction} placeholder="說明下一步需要調整或阻擋的原因" on:input={(event) => onCueChange(selectedCue.id, { instruction: event.currentTarget.value })}></textarea>
+        </label>
+        {#if selectedPaperIssue}
+          <p class="validation-message" role="alert">{selectedPaperIssue}</p>
+        {/if}
       </div>
     </div>
   {:else if selectedCue}

@@ -5,6 +5,13 @@ const subtitleActions = [
   { value: "retime", label: "回上游調整時間" }
 ];
 
+export const PAPER_EDIT_DECISION_ACTIONS = Object.freeze({
+  pending: "use_edit",
+  approve: "use_edit",
+  revise: "rewrite",
+  block: "needs_source"
+});
+
 export const ACTIONS_BY_WORKFLOW = {
   subtitle: subtitleActions,
   redraw: subtitleActions,
@@ -23,11 +30,48 @@ export const ACTIONS_BY_WORKFLOW = {
     { value: "cut", label: "刪減" },
     { value: "split", label: "拆分區塊" },
     { value: "needs_source", label: "需要來源" }
+  ],
+  paper_edit: [
+    { value: "use_edit", label: "Approve" },
+    { value: "rewrite", label: "Revise" },
+    { value: "needs_source", label: "Block" }
   ]
 };
 
 export function actionsForWorkflow(kind) {
   return ACTIONS_BY_WORKFLOW[kind] || subtitleActions;
+}
+
+function paperEditDecision(value) {
+  return Object.hasOwn(PAPER_EDIT_DECISION_ACTIONS, value) ? value : "pending";
+}
+
+export function paperDecisionIssue(cueState) {
+  return ["revise", "block"].includes(cueState?.decision) && !String(cueState.instruction || "").trim()
+    ? "Revise 與 Block 必須填寫註記。"
+    : "";
+}
+
+export function paperEditSections(cues = [], cueStates = {}) {
+  const sections = [];
+  const byId = new Map();
+  for (const cue of cues) {
+    const id = String(cue.beat?.chapter_id || "unassigned");
+    if (!byId.has(id)) {
+      const section = { id, title: cue.beat?.chapter_title || "Unassigned", cues: [], approved: 0, revise: 0, block: 0 };
+      byId.set(id, section);
+      sections.push(section);
+    }
+    const section = byId.get(id);
+    section.cues.push(cue);
+    const decision = paperEditDecision(cueStates[cue.id]?.decision);
+    if (decision === "approve") section.approved += 1;
+    else if (decision !== "pending") section[decision] += 1;
+  }
+  return sections.map((section) => ({
+    ...section,
+    status: section.block ? "block" : section.revise ? "revise" : section.approved === section.cues.length ? "approve" : "pending"
+  }));
 }
 
 const protectedLatinToken = /(?<![A-Za-z0-9])(?:[A-Za-z0-9]+(?:[._/+\-][A-Za-z0-9+#]+)+|[A-Za-z][+#]{1,2})(?![A-Za-z0-9])/g;
@@ -63,6 +107,7 @@ export function draftKey(packageData) {
 }
 
 export function createDraft(packageData) {
+  const paperEdit = packageData.workflow?.kind === "paper_edit";
   return {
     schema_version: "framecue_browser_draft_v1",
     selected_cue_id: packageData.cues[0]?.id || "",
@@ -73,7 +118,8 @@ export function createDraft(packageData) {
       text: cue.text,
       speech_text: cue.speech_text,
       action: "use_edit",
-      instruction: ""
+      instruction: "",
+      ...(paperEdit ? { decision: "pending" } : {})
     }])),
     blocks: Object.fromEntries(packageData.blocks.map((block) => [block.id, {
       target_text: block.target_text,
@@ -89,15 +135,20 @@ export function createDraft(packageData) {
 export function mergeDraft(packageData, savedDraft) {
   const fresh = createDraft(packageData);
   if (!savedDraft || savedDraft.schema_version !== fresh.schema_version) return fresh;
+  const paperEdit = packageData.workflow?.kind === "paper_edit";
   const actions = actionsForWorkflow(packageData.workflow?.kind);
   for (const cue of packageData.cues) {
     const saved = savedDraft.cues?.[cue.id];
     if (!saved) continue;
+    const decision = paperEdit ? paperEditDecision(saved.decision) : "";
     fresh.cues[cue.id] = {
       text: textForDisplay(packageData, saved.text ?? cue.text),
       speech_text: String(saved.speech_text ?? cue.speech_text),
-      action: actions.some((action) => action.value === saved.action) ? saved.action : "use_edit",
-      instruction: String(saved.instruction || "")
+      action: paperEdit
+        ? PAPER_EDIT_DECISION_ACTIONS[decision]
+        : actions.some((action) => action.value === saved.action) ? saved.action : "use_edit",
+      instruction: String(saved.instruction || ""),
+      ...(paperEdit ? { decision } : {})
     };
   }
   for (const block of packageData.blocks) {
@@ -146,7 +197,19 @@ export function blockContentIssue(packageData, draft, blockId) {
 }
 
 export function withCueChange(packageData, draft, cueId, patch) {
-  const cues = { ...draft.cues, [cueId]: { ...draft.cues[cueId], ...patch } };
+  const paperEdit = packageData.workflow?.kind === "paper_edit";
+  const decision = paperEdit && Object.hasOwn(patch, "decision") ? paperEditDecision(patch.decision) : "";
+  const cues = {
+    ...draft.cues,
+    [cueId]: {
+      ...draft.cues[cueId],
+      ...patch,
+      ...(paperEdit && Object.hasOwn(patch, "decision") ? {
+        decision,
+        action: PAPER_EDIT_DECISION_ACTIONS[decision]
+      } : {})
+    }
+  };
   const blocks = { ...draft.blocks };
   for (const block of packageData.blocks.filter((item) => item.cue_ids.includes(cueId))) {
     blocks[block.id] = {
@@ -200,6 +263,9 @@ export function approveBlockAndAdvance(packageData, draft, blockId) {
 }
 
 export function finalApprovalAllowed(packageData, draft) {
+  if (packageData.workflow?.kind === "paper_edit") {
+    return packageData.cues.every((cue) => draft.cues[cue.id]?.decision === "approve");
+  }
   return !packageData.blocks.length || packageData.blocks.every((block) =>
     draft.blocks[block.id]?.approved && !blockContentIssue(packageData, draft, block.id)
   );
@@ -207,6 +273,7 @@ export function finalApprovalAllowed(packageData, draft) {
 
 export function makeResult(packageData, draft, approvedAt = "") {
   const approved = Boolean(approvedAt);
+  const paperEdit = packageData.workflow?.kind === "paper_edit";
   return {
     schema_version: "framecue_review_result_v1",
     review_id: packageData.review_id,
@@ -224,13 +291,18 @@ export function makeResult(packageData, draft, approvedAt = "") {
       instruction: draft.blocks[block.id].instruction,
       approved: Boolean(draft.blocks[block.id].approved)
     })),
-    cues: packageData.cues.map((cue) => ({
-      id: cue.id,
-      text: draft.cues[cue.id].text,
-      speech_text: draft.cues[cue.id].speech_text,
-      action: draft.cues[cue.id].action,
-      instruction: draft.cues[cue.id].instruction
-    }))
+    cues: packageData.cues.map((cue) => {
+      const state = draft.cues[cue.id];
+      const decision = paperEdit ? paperEditDecision(state.decision) : "";
+      return {
+        id: cue.id,
+        text: state.text,
+        speech_text: state.speech_text,
+        action: paperEdit ? PAPER_EDIT_DECISION_ACTIONS[decision] : state.action,
+        instruction: state.instruction,
+        ...(paperEdit ? { decision } : {})
+      };
+    })
   };
 }
 
@@ -242,6 +314,7 @@ export function changedCount(packageData, draft) {
       current.text !== cue.text ||
       current.speech_text !== cue.speech_text ||
       current.action !== "use_edit" ||
+      (packageData.workflow?.kind === "paper_edit" && current.decision !== "pending") ||
       current.instruction.trim()
     ) count += 1;
   }

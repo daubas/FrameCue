@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 ADAPTER_PATH = ROOT / "adapters" / "hyperframes-player.html"
-VIEWER_VERSION = "2.4.0"
+VIEWER_VERSION = "2.5.0-dev.2"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
@@ -29,8 +29,17 @@ WORKFLOW_ACTIONS = {
     "hyperframes": {"use_edit", "rewrite", "resegment", "retime"},
     "image_carousel": {"use_edit", "replace_asset", "rewrite_copy", "recrop", "reorder"},
     "markdown": {"use_edit", "rewrite", "cut", "split", "needs_source"},
+    "paper_edit": {"use_edit", "rewrite", "needs_source"},
 }
 WORKFLOW_KINDS = set(WORKFLOW_ACTIONS)
+PAPER_EDIT_DECISION_ACTIONS = {
+    "pending": "use_edit",
+    "approve": "use_edit",
+    "revise": "rewrite",
+    "block": "needs_source",
+}
+PAPER_EDIT_AVAILABILITY = {"existing", "planned", "gap"}
+PAPER_EDIT_ROLES = {"evidence", "illustration", "reference-only"}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLIDE_PATTERN = re.compile(r"^slide-(\d+)\.png$", re.IGNORECASE)
 LIST_PATTERN = re.compile(r"^\s*(?:[-*+] |\d+\. )")
@@ -322,6 +331,88 @@ def nested_asset_paths(row, label):
     return paths
 
 
+def validate_paper_edit_spine(spine, label, source_ids):
+    if isinstance(spine, str):
+        if not spine.strip():
+            raise FrameCueError(f"{label} must not be empty")
+        return
+    if not isinstance(spine, dict):
+        raise FrameCueError(f"{label} must be a string or object")
+    for key in ("production_method", "duration", "acceptance"):
+        if key in spine and not as_text(spine[key], f"{label}.{key}").strip():
+            raise FrameCueError(f"{label}.{key} must not be empty")
+    text = spine.get("text", "")
+    if text:
+        as_text(text, f"{label}.text")
+    range_keys = {"source_id", "start_ms", "end_ms"}
+    present = range_keys.intersection(spine)
+    if present and present != range_keys:
+        raise FrameCueError(f"{label} source reference must include source_id, start_ms, and end_ms")
+    if present:
+        source_id = ensure_id(spine["source_id"], f"{label}.source_id")
+        if source_id not in source_ids:
+            raise FrameCueError(f"{label}.source_id does not exist")
+        start = as_ms(spine["start_ms"], f"{label}.start_ms")
+        end = as_ms(spine["end_ms"], f"{label}.end_ms")
+        if end < start:
+            raise FrameCueError(f"{label}.end_ms must not precede start_ms")
+    if not text and not present:
+        raise FrameCueError(f"{label} must contain text or a source reference")
+
+
+def validate_paper_edit_slot(slot, label, source_ids):
+    if not isinstance(slot, dict):
+        raise FrameCueError(f"{label} must be an object")
+    availability = slot.get("availability")
+    role = slot.get("role")
+    if availability not in PAPER_EDIT_AVAILABILITY:
+        raise FrameCueError(f"{label}.availability is invalid")
+    if role not in PAPER_EDIT_ROLES:
+        raise FrameCueError(f"{label}.role is invalid")
+    for key in ("production_method", "duration", "acceptance"):
+        if key in slot and not as_text(slot[key], f"{label}.{key}").strip():
+            raise FrameCueError(f"{label}.{key} must not be empty")
+    source_keys = {"source_id", "start_ms", "end_ms"}
+    present = source_keys.intersection(slot)
+    if role == "evidence" and availability != "existing":
+        raise FrameCueError(f"{label}.evidence requires existing availability")
+    if availability != "existing":
+        if present:
+            raise FrameCueError(f"{label} planned or gap media must not carry a source reference or range")
+        return
+    if present != source_keys:
+        raise FrameCueError(f"{label} existing media needs source_id, start_ms, and end_ms")
+    source_id = ensure_id(as_text(slot["source_id"], f"{label}.source_id"), f"{label}.source_id")
+    if source_id not in source_ids:
+        raise FrameCueError(f"{label}.source_id does not exist")
+    start = as_ms(slot["start_ms"], f"{label}.start_ms")
+    end = as_ms(slot["end_ms"], f"{label}.end_ms")
+    if end < start:
+        raise FrameCueError(f"{label}.end_ms must not precede start_ms")
+
+
+def validate_paper_edit_beat(beat, label, source_ids, duration_ms):
+    if not isinstance(beat, dict):
+        raise FrameCueError(f"{label}.beat must be an object")
+    for key in ("teaching_purpose", "spoken_content_summary"):
+        if not as_text(beat.get(key, ""), f"{label}.beat.{key}").strip():
+            raise FrameCueError(f"{label}.beat.{key} must not be empty")
+    validate_paper_edit_spine(beat.get("narration_spine"), f"{label}.beat.narration_spine", source_ids)
+    if as_ms(beat.get("duration_ms"), f"{label}.beat.duration_ms") != duration_ms:
+        raise FrameCueError(f"{label}.beat.duration_ms must match the Beat timeline duration")
+    source_ranges = ensure_list(beat.get("source_ranges"), f"{label}.beat.source_ranges")
+    visual_slots = ensure_list(beat.get("visual_slots"), f"{label}.beat.visual_slots")
+    unresolved_work = ensure_list(beat.get("unresolved_work"), f"{label}.beat.unresolved_work")
+    if not visual_slots:
+        raise FrameCueError(f"{label}.beat.visual_slots must not be empty")
+    for index, item in enumerate(source_ranges):
+        validate_paper_edit_slot(item, f"{label}.beat.source_ranges[{index}]", source_ids)
+    for index, item in enumerate(visual_slots):
+        validate_paper_edit_slot(item, f"{label}.beat.visual_slots[{index}]", source_ids)
+    if not all(isinstance(item, str) for item in unresolved_work):
+        raise FrameCueError(f"{label}.beat.unresolved_work must be a string array")
+
+
 def validate_package(package, package_dir=None, check_assets=True):
     if not isinstance(package, dict):
         raise FrameCueError("package must be an object")
@@ -356,6 +447,24 @@ def validate_package(package, package_dir=None, check_assets=True):
     blocks = ensure_list(package.get("blocks"), "package.blocks")
     if not cues:
         raise FrameCueError("package.cues must not be empty")
+
+    paper_source_ids = set()
+    if workflow_kind == "paper_edit":
+        paper_edit = package["media"].get("paper_edit")
+        if not isinstance(paper_edit, dict):
+            raise FrameCueError("package.media.paper_edit must be an object")
+        sources = ensure_list(paper_edit.get("sources"), "package.media.paper_edit.sources")
+        for index, source in enumerate(sources):
+            label = f"package.media.paper_edit.sources[{index}]"
+            if not isinstance(source, dict):
+                raise FrameCueError(f"{label} must be an object")
+            source_id = ensure_id(source.get("id", ""), f"{label}.id")
+            if source_id in paper_source_ids:
+                raise FrameCueError(f"duplicate paper edit source id: {source_id}")
+            paper_source_ids.add(source_id)
+            src = as_text(source.get("src", ""), f"{label}.src")
+            if check_assets:
+                asset_exists(package_dir, src, f"{label}.src")
 
     scene_ids = set()
     for index, scene in enumerate(scenes):
@@ -404,6 +513,8 @@ def validate_package(package, package_dir=None, check_assets=True):
         if workflow_kind == "markdown":
             if not isinstance(markdown, dict) or markdown.get("kind") not in {"paragraph", "heading", "list"}:
                 raise FrameCueError(f"{label}.markdown.kind is invalid")
+        if workflow_kind == "paper_edit":
+            validate_paper_edit_beat(cue.get("beat"), label, paper_source_ids, end - start)
         if check_assets:
             for nested, key, asset_label in nested_asset_paths(cue, label):
                 asset_exists(package_dir, nested[key], asset_label)
@@ -474,6 +585,9 @@ def validate_package(package, package_dir=None, check_assets=True):
         if len(scenes) != len(cues) or len({cue["scene_id"] for cue in cues}) != len(cues):
             raise FrameCueError("Markdown mode must contain one cue per content block")
 
+    if workflow_kind == "paper_edit" and blocks:
+        raise FrameCueError("paper edit mode reviews Beats only and must not contain blocks")
+
     return {
         "review_id": package["review_id"],
         "revision": package["revision"],
@@ -503,7 +617,8 @@ def validate_result(result, package, require_approved=False):
 
     result_cues = ensure_list(result.get("cues"), "result.cues")
     result_blocks = ensure_list(result.get("blocks"), "result.blocks")
-    actions = WORKFLOW_ACTIONS[package["workflow"]["kind"]]
+    workflow_kind = package["workflow"]["kind"]
+    actions = WORKFLOW_ACTIONS[workflow_kind]
     expected_cues = {cue["id"] for cue in package["cues"]}
     expected_blocks = {block["id"] for block in package["blocks"]}
     cue_ids = [as_text(row.get("id", ""), "result.cues[].id") for row in result_cues if isinstance(row, dict)]
@@ -519,20 +634,33 @@ def validate_result(result, package, require_approved=False):
         as_text(row.get("text", ""), "result.cues[].text")
         as_text(row.get("speech_text", ""), "result.cues[].speech_text")
         if row.get("action") not in actions:
-            raise FrameCueError(f"result.cues[].action is invalid for {package['workflow']['kind']}")
+            raise FrameCueError(f"result.cues[].action is invalid for {workflow_kind}")
         as_text(row.get("instruction", ""), "result.cues[].instruction")
+        if workflow_kind == "paper_edit":
+            decision = row.get("decision")
+            expected_action = PAPER_EDIT_DECISION_ACTIONS.get(decision)
+            if not expected_action:
+                raise FrameCueError("result.cues[].decision is invalid for paper_edit")
+            if row["action"] != expected_action:
+                raise FrameCueError("result.cues[].action does not match its paper_edit decision")
+            if decision in {"revise", "block"} and not row["instruction"].strip():
+                raise FrameCueError("paper_edit Revise and Block decisions require a note")
+        elif "decision" in row:
+            raise FrameCueError("result.cues[].decision is only valid for paper_edit")
     for row in result_blocks:
         if not isinstance(row, dict):
             raise FrameCueError("result.blocks entries must be objects")
         as_text(row.get("target_text", ""), "result.blocks[].target_text")
         as_text(row.get("speech_text", ""), "result.blocks[].speech_text")
         if row.get("action") not in actions:
-            raise FrameCueError(f"result.blocks[].action is invalid for {package['workflow']['kind']}")
+            raise FrameCueError(f"result.blocks[].action is invalid for {workflow_kind}")
         as_text(row.get("instruction", ""), "result.blocks[].instruction")
         if not isinstance(row.get("approved"), bool):
             raise FrameCueError("result.blocks[].approved must be boolean")
     if status == "approved" and expected_blocks and not all(row["approved"] for row in result_blocks):
         raise FrameCueError("all blocks must be approved before final approval")
+    if status == "approved" and workflow_kind == "paper_edit" and not all(row["decision"] == "approve" for row in result_cues):
+        raise FrameCueError("all Beats must be approved before final approval")
     if status == "approved":
         package_blocks = {row["id"]: row for row in package["blocks"]}
         result_cues_by_id = {row["id"]: row for row in result_cues}
@@ -778,6 +906,34 @@ def materialize_assets(package, source_root, out_dir):
             output[key] = copy_file(source, out_dir, Path("assets/context") / f"{key}{source.suffix or '.png'}")
         package["media"]["carousel"] = output
 
+    paper_edit = package["media"].get("paper_edit")
+    if paper_edit:
+        if not isinstance(paper_edit, dict):
+            raise FrameCueError("media.paper_edit must be an object")
+        sources = ensure_list(paper_edit.get("sources"), "media.paper_edit.sources")
+        output = copy.deepcopy(paper_edit)
+        output_sources = []
+        source_ids = set()
+        for index, item in enumerate(sources):
+            label = f"media.paper_edit.sources[{index}]"
+            if not isinstance(item, dict):
+                raise FrameCueError(f"{label} must be an object")
+            source_id = ensure_id(item.get("id", ""), f"{label}.id")
+            if source_id in source_ids:
+                raise FrameCueError(f"duplicate paper edit source id: {source_id}")
+            source_ids.add(source_id)
+            source = resolve_source_path(item.get("source", ""), source_root, f"{label}.source")
+            if not source.is_file():
+                raise FrameCueError(f"{label}.source must be a file")
+            bundled = copy.deepcopy(item)
+            bundled.pop("source", None)
+            bundled.pop("src", None)
+            bundled["id"] = source_id
+            bundled["src"] = copy_file(source, out_dir, Path("assets/paper-edit") / f"{source_id}{source.suffix or '.mp4'}")
+            output_sources.append(bundled)
+        output["sources"] = output_sources
+        package["media"]["paper_edit"] = output
+
     hyperframes = package["media"].get("hyperframes")
     if not hyperframes:
         return
@@ -960,6 +1116,7 @@ def build_manifest(items, out_dir):
 
 
 def default_result(package, approved=False):
+    paper_edit = package["workflow"]["kind"] == "paper_edit"
     return {
         "schema_version": RESULT_SCHEMA,
         "review_id": package["review_id"],
@@ -981,8 +1138,9 @@ def default_result(package, approved=False):
             "id": cue["id"],
             "text": cue["text"],
             "speech_text": cue["speech_text"],
-            "action": "use_edit",
+            "action": PAPER_EDIT_DECISION_ACTIONS["approve" if approved else "pending"] if paper_edit else "use_edit",
             "instruction": "",
+            **({"decision": "approve" if approved else "pending"} if paper_edit else {}),
         } for cue in package["cues"]],
     }
 

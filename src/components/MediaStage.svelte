@@ -13,6 +13,8 @@
   let cueAudio;
   let sourceVideoElement;
   let sourceVideoCueId = "";
+  let paperRangeCueId = "";
+  let paperRangeKey = "";
   let cuePlaybackActive = false;
   let cuePlaybackEndMs = 0;
   let playerFrame;
@@ -26,7 +28,17 @@
   $: redrawBefore = redraw?.before_image || redraw?.comparison_image || scene?.image || "";
   $: redrawAfter = redraw?.after_image || redraw?.current_image || scene?.image || "";
   $: boundary = cue?.boundary || scene?.boundary || null;
-  $: sourceVideo = packageData?.media?.video || null;
+  $: paperEdit = packageData?.media?.paper_edit || null;
+  $: paperSources = paperEdit?.sources || [];
+  $: paperRanges = paperEdit && cue?.beat ? paperRangesFor(cue.beat) : [];
+  $: if (cue?.id !== paperRangeCueId) {
+    paperRangeCueId = cue?.id || "";
+    paperRangeKey = paperRanges[0]?.key || "";
+  }
+  $: paperRange = paperRanges.find((range) => range.key === paperRangeKey) || paperRanges[0] || null;
+  $: paperVideo = paperRange ? paperSources.find((source) => source.id === paperRange.source_id) || null : null;
+  $: playbackCue = paperVideo && paperRange ? { ...cue, start_ms: paperRange.start_ms, end_ms: paperRange.end_ms } : cue;
+  $: sourceVideo = paperVideo || packageData?.media?.video || null;
   $: hyperframes = packageData?.media?.hyperframes || null;
   $: carousel = packageData?.media?.carousel || null;
   $: markdown = packageData?.media?.markdown || null;
@@ -45,9 +57,22 @@
   $: if (stageMode === "video" && playerReady && cue) {
     postPlayer("framecue:seek", { time: cue.start_ms / 1000 });
   }
-  $: if (stageMode === "video" && sourceVideo && sourceVideoElement && cue?.id && cue.id !== sourceVideoCueId) {
-    sourceVideoCueId = cue.id;
+  $: sourcePlaybackKey = paperEdit ? paperRange?.key || "" : playbackCue?.id || "";
+  $: if (stageMode === "video" && sourceVideo && sourceVideoElement && sourcePlaybackKey && sourcePlaybackKey !== sourceVideoCueId) {
+    sourceVideoCueId = sourcePlaybackKey;
     alignSourceVideo();
+  }
+
+  function paperRangesFor(beat) {
+    const ranges = [beat?.narration_spine, ...(beat?.source_ranges || []), ...(beat?.visual_slots || [])]
+      .filter((range) => range && typeof range === "object" && (!range.availability || range.availability === "existing") && paperSources.some((source) => source.id === range.source_id))
+      .map((range) => ({ ...range, key: `${range.source_id}:${range.start_ms}:${range.end_ms}` }));
+    return ranges.filter((range, index) => ranges.findIndex((item) => item.key === range.key) === index);
+  }
+
+  function paperRangeLabel(range) {
+    const source = paperSources.find((item) => item.id === range.source_id);
+    return `${source?.label || range.source_id} · ${formatTime(range.start_ms)} 至 ${formatTime(range.end_ms)}`;
   }
 
   function postPlayer(type, payload = {}) {
@@ -97,27 +122,27 @@
   }
 
   function alignSourceVideo(force = false) {
-    if (!sourceVideoElement || !cue) return;
+    if (!sourceVideoElement || !playbackCue) return;
     const currentMs = sourceVideoElement.currentTime * 1000;
-    if (force || cueNeedsSeek(cue, currentMs)) {
+    if (force || cueNeedsSeek(playbackCue, currentMs)) {
       sourceVideoElement.pause();
       cuePlaybackActive = false;
-      sourceVideoElement.currentTime = cue.start_ms / 1000;
+      sourceVideoElement.currentTime = playbackCue.start_ms / 1000;
     }
   }
 
   function toggleSourceVideo() {
-    if (!sourceVideoElement || !cue) return;
+    if (!sourceVideoElement || !playbackCue) return;
     if (!sourceVideoElement.paused) {
       sourceVideoElement.pause();
       cuePlaybackActive = false;
       return;
     }
     const currentMs = sourceVideoElement.currentTime * 1000;
-    if (currentMs < cue.start_ms - 100 || cuePlaybackEnded(currentMs, cue.end_ms)) {
-      sourceVideoElement.currentTime = cue.start_ms / 1000;
+    if (currentMs < playbackCue.start_ms - 100 || cuePlaybackEnded(currentMs, playbackCue.end_ms)) {
+      sourceVideoElement.currentTime = playbackCue.start_ms / 1000;
     }
-    cuePlaybackEndMs = cue.end_ms;
+    cuePlaybackEndMs = playbackCue.end_ms;
     cuePlaybackActive = true;
     pauseCueAudio();
     sourceVideoElement.play().catch(() => {
@@ -136,7 +161,7 @@
       sourceVideoElement.currentTime = Math.min(cuePlaybackEndMs / 1000, duration);
       return;
     }
-    if (packageData?.cues?.length) {
+    if (!paperEdit && packageData?.cues?.length) {
       onPlaybackCue(packageData.cues[cueIndexAtTime(packageData.cues, currentMs)]?.id);
     }
   }
@@ -193,13 +218,13 @@
 <section class:portraitStage={stageMode === "video" && hyperframes && !sourceVideo} class:contextMedia={Boolean(carousel || markdown)} class="media-stage" aria-label="媒體畫面">
   <div class="stage-topline">
     <div>
-      <span class="eyebrow">{carousel ? "圖卡審閱" : markdown ? "Markdown 審閱" : "媒體畫面"}</span>
-      <strong>{cue?.id || "沒有 Cue"}</strong>
+      <span class="eyebrow">{paperEdit ? "Paper edit 審閱" : carousel ? "圖卡審閱" : markdown ? "Markdown 審閱" : "媒體畫面"}</span>
+      <strong>{paperEdit ? `Beat ${cueNumber}` : cue?.id || "沒有 Cue"}</strong>
     </div>
     <div class="mode-strip" aria-label="畫面模式">
       {#each availableModes as mode}
         <button class:active={stageMode === mode} type="button" on:click={() => setMode(mode)}>
-          {mode === "still" ? "Cue 畫面" : mode === "redraw" ? "重繪比較" : mode === "boundary" ? "切點比較" : "影片"}
+          {mode === "still" ? paperEdit ? "Beat 畫面" : "Cue 畫面" : mode === "redraw" ? "重繪比較" : mode === "boundary" ? "切點比較" : "影片"}
         </button>
       {/each}
     </div>
@@ -221,7 +246,7 @@
           on:ended={() => { cuePlaybackActive = false; playerPlaying = false; }}
           on:timeupdate={handleSourceTimeUpdate}
         >
-          <track kind="captions" src={assetUrl(sourceVideo.captions)} srclang="zh-Hant" label="FrameCue 中英字幕" />
+          <track kind="captions" src={sourceVideo.captions ? assetUrl(sourceVideo.captions) : "data:text/vtt,WEBVTT%0A"} srclang="zh-Hant" label="FrameCue 中英字幕" />
         </video>
         <div class="subtitle-overlay">
           {#if cue?.original_text}
@@ -265,6 +290,11 @@
           <figcaption>後：{formatTime(cue?.end_ms || 0)}</figcaption>
         </figure>
       </div>
+    {:else if paperEdit && scene}
+      <figure class="carousel-stage">
+        <img src={assetUrl(scene.image)} alt={`Beat ${cueNumber} 的代表畫面`} />
+        <figcaption>Beat {cueNumber} 代表畫面</figcaption>
+      </figure>
     {:else if carousel && scene}
       <figure class="carousel-stage">
         <img src={assetUrl(scene.image)} alt={`${cue?.text || cue?.id} 圖卡`} />
@@ -325,10 +355,20 @@
   {/if}
 
   <div class="stage-footer">
-    <span>{carousel ? `第 ${cueNumber} 張，共 ${packageData.cues.length} 張` : markdown ? `第 ${cueNumber} 個區塊，共 ${packageData.cues.length} 個` : `${formatTime(cue?.start_ms || 0)} 至 ${formatTime(cue?.end_ms || 0)}`}</span>
+    <span>{paperEdit ? `Beat ${cueNumber} · ${formatTime(cue?.start_ms || 0)} 至 ${formatTime(cue?.end_ms || 0)}` : carousel ? `第 ${cueNumber} 張，共 ${packageData.cues.length} 張` : markdown ? `第 ${cueNumber} 個區塊，共 ${packageData.cues.length} 個` : `${formatTime(cue?.start_ms || 0)} 至 ${formatTime(cue?.end_ms || 0)}`}</span>
     <div class="stage-actions">
+      {#if paperEdit && paperRanges.length > 1}
+        <label class="paper-source-select">
+          <span>來源影片</span>
+          <select value={paperRangeKey} on:change={(event) => paperRangeKey = event.currentTarget.value}>
+            {#each paperRanges as range}
+              <option value={range.key}>{paperRangeLabel(range)}</option>
+            {/each}
+          </select>
+        </label>
+      {/if}
       {#if stageMode === "video" && (sourceVideo || hyperframes)}
-        <button type="button" on:click={toggleVideo}>{playerPlaying ? "暫停 Cue" : "播放 Cue"}</button>
+        <button type="button" on:click={toggleVideo}>{playerPlaying ? paperEdit ? "暫停 Beat" : "暫停 Cue" : paperEdit ? "播放 Beat" : "播放 Cue"}</button>
       {:else if cue?.audio}
         <button type="button" on:click={toggleCueAudio}>{cueAudio?.paused === false ? "暫停 Cue" : "播放 Cue"}</button>
       {/if}

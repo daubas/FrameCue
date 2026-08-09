@@ -14,6 +14,7 @@
     formatTime,
     makeResult,
     mergeDraft,
+    paperDecisionIssue,
     textForDisplay,
     withBlockApproval,
     withBlockChange,
@@ -199,6 +200,10 @@
 
   function downloadResult() {
     if (!packageData || !draft) return;
+    if (packageData.workflow.kind === "paper_edit" && packageData.cues.some((cue) => paperDecisionIssue(draft.cues[cue.id]))) {
+      window.alert("Revise 與 Block 的 Beat 必須填寫註記後才能輸出審閱結果。");
+      return;
+    }
     const result = makeResult(packageData, draft, draft.final_approval?.approved_at || "");
     downloadText(resultFileName(packageData), "application/json", JSON.stringify(result, null, 2));
   }

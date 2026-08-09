@@ -51,7 +51,8 @@
         "text": { "type": "string" },
         "speech_text": { "type": "string" },
         "action": { "$ref": "#/$defs/action" },
-        "instruction": { "type": "string" }
+        "instruction": { "type": "string" },
+        "decision": { "enum": ["pending", "approve", "revise", "block"] }
       },
       "additionalProperties": false
     }

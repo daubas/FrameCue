@@ -158,6 +158,124 @@ class FrameCueV2Tests(unittest.TestCase):
         self.assertTrue(captions.read_text(encoding="utf-8").startswith("WEBVTT\n\n"))
         framecue.validate_package(package, out_dir)
 
+    def test_paper_edit_builds_multi_source_beats_and_requires_decisions(self):
+        source_root = self.output / "paper-edit-input"
+        source_root.mkdir()
+        for name in ("beat-1.svg", "beat-2.svg"):
+            (source_root / name).write_text(
+                '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#123"/></svg>',
+                encoding="utf-8",
+            )
+        (source_root / "lesson-a.mp4").write_bytes(b"paper-edit-video-a")
+        (source_root / "lesson-b.mp4").write_bytes(b"paper-edit-video-b")
+        source = {
+            "review_id": "paper-edit-fixture",
+            "revision": "r1",
+            "workflow": {"kind": "paper_edit", "label": "Paper edit fixture"},
+            "media": {"paper_edit": {"sources": [
+                {"id": "lesson-a", "label": "Lesson A", "source": "lesson-a.mp4"},
+                {"id": "lesson-b", "label": "Lesson B", "source": "lesson-b.mp4"},
+            ]}},
+            "scenes": [
+                {"id": "s0001", "start_ms": 0, "end_ms": 3000, "image": "beat-1.svg"},
+                {"id": "s0002", "start_ms": 3000, "end_ms": 5000, "image": "beat-2.svg"},
+            ],
+            "cues": [
+                {
+                    "id": "c0001", "start_ms": 0, "end_ms": 3000, "scene_id": "s0001", "text": "Beat one", "speech_text": "Beat one",
+                    "beat": {
+                        "teaching_purpose": "建立問題", "spoken_content_summary": "說明痛點", "duration_ms": 3000,
+                        "narration_spine": {"source_id": "lesson-a", "start_ms": 1000, "end_ms": 2500},
+                        "source_ranges": [
+                            {"source_id": "lesson-a", "start_ms": 1000, "end_ms": 2500, "availability": "existing", "role": "evidence"},
+                            {"source_id": "lesson-b", "start_ms": 0, "end_ms": 1200, "availability": "existing", "role": "reference-only"},
+                        ],
+                        "visual_slots": [
+                            {"id": "ui", "description": "產品畫面", "availability": "existing", "role": "evidence", "source_id": "lesson-a", "start_ms": 1000, "end_ms": 2500},
+                            {"id": "diagram", "description": "補充圖", "availability": "planned", "role": "illustration", "production_method": "動態圖卡", "duration": "3 秒", "acceptance": "手機上可讀"},
+                        ],
+                        "unresolved_work": ["補拍圖示"],
+                    },
+                },
+                {
+                    "id": "c0002", "start_ms": 3000, "end_ms": 5000, "scene_id": "s0002", "text": "Beat two", "speech_text": "Beat two",
+                    "beat": {
+                        "teaching_purpose": "交代下一步", "spoken_content_summary": "提出行動", "duration_ms": 2000,
+                        "narration_spine": {"text": "以清楚的行動收尾", "production_method": "補錄旁白", "duration": "2 秒", "acceptance": "行動句清楚"},
+                        "source_ranges": [],
+                        "visual_slots": [{"id": "placeholder", "availability": "gap", "role": "illustration"}],
+                        "unresolved_work": ["建立 placeholder"],
+                    },
+                },
+            ],
+            "blocks": [],
+        }
+        out_dir = self.output / "paper-edit"
+        framecue.build_package(source, source_root, out_dir)
+        package = framecue.read_json(out_dir / "review_package.json")
+        self.assertEqual(package["workflow"]["kind"], "paper_edit")
+        self.assertEqual([source["id"] for source in package["media"]["paper_edit"]["sources"]], ["lesson-a", "lesson-b"])
+        self.assertTrue((out_dir / package["media"]["paper_edit"]["sources"][0]["src"]).is_file())
+        self.assertNotIn("source", package["media"]["paper_edit"]["sources"][0])
+
+        result = framecue.default_result(package, approved=True)
+        self.assertEqual([cue["decision"] for cue in result["cues"]], ["approve", "approve"])
+        self.assertEqual(framecue.validate_result(result, package, require_approved=True)["status"], "approved")
+
+        result = framecue.default_result(package)
+        result["cues"][0].update({"decision": "revise", "action": "rewrite"})
+        with self.assertRaisesRegex(framecue.FrameCueError, "require a note"):
+            framecue.validate_result(result, package)
+
+        invalid = json.loads(json.dumps(package))
+        invalid["cues"][0]["beat"]["visual_slots"][0]["availability"] = "planned"
+        invalid["content_checksum"] = framecue.package_checksum(invalid)
+        with self.assertRaisesRegex(framecue.FrameCueError, "evidence requires existing"):
+            framecue.validate_package(invalid, out_dir)
+
+        invalid = json.loads(json.dumps(package))
+        invalid["cues"][0]["beat"]["visual_slots"][0] = {"availability": "existing", "role": "illustration"}
+        invalid["content_checksum"] = framecue.package_checksum(invalid)
+        with self.assertRaisesRegex(framecue.FrameCueError, "existing media needs"):
+            framecue.validate_package(invalid, out_dir)
+
+        invalid = json.loads(json.dumps(package))
+        invalid["cues"][0]["beat"]["visual_slots"][1].update({"source_id": "lesson-a", "start_ms": 1000, "end_ms": 2500})
+        invalid["content_checksum"] = framecue.package_checksum(invalid)
+        with self.assertRaisesRegex(framecue.FrameCueError, "planned or gap media"):
+            framecue.validate_package(invalid, out_dir)
+
+        invalid = json.loads(json.dumps(package))
+        invalid["cues"][0]["beat"]["visual_slots"][1]["acceptance"] = " "
+        invalid["content_checksum"] = framecue.package_checksum(invalid)
+        with self.assertRaisesRegex(framecue.FrameCueError, "acceptance must not be empty"):
+            framecue.validate_package(invalid, out_dir)
+
+        invalid = json.loads(json.dumps(package))
+        invalid["cues"][1]["beat"]["narration_spine"]["acceptance"] = " "
+        invalid["content_checksum"] = framecue.package_checksum(invalid)
+        with self.assertRaisesRegex(framecue.FrameCueError, "narration_spine.acceptance must not be empty"):
+            framecue.validate_package(invalid, out_dir)
+
+        all_planned = {
+            "review_id": "paper-edit-planned", "revision": "r1", "workflow": {"kind": "paper_edit"},
+            "media": {"paper_edit": {"sources": []}},
+            "scenes": [{"id": "s0001", "start_ms": 0, "end_ms": 1000, "image": "beat-1.svg"}],
+            "cues": [{
+                "id": "c0001", "start_ms": 0, "end_ms": 1000, "scene_id": "s0001", "text": "Planned Beat", "speech_text": "Planned Beat",
+                "beat": {
+                    "teaching_purpose": "規劃下一步", "spoken_content_summary": "先保留 placeholder", "narration_spine": "先說明目標",
+                    "source_ranges": [], "visual_slots": [{"id": "placeholder", "availability": "planned", "role": "illustration"}],
+                    "duration_ms": 1000, "unresolved_work": ["建立動畫"],
+                },
+            }],
+            "blocks": [],
+        }
+        planned_dir = self.output / "paper-edit-planned"
+        framecue.build_package(all_planned, source_root, planned_dir)
+        planned_package = framecue.read_json(planned_dir / "review_package.json")
+        self.assertEqual(planned_package["media"]["paper_edit"]["sources"], [])
+
     def test_null_legacy_milliseconds_fall_back_to_seconds(self):
         self.assertEqual(framecue.source_ms({"start_ms": None, "start": 1.25}, "start_ms", "fixture"), 1250)
 

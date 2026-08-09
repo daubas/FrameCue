@@ -1,7 +1,7 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: implementation complete; latest validated runtime pinned at `v2.3.0`
-Last updated: 2026-07-30
+Status: `v2.5.0-dev.2` groups paper-edit Beats under read-only Sections; latest pinned release remains `v2.3.0`
+Last updated: 2026-08-05
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
 
@@ -303,3 +303,10 @@ Each implementation phase must leave the smallest runnable check that proves its
 - The pilot confirmed that post-approval TTS pronunciation guidance is not subtitle content. When that guidance changes, AgenticDub creates a new immutable package and records an inherited-content approval only after asserting Cue, Block, Scene, Media, Risk, and subtitle-policy payloads are unchanged from the approved revision.
 - The final QC video is a separate human gate. FrameCue approval authorizes reviewed subtitle content; it does not silently authorize publication. The r12 QC artifact is available through the read-only FBR handoff and remains `final_qc_pending`.
 - Production timing did not clip speech: maximum fitted speed was `1.0714x`, the voice ended before the original-video fade, and visual checks confirmed video and bilingual captions after late Cue `c0359` and at the ending.
+
+### 2026-08-05 - Paper-edit development workflow
+
+- Added the `paper_edit` workflow at `v2.5.0-dev.1` without a second viewer or a new dependency. Each common-contract Cue is presented as a Beat and carries paper-edit-only metadata; metadata is never a review item.
+- Added Section grouping at `v2.5.0-dev.2`. `chapter_id` and `chapter_title` form the higher-level navigation and progress summary; Approve, Revise, and Block remain checksum-bound Beat decisions.
+- A portable package materializes each declared source video separately. Beats retain their paper timeline while selecting an existing source range for native playback; planned and gap work can remain representative-image-only.
+- Paper-edit results add a required per-Beat decision while retaining the existing action field: Approve maps to `use_edit`, Revise to `rewrite`, and Block to `needs_source`. Revise/Block require notes, and final approval requires every Beat to be Approve.

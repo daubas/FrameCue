@@ -11,6 +11,8 @@ import {
   cuePlaybackEnded,
   finalApprovalAllowed,
   makeResult,
+  paperDecisionIssue,
+  paperEditSections,
   withBlockApproval,
   withCueChange
 } from "../src/lib/review.js";
@@ -138,4 +140,50 @@ test("new-mode browser drafts export the frozen result contract", () => {
   assert.equal(result.schema_version, "framecue_review_result_v1");
   assert.equal(result.cues[0].action, "reorder");
   assert.equal(result.cues.length, 1);
+});
+
+test("paper edit decisions gate final approval and map to existing actions", () => {
+  const paperPackage = {
+    review_id: "paper",
+    revision: "r1",
+    content_checksum: "b".repeat(64),
+    viewer_version: "2.5.0-dev.1",
+    workflow: { kind: "paper_edit" },
+    cues: [
+      { id: "c0001", text: "Beat one", speech_text: "Beat one" },
+      { id: "c0002", text: "Beat two", speech_text: "Beat two" }
+    ],
+    blocks: []
+  };
+  let draft = createDraft(paperPackage);
+  assert.equal(draft.cues.c0001.decision, "pending");
+  assert.equal(finalApprovalAllowed(paperPackage, draft), false);
+
+  draft = withCueChange(paperPackage, draft, "c0001", { decision: "revise" });
+  assert.equal(draft.cues.c0001.action, "rewrite");
+  assert.match(paperDecisionIssue(draft.cues.c0001), /必須/);
+  draft = withCueChange(paperPackage, draft, "c0001", { instruction: "補上案例" });
+  draft = withCueChange(paperPackage, draft, "c0001", { decision: "approve" });
+  draft = withCueChange(paperPackage, draft, "c0002", { decision: "approve" });
+  assert.equal(finalApprovalAllowed(paperPackage, draft), true);
+
+  const result = makeResult(paperPackage, draft, "2026-08-05T00:00:00Z");
+  assert.deepEqual(result.cues.map((cue) => [cue.decision, cue.action]), [["approve", "use_edit"], ["approve", "use_edit"]]);
+});
+
+test("paper edit groups Beats under Sections and summarizes their decisions", () => {
+  const cues = [
+    { id: "beat-00.1", beat: { chapter_id: "00", chapter_title: "Opening" } },
+    { id: "beat-00.2", beat: { chapter_id: "00", chapter_title: "Opening" } },
+    { id: "beat-01.1", beat: { chapter_id: "01", chapter_title: "Setup" } }
+  ];
+  const sections = paperEditSections(cues, {
+    "beat-00.1": { decision: "approve" },
+    "beat-00.2": { decision: "revise" },
+    "beat-01.1": { decision: "approve" }
+  });
+  assert.deepEqual(sections.map(({ id, approved, revise, status }) => ({ id, approved, revise, status })), [
+    { id: "00", approved: 1, revise: 1, status: "revise" },
+    { id: "01", approved: 1, revise: 0, status: "approve" }
+  ]);
 });

@@ -181,6 +181,8 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .stage-footer { justify-content: space-between; min-height: 44px; padding-top: 12px; color: #bfc8be; font-size: 13px; font-variant-numeric: tabular-nums; }
 .stage-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
 .stage-actions button { padding: 5px 8px; font-size: 12px; }
+.paper-source-select { display: flex; align-items: center; gap: 5px; color: #c7d1c5; font-size: 12px; }
+.paper-source-select select { max-width: 220px; min-height: 30px; padding: 4px 6px; }
 .warning-button { border-color: #b46d4a; color: #ffd9bf; }
 .media-stage audio { width: 100%; margin-top: 8px; }
 
@@ -188,6 +190,7 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .workbench-header { justify-content: space-between; min-height: 65px; padding: 12px 14px; border-bottom: 1px solid #3b443d; }
 .workbench-header > div:first-child { display: grid; gap: 2px; }
 .workbench-header strong { font-size: 15px; }
+.workbench-header small { color: #9eaa9e; font-size: 11px; font-variant-numeric: tabular-nums; }
 .info { display: inline-grid; width: 15px; height: 15px; place-items: center; border: 1px solid #7d8c7b; border-radius: 50%; color: #eac477; font-size: 10px; font-weight: 800; text-transform: none; cursor: help; }
 
 .workbench-layout { display: grid; grid-template-columns: minmax(155px, .72fr) minmax(0, 1.28fr); min-height: 0; }
@@ -200,6 +203,18 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
 .review-list button > span { color: #aebbac; font-size: 11px; font-variant-numeric: tabular-nums; }
 .review-list button > strong { overflow: hidden; overflow-wrap: anywhere; word-break: normal; line-break: auto; font-size: 13px; font-weight: 620; line-height: 1.35; text-overflow: ellipsis; }
 .review-list button > small { color: #9ba79b; font-size: 11px; font-variant-numeric: tabular-nums; }
+.paper-section { border-bottom: 1px solid #3a433c; }
+.paper-section > .section-heading,
+.section-beats > button { display: grid; width: 100%; gap: 3px; border: 0; border-radius: 0; text-align: left; }
+.paper-section > .section-heading { position: sticky; top: 0; z-index: 1; min-height: 66px; padding: 9px 10px; background: #202721; color: #e2e9df; }
+.paper-section.active > .section-heading { background: #304035; }
+.paper-section.approved > .section-heading { box-shadow: inset 4px 0 #92b17e; }
+.paper-section.needs-work > .section-heading { box-shadow: inset 4px 0 #d39a64; }
+.section-beats > button { min-height: 72px; padding: 9px 10px 9px 18px; background: #171b18; color: #cbd4ca; }
+.section-beats > button:hover { background: #232b25; }
+.section-beats > button.active { background: #394f40; color: #fff; }
+.section-beats > button.approved { box-shadow: inset 3px 0 #92b17e; }
+.section-beats > button.needs-work { box-shadow: inset 3px 0 #d39a64; }
 .list-filter { position: sticky; top: 0; z-index: 1; justify-content: stretch; border-width: 0 0 1px; border-radius: 0; background: #1d231f; }
 .list-filter button { flex: 1; }
 .empty-list { padding: 14px; color: #aab5a9; font-size: 13px; }
