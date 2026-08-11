@@ -148,6 +148,7 @@
     if (force || cueNeedsSeek(playbackCue, currentMs)) {
       sourceVideoElement.pause();
       cuePlaybackActive = false;
+      playerPlaying = false;
       sourceVideoElement.currentTime = playbackCue.start_ms / 1000;
     }
   }
