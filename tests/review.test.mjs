@@ -9,6 +9,8 @@ import {
   cueIndexAtTime,
   cueNeedsSeek,
   cuePlaybackEnded,
+  nextAutoAdvanceCueId,
+  nextCueId,
   finalApprovalAllowed,
   makeResult,
   paperDecisionIssue,
@@ -106,6 +108,13 @@ test("video time selects the current cue at each boundary", () => {
   assert.equal(cueIndexAtTime(cues, 999), 0);
   assert.equal(cueIndexAtTime(cues, 1000), 1);
   assert.equal(cueIndexAtTime(cues, 2500), 2);
+});
+
+test("next cue advances once and stops at the final cue", () => {
+  const cues = [{ id: "c0001" }, { id: "c0002" }];
+  assert.equal(nextCueId(cues, "c0001"), "c0002");
+  assert.equal(nextCueId(cues, "c0002"), "");
+  assert.equal(nextAutoAdvanceCueId(cues, "c0002", "c0001"), "");
 });
 
 test("new workflows expose only their own follow-up actions", () => {

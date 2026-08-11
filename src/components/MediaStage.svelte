@@ -1,6 +1,6 @@
 <script>
-  import { onMount } from "svelte";
-  import { cueIndexAtTime, cueNeedsSeek, cuePlaybackEnded, formatTime, markedParts } from "../lib/review.js";
+  import { onMount, tick } from "svelte";
+  import { cueIndexAtTime, cueNeedsSeek, cuePlaybackEnded, formatTime, markedParts, nextAutoAdvanceCueId } from "../lib/review.js";
 
   export let packageData;
   export let cue;
@@ -17,6 +17,7 @@
   let paperRangeKey = "";
   let cuePlaybackActive = false;
   let cuePlaybackEndMs = 0;
+  let autoAdvanceCueId = "";
   let playerFrame;
   let playerReady = false;
   let playerPlaying = false;
@@ -88,7 +89,13 @@
   }
 
   function pauseCueAudio() {
+    autoAdvanceCueId = "";
     cueAudio?.pause();
+  }
+
+  function pausePlayback() {
+    pausePlayer();
+    pauseCueAudio();
   }
 
   function setMode(mode) {
@@ -104,11 +111,25 @@
   function toggleCueAudio() {
     if (!cueAudio?.src) return;
     if (cueAudio.paused) {
+      autoAdvanceCueId = cue?.id || "";
       pausePlayer();
-      cueAudio.play();
+      cueAudio.play().catch(() => autoAdvanceCueId = "");
     } else {
+      autoAdvanceCueId = "";
       cueAudio.pause();
     }
+  }
+
+  async function handleCueAudioEnded() {
+    const nextId = nextAutoAdvanceCueId(packageData?.cues || [], cue?.id, autoAdvanceCueId);
+    autoAdvanceCueId = "";
+    if (!nextId) return;
+    onPlaybackCue(nextId);
+    await tick();
+    if (!cueAudio?.src || cue?.id !== nextId) return;
+    cueAudio.currentTime = 0;
+    autoAdvanceCueId = nextId;
+    cueAudio.play().catch(() => autoAdvanceCueId = "");
   }
 
   function toggleVideo() {
@@ -199,18 +220,20 @@
 
   function replayRisk() {
     if (!cueAudio?.src) return;
+    autoAdvanceCueId = "";
     cueAudio.currentTime = 0;
-    toggleCueAudio();
+    pausePlayer();
+    cueAudio.play().catch(() => {});
   }
 
   onMount(() => {
     window.addEventListener("message", handleMessage);
     window.addEventListener("framecue:toggle-playback", togglePlayback);
-    window.addEventListener("framecue:pause-playback", pausePlayer);
+    window.addEventListener("framecue:pause-playback", pausePlayback);
     return () => {
       window.removeEventListener("message", handleMessage);
       window.removeEventListener("framecue:toggle-playback", togglePlayback);
-      window.removeEventListener("framecue:pause-playback", pausePlayer);
+      window.removeEventListener("framecue:pause-playback", pausePlayback);
     };
   });
 </script>
@@ -378,6 +401,6 @@
     </div>
   </div>
   {#if cue?.audio}
-    <audio bind:this={cueAudio} src={assetUrl(cue.audio)} preload="metadata" on:play={pausePlayer}></audio>
+    <audio bind:this={cueAudio} src={assetUrl(cue.audio)} preload="metadata" on:play={pausePlayer} on:ended={handleCueAudioEnded}></audio>
   {/if}
 </section>

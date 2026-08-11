@@ -338,6 +338,15 @@ export function cueIndexAtTime(cues, milliseconds) {
   return found;
 }
 
+export function nextCueId(cues, cueId) {
+  const index = cues.findIndex((cue) => cue.id === cueId);
+  return index >= 0 ? cues[index + 1]?.id || "" : "";
+}
+
+export function nextAutoAdvanceCueId(cues, cueId, armedCueId) {
+  return cueId && cueId === armedCueId ? nextCueId(cues, cueId) : "";
+}
+
 export function cueNeedsSeek(cue, milliseconds, tolerance = 100) {
   return !cue || milliseconds < cue.start_ms - tolerance || milliseconds >= cue.end_ms + tolerance;
 }
