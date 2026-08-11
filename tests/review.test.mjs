@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -23,6 +24,11 @@ import {
 const packageData = {
   blocks: [{ id: "b0001", cue_ids: ["c0001", "c0002"] }]
 };
+
+test("captioned videos do not render the FrameCue subtitle overlay", () => {
+  const source = readFileSync(new URL("../src/components/MediaStage.svelte", import.meta.url), "utf8");
+  assert.match(source, /\{#if !sourceVideo\.captions\}\s*<div class="subtitle-overlay">/);
+});
 
 function approvedDraft() {
   return {

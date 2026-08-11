@@ -272,18 +272,20 @@
         >
           <track kind="captions" src={sourceVideo.captions ? assetUrl(sourceVideo.captions) : "data:text/vtt,WEBVTT%0A"} srclang="zh-Hant" label="FrameCue 中文字幕" default />
         </video>
-        <div class="subtitle-overlay">
-          {#if cue?.original_text}
-            <div class="subtitle source"><span>{cue.original_text}</span></div>
-          {/if}
-          <div class="subtitle target">
-            <span>
-              {#each markedParts(cueDraft?.text || "", cue?.risks || []) as part}
-                {#if part.risk}<mark>{part.text}</mark>{:else}{part.text}{/if}
-              {/each}
-            </span>
+        {#if !sourceVideo.captions}
+          <div class="subtitle-overlay">
+            {#if cue?.original_text}
+              <div class="subtitle source"><span>{cue.original_text}</span></div>
+            {/if}
+            <div class="subtitle target">
+              <span>
+                {#each markedParts(cueDraft?.text || "", cue?.risks || []) as part}
+                  {#if part.risk}<mark>{part.text}</mark>{:else}{part.text}{/if}
+                {/each}
+              </span>
+            </div>
           </div>
-        </div>
+        {/if}
       </div>
     {:else if stageMode === "video" && hyperframes}
       <div class="player-shell">
