@@ -465,6 +465,8 @@ def validate_package(package, package_dir=None, check_assets=True):
             src = as_text(source.get("src", ""), f"{label}.src")
             if check_assets:
                 asset_exists(package_dir, src, f"{label}.src")
+                if source.get("captions"):
+                    asset_exists(package_dir, source["captions"], f"{label}.captions")
 
     scene_ids = set()
     for index, scene in enumerate(scenes):
@@ -930,6 +932,9 @@ def materialize_assets(package, source_root, out_dir):
             bundled.pop("src", None)
             bundled["id"] = source_id
             bundled["src"] = copy_file(source, out_dir, Path("assets/paper-edit") / f"{source_id}{source.suffix or '.mp4'}")
+            if item.get("captions"):
+                captions = resolve_source_path(item["captions"], source_root, f"{label}.captions")
+                bundled["captions"] = copy_file(captions, out_dir, Path("assets/paper-edit") / f"{source_id}.vtt")
             output_sources.append(bundled)
         output["sources"] = output_sources
         package["media"]["paper_edit"] = output

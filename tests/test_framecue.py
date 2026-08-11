@@ -168,12 +168,13 @@ class FrameCueV2Tests(unittest.TestCase):
             )
         (source_root / "lesson-a.mp4").write_bytes(b"paper-edit-video-a")
         (source_root / "lesson-b.mp4").write_bytes(b"paper-edit-video-b")
+        (source_root / "lesson-a.vtt").write_text("WEBVTT\n\n00:00.000 --> 00:01.000\nBeat one\n", encoding="utf-8")
         source = {
             "review_id": "paper-edit-fixture",
             "revision": "r1",
             "workflow": {"kind": "paper_edit", "label": "Paper edit fixture"},
             "media": {"paper_edit": {"sources": [
-                {"id": "lesson-a", "label": "Lesson A", "source": "lesson-a.mp4"},
+                {"id": "lesson-a", "label": "Lesson A", "source": "lesson-a.mp4", "captions": "lesson-a.vtt"},
                 {"id": "lesson-b", "label": "Lesson B", "source": "lesson-b.mp4"},
             ]}},
             "scenes": [
@@ -216,6 +217,7 @@ class FrameCueV2Tests(unittest.TestCase):
         self.assertEqual(package["workflow"]["kind"], "paper_edit")
         self.assertEqual([source["id"] for source in package["media"]["paper_edit"]["sources"]], ["lesson-a", "lesson-b"])
         self.assertTrue((out_dir / package["media"]["paper_edit"]["sources"][0]["src"]).is_file())
+        self.assertTrue((out_dir / package["media"]["paper_edit"]["sources"][0]["captions"]).is_file())
         self.assertNotIn("source", package["media"]["paper_edit"]["sources"][0])
 
         result = framecue.default_result(package, approved=True)

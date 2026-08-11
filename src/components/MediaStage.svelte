@@ -270,7 +270,7 @@
           on:ended={() => { cuePlaybackActive = false; playerPlaying = false; }}
           on:timeupdate={handleSourceTimeUpdate}
         >
-          <track kind="captions" src={sourceVideo.captions ? assetUrl(sourceVideo.captions) : "data:text/vtt,WEBVTT%0A"} srclang="zh-Hant" label="FrameCue 中英字幕" />
+          <track kind="captions" src={sourceVideo.captions ? assetUrl(sourceVideo.captions) : "data:text/vtt,WEBVTT%0A"} srclang="zh-Hant" label="FrameCue 中文字幕" default />
         </video>
         <div class="subtitle-overlay">
           {#if cue?.original_text}
