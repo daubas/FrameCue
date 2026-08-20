@@ -1,5 +1,7 @@
 import json
+import hashlib
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -103,6 +105,170 @@ class WorkspaceHTTPTests(unittest.TestCase):
             "X-FrameCue-CSRF": snapshot["csrf_token"],
             "X-FrameCue-Session": session_id,
         }
+
+    def _agent_token(self, database, package, *permissions, label="agent"):
+        result = run_cli(
+            "agent-token-create",
+            "--database", str(database),
+            "--label", label,
+            "--workspace", package["review_id"],
+            *sum((["--permission", permission] for permission in permissions), []),
+        )
+        return json.loads(result.stdout)
+
+    def _pending_order_server(self, root):
+        database, package, server, thread = self._workspace_server(root)
+        summary = framecue.complete_workspace_round(database, package["review_id"], 0)
+        return database, package, summary, server, thread
+
+    def test_agent_token_cli_stores_only_hash_and_revocation_is_idempotent(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-token-") as temp:
+            database, package, server, thread = self._workspace_server(Path(temp))
+            try:
+                token = self._agent_token(database, package, "list", "read", "claim")
+                connection = sqlite3.connect(database)
+                connection.row_factory = sqlite3.Row
+                row = connection.execute("SELECT * FROM agent_tokens WHERE token_id = ?", (token["token_id"],)).fetchone()
+                work_orders_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_orders'"
+                ).fetchone()["sql"]
+                columns = {item["name"] for item in connection.execute("PRAGMA table_info(work_orders)")}
+                connection.close()
+                self.assertEqual(row["token_hash"], hashlib.sha256(token["token"].encode()).hexdigest())
+                self.assertNotIn(token["token"], json.dumps(dict(row)))
+                self.assertNotIn("UNIQUE(review_id, base_revision, base_checksum, operation)", work_orders_sql)
+                self.assertTrue({"lease_owner_token_id", "lease_expires_at", "attempt_count", "last_error_json"} <= columns)
+
+                for _ in range(2):
+                    revoked = run_cli(
+                        "agent-token-revoke", "--database", str(database), "--token-id", token["token_id"]
+                    )
+                    self.assertEqual(json.loads(revoked.stdout)["status"], "revoked")
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_agent_list_and_read_enforce_bearer_permission_scope_and_revocation(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-read-") as temp:
+            root = Path(temp)
+            database, package, summary, server, thread = self._pending_order_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                token = self._agent_token(database, package, "list", "read")
+                auth = {"Authorization": f"Bearer {token['token']}"}
+                _, _, listed = self._json_request(
+                    base, f"/api/agent/work-orders?workspace_id={package['review_id']}", headers=auth
+                )
+                self.assertEqual([row["request_id"] for row in listed["work_orders"]], [summary["request_id"]])
+                self.assertNotIn("token_hash", json.dumps(listed))
+                self.assertNotIn("document", listed["work_orders"][0])
+                self.assertNotIn("targets", listed["work_orders"][0])
+                _, _, read = self._json_request(base, f"/api/agent/work-orders/{summary['request_id']}", headers=auth)
+                self.assertEqual(read["request_id"], summary["request_id"])
+
+                for headers, code in [({}, 401), ({"Authorization": "Bearer wrong"}, 401)]:
+                    request = urllib.request.Request(
+                        f"{base}/api/agent/work-orders?workspace_id={package['review_id']}", headers=headers
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as failure:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(failure.exception.code, code)
+
+                claim_only = self._agent_token(database, package, "claim", label="claim-only")
+                request = urllib.request.Request(
+                    f"{base}/api/agent/work-orders?workspace_id={package['review_id']}",
+                    headers={"Authorization": f"Bearer {claim_only['token']}"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(failure.exception.code, 403)
+
+                outside = run_cli(
+                    "agent-token-create", "--database", str(database), "--label", "outside",
+                    "--workspace", "another-workspace", "--permission", "read",
+                )
+                outside_token = json.loads(outside.stdout)["token"]
+                request = urllib.request.Request(
+                    f"{base}/api/agent/work-orders/{summary['request_id']}",
+                    headers={"Authorization": f"Bearer {outside_token}"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(failure.exception.code, 403)
+
+                run_cli("agent-token-revoke", "--database", str(database), "--token-id", token["token_id"])
+                request = urllib.request.Request(
+                    f"{base}/api/agent/work-orders/{summary['request_id']}", headers=auth
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(failure.exception.code, 401)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_agent_claim_is_atomic_renewable_and_expired_claim_returns_to_pending(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-claim-") as temp:
+            root = Path(temp)
+            database, package, summary, server, thread = self._pending_order_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                first = self._agent_token(database, package, "claim", "read", label="first")
+                second = self._agent_token(database, package, "claim", "read", label="second")
+                third = self._agent_token(database, package, "claim", "read", label="third")
+
+                def claim(token):
+                    return self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/claim", method="POST",
+                        headers={"Authorization": f"Bearer {token['token']}"},
+                    )[2]
+
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:00:00+00:00"):
+                    claimed = claim(first)
+                self.assertEqual(claimed["status"], "processing")
+                self.assertEqual(claimed["attempt_count"], 1)
+                self.assertEqual(claimed["lease_expires_at"], "2026-08-20T00:05:00+00:00")
+                self.assertNotIn("document", claimed)
+
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:01:00+00:00"):
+                    renewed = claim(first)
+                self.assertEqual(renewed["attempt_count"], 1)
+                self.assertEqual(renewed["lease_expires_at"], "2026-08-20T00:06:00+00:00")
+
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:02:00+00:00"):
+                    request = urllib.request.Request(
+                        f"{base}/api/agent/work-orders/{summary['request_id']}/claim", data=b"", method="POST",
+                        headers={"Authorization": f"Bearer {second['token']}"},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as failure:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(failure.exception.code, 409)
+
+                run_cli(
+                    "agent-token-revoke", "--database", str(database), "--token-id", first["token_id"]
+                )
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:02:00+00:00"):
+                    reclaimed_after_revoke = claim(second)
+                self.assertEqual(reclaimed_after_revoke["attempt_count"], 2)
+                self.assertEqual(reclaimed_after_revoke["lease_owner_token_id"], second["token_id"])
+
+                pull = root / "processing.json"
+                with self.assertRaises(subprocess.CalledProcessError):
+                    run_cli(
+                        "work-pull", "--database", str(database), "--review-id", package["review_id"],
+                        "--out", str(pull),
+                    )
+
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:08:00+00:00"):
+                    reclaimed = claim(third)
+                self.assertEqual(reclaimed["attempt_count"], 3)
+                self.assertEqual(reclaimed["lease_owner_token_id"], third["token_id"])
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
 
     def test_workspace_v2_snapshot_operations_and_sse_only_publish_reload_versions(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-v2-http-") as temp:

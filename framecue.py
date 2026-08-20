@@ -21,7 +21,7 @@ import wave
 from http.cookies import CookieError, SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
@@ -75,6 +75,10 @@ def write_json(path, value):
 
 def utc_now():
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def agent_utc_now():
+    return utc_now()
 
 
 def canonical_json(value):
@@ -1304,8 +1308,7 @@ def open_workspace_database(database):
                 status TEXT NOT NULL,
                 request_json TEXT NOT NULL,
                 candidate_json TEXT,
-                created_at TEXT NOT NULL,
-                UNIQUE(review_id, base_revision, base_checksum, operation)
+                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS workspace_drafts (
                 review_id TEXT PRIMARY KEY REFERENCES workspaces(review_id),
@@ -1314,6 +1317,15 @@ def open_workspace_database(database):
                 issues_json TEXT NOT NULL,
                 direct_changes_json TEXT NOT NULL,
                 frozen_revision_id INTEGER REFERENCES revisions(revision_id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_tokens (
+                token_id TEXT PRIMARY KEY,
+                token_hash TEXT UNIQUE NOT NULL,
+                label TEXT NOT NULL,
+                workspace_ids_json TEXT NOT NULL,
+                permissions_json TEXT NOT NULL,
+                revoked_at TEXT,
+                created_at TEXT NOT NULL
             );
         """)
         work_orders_sql = connection.execute(
@@ -1336,11 +1348,28 @@ def open_workspace_database(database):
                     candidate_json TEXT,
                     created_at TEXT NOT NULL
                 );
-                INSERT INTO work_orders_without_base_unique SELECT * FROM work_orders;
+                INSERT INTO work_orders_without_base_unique
+                    (work_order_id, request_id, review_id, revision_id, base_revision, base_checksum,
+                     operation, status, request_json, candidate_json, created_at)
+                SELECT work_order_id, request_id, review_id, revision_id, base_revision, base_checksum,
+                       operation, status, request_json, candidate_json, created_at
+                FROM work_orders;
                 DROP TABLE work_orders;
                 ALTER TABLE work_orders_without_base_unique RENAME TO work_orders;
                 COMMIT;
             """)
+        work_order_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(work_orders)")
+        }
+        for name, declaration in (
+            ("lease_owner_token_id", "TEXT REFERENCES agent_tokens(token_id)"),
+            ("lease_expires_at", "TEXT"),
+            ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_error_json", "TEXT"),
+        ):
+            if name not in work_order_columns:
+                connection.execute(f"ALTER TABLE work_orders ADD COLUMN {name} {declaration}")
+        connection.commit()
         return connection
     except (OSError, sqlite3.Error) as error:
         if connection is not None:
@@ -2197,6 +2226,43 @@ class WorkspaceCollaboration:
         return ""
 
 
+def expire_agent_leases(connection, now):
+    connection.execute(
+        """UPDATE work_orders
+           SET status = 'pending', lease_owner_token_id = NULL, lease_expires_at = NULL
+           WHERE status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
+        (now,),
+    )
+
+
+def agent_work_order_value(row):
+    try:
+        value = json.loads(row["request_json"])
+    except json.JSONDecodeError as error:
+        raise FrameCueError(f"work order is invalid JSON: {row['request_id']}") from error
+    value.update({
+        "status": row["status"],
+        "lease_owner_token_id": row["lease_owner_token_id"],
+        "lease_expires_at": row["lease_expires_at"],
+        "attempt_count": row["attempt_count"],
+    })
+    return value
+
+
+def agent_work_order_metadata(row):
+    return {
+        "request_id": row["request_id"],
+        "workspace_id": row["review_id"],
+        "operation": row["operation"],
+        "base_revision": row["base_revision"],
+        "base_checksum": row["base_checksum"],
+        "status": row["status"],
+        "lease_owner_token_id": row["lease_owner_token_id"],
+        "lease_expires_at": row["lease_expires_at"],
+        "attempt_count": row["attempt_count"],
+    }
+
+
 def make_workspace_server(database, bundle_dir, port=0):
     directory = Path(bundle_dir).expanduser().resolve()
     package, _ = bundle_summary(directory / "review_package.json")
@@ -2285,6 +2351,172 @@ def make_workspace_server(database, bundle_dir, port=0):
             )
             token = self.headers.get("X-FrameCue-CSRF", "")
             return same_host and hmac.compare_digest(token, csrf_token)
+
+        def require_agent(self, permission):
+            match = re.fullmatch(r"Bearer\s+(\S+)", self.headers.get("Authorization", ""))
+            if match is None:
+                self.send_json(401, {"error": "agent bearer token is required"})
+                return None
+            token_hash = hashlib.sha256(match.group(1).encode("utf-8")).hexdigest()
+            connection = open_workspace_database(database)
+            try:
+                row = connection.execute(
+                    """SELECT token_id, label, workspace_ids_json, permissions_json, revoked_at
+                       FROM agent_tokens WHERE token_hash = ?""",
+                    (token_hash,),
+                ).fetchone()
+            finally:
+                connection.close()
+            if row is None or row["revoked_at"] is not None:
+                self.send_json(401, {"error": "agent bearer token is invalid"})
+                return None
+            try:
+                workspace_ids = json.loads(row["workspace_ids_json"])
+                permissions = json.loads(row["permissions_json"])
+            except json.JSONDecodeError:
+                self.send_json(401, {"error": "agent bearer token is invalid"})
+                return None
+            if (
+                not isinstance(workspace_ids, list)
+                or not all(isinstance(value, str) for value in workspace_ids)
+                or not isinstance(permissions, list)
+                or not all(isinstance(value, str) for value in permissions)
+            ):
+                self.send_json(401, {"error": "agent bearer token is invalid"})
+                return None
+            if permission not in permissions:
+                self.send_json(403, {"error": f"agent token lacks {permission} permission"})
+                return None
+            return {"token_id": row["token_id"], "label": row["label"], "workspace_ids": workspace_ids}
+
+        def agent_is_active(self, connection, identity):
+            row = connection.execute(
+                "SELECT revoked_at FROM agent_tokens WHERE token_id = ?", (identity["token_id"],)
+            ).fetchone()
+            return row is not None and row["revoked_at"] is None
+
+        def send_agent_list(self, identity, workspace_id):
+            if workspace_id not in identity["workspace_ids"]:
+                self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                return
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, agent_utc_now())
+                rows = connection.execute(
+                    """SELECT request_id, review_id, operation, base_revision, base_checksum,
+                              status, lease_owner_token_id, lease_expires_at, attempt_count
+                       FROM work_orders WHERE review_id = ? ORDER BY work_order_id""",
+                    (workspace_id,),
+                ).fetchall()
+                connection.commit()
+                values = [agent_work_order_metadata(row) for row in rows]
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, {"work_orders": values})
+
+        def send_agent_read(self, identity, request_id):
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, agent_utc_now())
+                row = connection.execute(
+                    """SELECT request_id, review_id, request_json, status, lease_owner_token_id,
+                              lease_expires_at, attempt_count
+                       FROM work_orders WHERE request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    self.send_json(404, {"error": "work order was not found"})
+                    return
+                if row["review_id"] not in identity["workspace_ids"]:
+                    connection.rollback()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                connection.commit()
+                value = agent_work_order_value(row)
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, value)
+
+        def send_agent_claim(self, identity, request_id):
+            now = agent_utc_now()
+            try:
+                lease_expires_at = (
+                    dt.datetime.fromisoformat(now) + dt.timedelta(seconds=300)
+                ).replace(microsecond=0).isoformat()
+            except ValueError:
+                self.send_json(500, {"error": "agent clock is invalid"})
+                return
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, now)
+                row = connection.execute(
+                    "SELECT request_id, review_id, status, lease_owner_token_id FROM work_orders WHERE request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    self.send_json(404, {"error": "work order was not found"})
+                    return
+                if row["review_id"] not in identity["workspace_ids"]:
+                    connection.rollback()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                if row["status"] == "pending":
+                    connection.execute(
+                        """UPDATE work_orders
+                           SET status = 'processing', lease_owner_token_id = ?, lease_expires_at = ?,
+                               attempt_count = attempt_count + 1
+                           WHERE request_id = ? AND status = 'pending'""",
+                        (identity["token_id"], lease_expires_at, request_id),
+                    )
+                elif row["status"] == "processing" and row["lease_owner_token_id"] == identity["token_id"]:
+                    connection.execute(
+                        "UPDATE work_orders SET lease_expires_at = ? WHERE request_id = ?",
+                        (lease_expires_at, request_id),
+                    )
+                else:
+                    connection.rollback()
+                    self.send_json(409, {"error": "work order is already claimed or unavailable"})
+                    return
+                claimed = connection.execute(
+                    """SELECT request_id, review_id, operation, base_revision, base_checksum,
+                              status, lease_owner_token_id, lease_expires_at, attempt_count
+                       FROM work_orders WHERE request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                connection.commit()
+                value = agent_work_order_metadata(claimed)
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, value)
 
         def require_session(self):
             session = collaboration.session(self.request_session_id())
@@ -2467,7 +2699,24 @@ def make_workspace_server(database, bundle_dir, port=0):
                 remaining -= len(chunk)
 
         def do_GET(self):
-            path = urlsplit(self.path).path
+            parsed_request = urlsplit(self.path)
+            path = parsed_request.path
+            if path == "/api/agent/work-orders":
+                identity = self.require_agent("list")
+                if identity is None:
+                    return
+                workspace_ids = parse_qs(parsed_request.query).get("workspace_id", [])
+                if len(workspace_ids) != 1 or not workspace_ids[0]:
+                    self.send_json(400, {"error": "workspace_id is required"})
+                    return
+                self.send_agent_list(identity, workspace_ids[0])
+                return
+            agent_read = re.fullmatch(r"/api/agent/work-orders/([^/]+)", path)
+            if agent_read:
+                identity = self.require_agent("read")
+                if identity is not None:
+                    self.send_agent_read(identity, unquote(agent_read.group(1)))
+                return
             if path == "/api/workspace/events":
                 self.send_workspace_event()
                 return
@@ -2507,6 +2756,12 @@ def make_workspace_server(database, bundle_dir, port=0):
 
         def do_POST(self):
             path = urlsplit(self.path).path
+            agent_claim = re.fullmatch(r"/api/agent/work-orders/([^/]+)/claim", path)
+            if agent_claim:
+                identity = self.require_agent("claim")
+                if identity is not None:
+                    self.send_agent_claim(identity, unquote(agent_claim.group(1)))
+                return
             if path not in {"/api/content-complete", "/api/workspace/operation", "/api/workspace/complete"}:
                 self.send_error(404)
                 return
@@ -2561,6 +2816,73 @@ def command_workspace_serve(args):
         pass
     finally:
         server.server_close()
+
+
+def command_agent_token_create(args):
+    label = args.label.strip()
+    workspace_ids = list(dict.fromkeys(value.strip() for value in args.workspace if value.strip()))
+    permissions = list(dict.fromkeys(args.permission))
+    if not label or any(not value.strip() for value in args.workspace):
+        raise FrameCueError("agent token label and Workspace IDs must be non-empty")
+    token_id = opaque_id("token")
+    token = secrets.token_urlsafe(32)
+    connection = open_workspace_database(args.database)
+    try:
+        connection.execute(
+            """INSERT INTO agent_tokens
+               (token_id, token_hash, label, workspace_ids_json, permissions_json, revoked_at, created_at)
+               VALUES (?, ?, ?, ?, ?, NULL, ?)""",
+            (
+                token_id,
+                hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                label,
+                canonical_json(workspace_ids),
+                canonical_json(permissions),
+                utc_now(),
+            ),
+        )
+        connection.commit()
+    except sqlite3.Error as error:
+        connection.rollback()
+        raise FrameCueError(f"workspace database error: {error}") from error
+    finally:
+        connection.close()
+    print(json.dumps({
+        "token_id": token_id,
+        "token": token,
+        "label": label,
+        "workspace_ids": workspace_ids,
+        "permissions": permissions,
+    }, ensure_ascii=False))
+
+
+def command_agent_token_revoke(args):
+    connection = open_workspace_database(args.database)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT revoked_at FROM agent_tokens WHERE token_id = ?", (args.token_id,)
+        ).fetchone()
+        if row is None:
+            raise FrameCueError(f"agent token not found: {args.token_id}")
+        revoked_at = row["revoked_at"] or utc_now()
+        connection.execute(
+            "UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL",
+            (revoked_at, args.token_id),
+        )
+        connection.execute(
+            """UPDATE work_orders
+               SET status = 'pending', lease_owner_token_id = NULL, lease_expires_at = NULL
+               WHERE status = 'processing' AND lease_owner_token_id = ?""",
+            (args.token_id,),
+        )
+        connection.commit()
+    except sqlite3.Error as error:
+        connection.rollback()
+        raise FrameCueError(f"workspace database error: {error}") from error
+    finally:
+        connection.close()
+    print(json.dumps({"token_id": args.token_id, "status": "revoked", "revoked_at": revoked_at}))
 
 
 def command_work_pull(args):
@@ -3444,6 +3766,21 @@ def parser():
     workspace_serve.add_argument("--dir", required=True)
     workspace_serve.add_argument("--port", type=int, default=3069)
     workspace_serve.set_defaults(func=command_workspace_serve)
+
+    agent_token_create = commands.add_parser("agent-token-create", help="create one scoped agent bearer token")
+    agent_token_create.add_argument("--database", required=True)
+    agent_token_create.add_argument("--label", required=True)
+    agent_token_create.add_argument("--workspace", action="append", required=True)
+    agent_token_create.add_argument(
+        "--permission", action="append", required=True,
+        choices=("list", "claim", "read", "submit", "fail", "retry"),
+    )
+    agent_token_create.set_defaults(func=command_agent_token_create)
+
+    agent_token_revoke = commands.add_parser("agent-token-revoke", help="revoke one agent bearer token")
+    agent_token_revoke.add_argument("--database", required=True)
+    agent_token_revoke.add_argument("--token-id", required=True)
+    agent_token_revoke.set_defaults(func=command_agent_token_revoke)
 
     work_pull = commands.add_parser("work-pull", help="write the workspace's pending work order")
     work_pull.add_argument("--database", required=True)

@@ -335,7 +335,12 @@ class CandidateV2Tests(unittest.TestCase):
                     created_at TEXT NOT NULL,
                     UNIQUE(review_id, base_revision, base_checksum, operation)
                 );
-                INSERT INTO work_orders SELECT * FROM current_work_orders;
+                INSERT INTO work_orders
+                    (work_order_id, request_id, review_id, revision_id, base_revision, base_checksum,
+                     operation, status, request_json, candidate_json, created_at)
+                SELECT work_order_id, request_id, review_id, revision_id, base_revision, base_checksum,
+                       operation, status, request_json, candidate_json, created_at
+                FROM current_work_orders;
                 DROP TABLE current_work_orders;
             """)
             connection.close()
