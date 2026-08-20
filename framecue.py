@@ -14,8 +14,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unicodedata
 import wave
+from http.cookies import CookieError, SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -1959,6 +1962,207 @@ def command_content_complete(args):
     print(json.dumps(complete_content_revision(args.database, args.review_id, result), ensure_ascii=False))
 
 
+def workspace_snapshot(database, review_id, csrf_token):
+    connection = open_workspace_database(database)
+    try:
+        workspace = workspace_row(connection, review_id)
+        draft = draft_row(connection, workspace)
+        connection.commit()
+    except sqlite3.Error as error:
+        connection.rollback()
+        raise FrameCueError(f"workspace database error: {error}") from error
+    finally:
+        connection.close()
+    return {
+        "schema": "framecue_workspace_snapshot_v2",
+        "workspace_id": review_id,
+        "stage": workspace["stage"],
+        "draft_version": draft["draft_version"],
+        "csrf_token": csrf_token,
+        "document": draft["document"],
+        "issues": draft["issues"],
+        "direct_edit_count": len(draft["direct_changes"]),
+    }
+
+
+class WorkspaceCollaboration:
+    SESSION_TTL_SECONDS = 20
+    LOCK_TTL_SECONDS = 15
+
+    def __init__(self):
+        self.condition = threading.Condition(threading.RLock())
+        self.sessions = {}
+        self.locks = {}
+        self.lead_session_id = None
+        self.version = 0
+
+    def _expire(self):
+        now = time.monotonic()
+        expired = [
+            session_id for session_id, session in self.sessions.items()
+            if session["last_seen"] + self.SESSION_TTL_SECONDS <= now
+        ]
+        for session_id in expired:
+            del self.sessions[session_id]
+        locks = {
+            cue_id: lock for cue_id, lock in self.locks.items()
+            if lock["session_id"] in self.sessions and lock["expires_at"] > now
+        }
+        changed = bool(expired) or locks != self.locks
+        self.locks = locks
+        return changed
+
+    def expire(self):
+        if self._expire():
+            self.changed()
+
+    def _display_name(self, requested, exclude_session_id=None):
+        name = requested.strip() if isinstance(requested, str) else ""
+        if not name:
+            name = "Reviewer"
+        if len(name) > 80 or any(char in name for char in "\r\n"):
+            raise FrameCueError("workspace display name is invalid")
+        taken = {
+            session["display_name"] for session_id, session in self.sessions.items()
+            if session_id != exclude_session_id
+        }
+        if name not in taken:
+            return name
+        suffix = 2
+        while f"{name} {suffix}" in taken:
+            suffix += 1
+        return f"{name} {suffix}"
+
+    def register_or_refresh(self, session_id, display_name):
+        self.expire()
+        session = self.sessions.get(session_id)
+        if session is not None:
+            session["last_seen"] = time.monotonic()
+            return session
+        session_id = secrets.token_urlsafe(24)
+        session = {
+            "session_id": session_id,
+            "display_name": self._display_name(display_name),
+            "dirty": False,
+            "selected_cue_id": "",
+            "last_seen": time.monotonic(),
+        }
+        self.sessions[session_id] = session
+        if self.lead_session_id not in self.sessions:
+            self.lead_session_id = session_id
+        self.changed()
+        return session
+
+    def session(self, session_id):
+        self.expire()
+        session = self.sessions.get(session_id)
+        if session is not None:
+            session["last_seen"] = time.monotonic()
+        return session
+
+    def changed(self):
+        self.version += 1
+        self.condition.notify_all()
+
+    def snapshot_fields(self, session_id):
+        self.expire()
+        session = self.sessions[session_id]
+        return {
+            "session_id": session_id,
+            "display_name": session["display_name"],
+            "lead_session_id": self.lead_session_id,
+            "lead_active": self.lead_session_id in self.sessions,
+            "participants": [{
+                "session_id": session["session_id"],
+                "display_name": session["display_name"],
+                "dirty": session["dirty"],
+                "selected_cue_id": session["selected_cue_id"],
+            } for session in self.sessions.values()],
+            "locks": [{
+                "cue_id": cue_id,
+                "session_id": lock["session_id"],
+            } for cue_id, lock in self.locks.items()],
+            "snapshot_version": self.version,
+        }
+
+    def set_presence(self, session, operation, cue_ids):
+        selected_cue_id = operation.get("selected_cue_id", session["selected_cue_id"])
+        if not isinstance(selected_cue_id, str) or (selected_cue_id and selected_cue_id not in cue_ids):
+            raise FrameCueError("workspace selected Cue is invalid")
+        display_name = operation.get("display_name", session["display_name"])
+        if not isinstance(display_name, str):
+            raise FrameCueError("workspace display name is invalid")
+        next_name = self._display_name(display_name, session["session_id"])
+        if session["selected_cue_id"] != selected_cue_id or session["display_name"] != next_name:
+            session["selected_cue_id"] = selected_cue_id
+            session["display_name"] = next_name
+            self.changed()
+
+    def set_dirty(self, session, dirty):
+        if type(dirty) is not bool:
+            raise FrameCueError("workspace dirty state is invalid")
+        if session["dirty"] != dirty:
+            session["dirty"] = dirty
+            self.changed()
+
+    def lock(self, session, cue_ids):
+        self.expire()
+        now = time.monotonic()
+        for cue_id in cue_ids:
+            lock = self.locks.get(cue_id)
+            if lock is not None and lock["session_id"] != session["session_id"]:
+                raise FrameCueError(f"workspace Cue is locked: {cue_id}")
+        for cue_id in cue_ids:
+            self.locks[cue_id] = {
+                "session_id": session["session_id"],
+                "expires_at": now + self.LOCK_TTL_SECONDS,
+            }
+        self.changed()
+
+    def unlock(self, session, cue_ids):
+        changed = False
+        for cue_id in cue_ids:
+            lock = self.locks.get(cue_id)
+            if lock is not None and lock["session_id"] != session["session_id"]:
+                raise FrameCueError(f"workspace Cue lock belongs to another session: {cue_id}")
+            if lock is not None and lock["session_id"] == session["session_id"]:
+                del self.locks[cue_id]
+                changed = True
+        if changed:
+            self.changed()
+
+    def assert_unlocked(self, session, cue_ids):
+        self.expire()
+        for cue_id in cue_ids:
+            lock = self.locks.get(cue_id)
+            if lock is not None and lock["session_id"] != session["session_id"]:
+                raise FrameCueError(f"workspace Cue is locked: {cue_id}")
+
+    def transfer_lead(self, session, expected_lead_session_id, new_lead_session_id):
+        self.expire()
+        if expected_lead_session_id != self.lead_session_id:
+            raise FrameCueError("workspace lead changed; reload the latest snapshot")
+        target_session_id = new_lead_session_id or session["session_id"]
+        if target_session_id not in self.sessions:
+            raise FrameCueError("workspace lead target is not connected")
+        current_lead = self.sessions.get(self.lead_session_id)
+        if current_lead is not None and session["session_id"] != self.lead_session_id:
+            raise FrameCueError("only the workspace lead can transfer this role")
+        if current_lead is None and target_session_id != session["session_id"]:
+            raise FrameCueError("a replacement lead must claim the role directly")
+        if self.lead_session_id != target_session_id:
+            self.lead_session_id = target_session_id
+            self.changed()
+
+    def completion_error(self):
+        self.expire()
+        if any(session["dirty"] for session in self.sessions.values()):
+            return "workspace completion is blocked by unsynchronized edits"
+        if self.locks:
+            return "workspace completion is blocked by active Cue locks"
+        return ""
+
+
 def make_workspace_server(database, bundle_dir, port=0):
     directory = Path(bundle_dir).expanduser().resolve()
     package, _ = bundle_summary(directory / "review_package.json")
@@ -1969,6 +2173,7 @@ def make_workspace_server(database, bundle_dir, port=0):
     finally:
         connection.close()
     csrf_token = secrets.token_urlsafe(32)
+    collaboration = WorkspaceCollaboration()
 
     class WorkspaceHandler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
@@ -1986,14 +2191,191 @@ def make_workspace_server(database, bundle_dir, port=0):
                     return str(candidate)
             return super().translate_path(path)
 
-        def send_json(self, status, value):
+        def send_json(self, status, value, headers=()):
             body = json.dumps(value, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for name, header_value in headers:
+                self.send_header(name, header_value)
             self.end_headers()
             self.wfile.write(body)
+
+        def request_session_id(self):
+            header = self.headers.get("X-FrameCue-Session", "").strip()
+            if header:
+                return header
+            try:
+                cookies = SimpleCookie(self.headers.get("Cookie", ""))
+                morsel = cookies.get("framecue_session")
+                return morsel.value if morsel is not None else ""
+            except CookieError:
+                return ""
+
+        def read_workspace_json(self):
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                self.send_error(415)
+                return None
+            try:
+                content_length = int(self.headers["Content-Length"])
+            except (KeyError, TypeError, ValueError):
+                self.send_error(411)
+                return None
+            if content_length < 0:
+                self.send_error(400)
+                return None
+            if content_length > 10 * 1024 * 1024:
+                self.send_error(413)
+                return None
+            try:
+                value = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.send_error(400)
+                return None
+            if not isinstance(value, dict):
+                self.send_error(400)
+                return None
+            return value
+
+        def has_valid_csrf(self):
+            origin = self.headers.get("Origin", "")
+            parsed_origin = urlsplit(origin)
+            same_host = (
+                parsed_origin.scheme in {"http", "https"}
+                and parsed_origin.netloc == self.headers.get("Host", "")
+                and not parsed_origin.path
+                and not parsed_origin.query
+                and not parsed_origin.fragment
+            )
+            token = self.headers.get("X-FrameCue-CSRF", "")
+            return same_host and hmac.compare_digest(token, csrf_token)
+
+        def require_session(self):
+            session = collaboration.session(self.request_session_id())
+            if session is None:
+                self.send_json(403, {"error": "workspace session is not registered"})
+            return session
+
+        def current_snapshot(self, session):
+            snapshot = workspace_snapshot(database, review_id, csrf_token)
+            snapshot.update(collaboration.snapshot_fields(session["session_id"]))
+            return snapshot
+
+        def has_workspace_draft(self):
+            connection = open_workspace_database(database)
+            try:
+                return connection.execute(
+                    "SELECT 1 FROM workspace_drafts WHERE review_id = ?",
+                    (review_id,),
+                ).fetchone() is not None
+            finally:
+                connection.close()
+
+        def required_draft_version(self, operation, snapshot):
+            draft_version = operation.get("draft_version")
+            if type(draft_version) is not int or draft_version < 0:
+                raise FrameCueError("workspace draft version is invalid")
+            if draft_version != snapshot["draft_version"]:
+                raise FrameCueError(
+                    f"workspace draft version is stale: expected {snapshot['draft_version']}, got {draft_version}"
+                )
+
+        def operation_cue_ids(self, operation):
+            kind = operation.get("kind")
+            if kind in {"edit", "split"}:
+                values = [operation.get("cue_id")]
+            elif kind == "merge":
+                values = [operation.get("cue_id"), operation.get("adjacent_cue_id")]
+            elif kind == "flag":
+                values = operation.get("cue_ids")
+                if values is None:
+                    values = [operation.get("cue_id")]
+            else:
+                values = []
+            return [value for value in values if isinstance(value, str)] if isinstance(values, list) else []
+
+        def requested_cue_ids(self, operation, document):
+            cue_ids = operation.get("cue_ids")
+            if (
+                not isinstance(cue_ids, list)
+                or not cue_ids
+                or not all(isinstance(cue_id, str) and cue_id for cue_id in cue_ids)
+                or len(set(cue_ids)) != len(cue_ids)
+            ):
+                raise FrameCueError("workspace Cue IDs are invalid")
+            known_cue_ids = {cue["id"] for cue in document["cues"]}
+            if not set(cue_ids).issubset(known_cue_ids):
+                raise FrameCueError("workspace Cue was not found")
+            return cue_ids
+
+        def apply_workspace_operation(self, session, operation):
+            snapshot = self.current_snapshot(session)
+            kind = operation.get("kind")
+            if kind == "presence":
+                self.set_presence(session, operation, snapshot)
+                return self.current_snapshot(session)
+            if kind == "dirty":
+                collaboration.set_dirty(session, operation.get("dirty"))
+                return self.current_snapshot(session)
+            if kind in {"lock", "unlock"}:
+                self.required_draft_version(operation, snapshot)
+                cue_ids = self.requested_cue_ids(operation, snapshot["document"])
+                if kind == "lock":
+                    collaboration.lock(session, cue_ids)
+                else:
+                    collaboration.unlock(session, cue_ids)
+                return self.current_snapshot(session)
+            if kind == "lead":
+                self.required_draft_version(operation, snapshot)
+                expected_lead_session_id = operation.get("expected_lead_session_id")
+                new_lead_session_id = operation.get("new_lead_session_id", "")
+                if not isinstance(expected_lead_session_id, str) or not isinstance(new_lead_session_id, str):
+                    raise FrameCueError("workspace lead operation is invalid")
+                collaboration.transfer_lead(session, expected_lead_session_id, new_lead_session_id)
+                return self.current_snapshot(session)
+            affected_cue_ids = self.operation_cue_ids(operation)
+            collaboration.assert_unlocked(session, affected_cue_ids)
+            apply_draft_operation(database, review_id, operation)
+            collaboration.unlock(session, affected_cue_ids)
+            collaboration.changed()
+            return self.current_snapshot(session)
+
+        def set_presence(self, session, operation, snapshot):
+            cue_ids = {cue["id"] for cue in snapshot["document"]["cues"]}
+            collaboration.set_presence(session, operation, cue_ids)
+
+        def send_workspace_event(self):
+            with collaboration.condition:
+                session = self.require_session()
+                if session is None:
+                    return
+                try:
+                    last_version = int(self.headers.get("Last-Event-ID", "-1"))
+                except ValueError:
+                    last_version = -1
+                collaboration.expire()
+                if collaboration.version <= last_version:
+                    collaboration.condition.wait(timeout=15)
+                    collaboration.expire()
+                version = collaboration.version
+            if version <= last_version:
+                body = b": keepalive\n\n"
+            else:
+                body = (
+                    f"retry: 1000\nid: {version}\nevent: snapshot\n"
+                    f"data: {json.dumps({'version': version})}\n\n"
+                ).encode("utf-8")
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def send_unsatisfiable_range(self, size):
             self.send_response(416)
@@ -2051,7 +2433,28 @@ def make_workspace_server(database, bundle_dir, port=0):
                 remaining -= len(chunk)
 
         def do_GET(self):
-            if self.path != "/api/workspace":
+            path = urlsplit(self.path).path
+            if path == "/api/workspace/events":
+                self.send_workspace_event()
+                return
+            if path == "/api/workspace/snapshot":
+                with collaboration.condition:
+                    try:
+                        session = collaboration.register_or_refresh(
+                            self.request_session_id(),
+                            self.headers.get("X-FrameCue-Display-Name", ""),
+                        )
+                        snapshot = self.current_snapshot(session)
+                    except FrameCueError as error:
+                        self.send_json(409, {"error": str(error)})
+                        return
+                self.send_json(
+                    200,
+                    snapshot,
+                    (("Set-Cookie", f"framecue_session={session['session_id']}; Path=/; HttpOnly; SameSite=Strict"),),
+                )
+                return
+            if path != "/api/workspace":
                 return super().do_GET()
             connection = open_workspace_database(database)
             try:
@@ -2069,47 +2472,47 @@ def make_workspace_server(database, bundle_dir, port=0):
             })
 
         def do_POST(self):
-            if self.path != "/api/content-complete":
+            path = urlsplit(self.path).path
+            if path not in {"/api/content-complete", "/api/workspace/operation", "/api/workspace/complete"}:
                 self.send_error(404)
                 return
-            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            if content_type != "application/json":
-                self.send_error(415)
+            value = self.read_workspace_json()
+            if value is None:
                 return
-            try:
-                content_length = int(self.headers["Content-Length"])
-            except (KeyError, TypeError, ValueError):
-                self.send_error(411)
-                return
-            if content_length < 0:
-                self.send_error(400)
-                return
-            if content_length > 10 * 1024 * 1024:
-                self.send_error(413)
-                return
-            origin = self.headers.get("Origin", "")
-            parsed_origin = urlsplit(origin)
-            same_host = (
-                parsed_origin.scheme in {"http", "https"}
-                and parsed_origin.netloc == self.headers.get("Host", "")
-                and not parsed_origin.path
-                and not parsed_origin.query
-                and not parsed_origin.fragment
-            )
-            token = self.headers.get("X-FrameCue-CSRF", "")
-            if not same_host or not hmac.compare_digest(token, csrf_token):
+            if not self.has_valid_csrf():
                 self.send_error(403)
                 return
-            try:
-                result = json.loads(self.rfile.read(content_length).decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self.send_error(400)
+            if path == "/api/content-complete":
+                if self.has_workspace_draft():
+                    self.send_json(409, {"error": "active Subtitle Workspace must use /api/workspace/complete"})
+                    return
+                try:
+                    summary = complete_content_revision(database, review_id, value)
+                except FrameCueError as error:
+                    self.send_json(409, {"error": str(error)})
+                    return
+                self.send_json(200, summary)
                 return
-            try:
-                summary = complete_content_revision(database, review_id, result)
-            except FrameCueError as error:
-                self.send_json(409, {"error": str(error)})
-                return
+            with collaboration.condition:
+                session = self.require_session()
+                if session is None:
+                    return
+                try:
+                    if path == "/api/workspace/operation":
+                        self.send_json(200, self.apply_workspace_operation(session, value))
+                        return
+                    if collaboration.lead_session_id != session["session_id"]:
+                        self.send_json(403, {"error": "only the workspace lead can complete this round"})
+                        return
+                    completion_error = collaboration.completion_error()
+                    if completion_error:
+                        self.send_json(409, {"error": completion_error})
+                        return
+                    summary = complete_workspace_round(database, review_id, value.get("draft_version"))
+                    collaboration.changed()
+                except FrameCueError as error:
+                    self.send_json(409, {"error": str(error)})
+                    return
             self.send_json(200, summary)
 
     server = ThreadingHTTPServer(("127.0.0.1", port), WorkspaceHandler)
