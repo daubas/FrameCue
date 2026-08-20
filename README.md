@@ -74,6 +74,43 @@ python3 framecue.py collect \
 `collect` rejects a stale checksum, wrong revision, incomplete snapshot, or
 unapproved result.
 
+## Subtitle Workspace (Development Milestone)
+
+The local Subtitle Workspace extends the immutable v2 contract with a SQLite
+draft and same-machine HTTP service. The static bundle workflow above remains
+the released default.
+
+The implemented content-review milestone supports:
+
+- a complete Subtitle Document v2 draft with versioned edit, split, merge, and
+  needs-modification operations;
+- reverse approval: unmarked content is approved when the lead completes the
+  round;
+- immutable Content Revisions and checksum-bound content-correction Work
+  Orders;
+- Content Candidate v2 validation and independent accept/reject decisions;
+- browser sessions, presence, lead transfer, Cue locks, dirty-state completion
+  gates, autosave, and server-sent change notifications;
+- scoped agent bearer tokens and Work Order list/read/claim/submit/fail/retry.
+
+Import and serve one development Workspace:
+
+```bash
+python3 framecue.py workspace-import \
+  --database workspace.sqlite3 \
+  --package review-r1/review_package.json \
+  --timing-profile synchronous_dub
+
+python3 framecue.py workspace-serve \
+  --database workspace.sqlite3 \
+  --dir review-r1 \
+  --port 3069
+```
+
+This milestone is not production-ready. Real TTS and alignment execution,
+Voice Candidate v2, audiovisual review, portable Workspace export/import, and
+production cutover remain pending.
+
 ## Contract
 
 `framecue_package_v2` is immutable and records:

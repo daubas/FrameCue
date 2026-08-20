@@ -1,6 +1,6 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: v2 static runtime complete at `v2.6.0`; subtitle Workspace refactor in progress
+Status: v2 static runtime complete at `v2.6.0`; Subtitle Workspace content-review milestone implemented, acceptance pending
 Last updated: 2026-08-20
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
@@ -9,7 +9,11 @@ Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md
 
 This is the canonical implementation note for the FrameCue v2 refactor. It records the agreed product boundary, contracts, rollout order, validation gates, and implementation feedback. Update this document as implementation or user feedback changes the plan.
 
-FrameCue v2 has one job: provide a portable, static human-review gate for media-aligned content. Subtitle generation, translation, speech synthesis, and rendering stay outside FrameCue.
+The released FrameCue v2 runtime has one job: provide a portable, static
+human-review gate for media-aligned content. The Subtitle Workspace extension
+adds local revision, collaboration, and agent handoff state without moving
+subtitle generation, translation, speech synthesis, or rendering into
+FrameCue.
 
 ## 2026-08-20 — Subtitle Workspace extension
 
@@ -19,13 +23,26 @@ the reviewer no longer has to download a result before the agent continues.
 FrameCue still does not run TTS: it owns revisions and Work Orders; AgenticDub
 returns a checksum-bound Candidate with audio/alignment/timing evidence.
 
-The first implemented slice imports Peter r2 without modifying its bundle,
-serves the current viewer with Range 206 media, stores an approved Content
-Revision and pending Work Order in one idempotent transaction, and accepts only
-Candidates that preserve approved content and carry SHA-256-verified evidence.
-AgenticDub currently supports validation and dry-run planning only; formal TTS,
-audiovisual exception review, scoped reruns, portable Work Order bundles, and
-final acceptance remain pending. The current contract and rollout order live in
+The implemented milestone now provides:
+
+- a SQLite-backed complete Subtitle Document v2 draft with compare-and-swap
+  edit, split, same-Block merge, and needs-modification operations;
+- reverse approval that creates an immutable Content Revision directly for a
+  clean round, or one frozen content-correction Work Order for edited and
+  flagged ranges;
+- fail-closed Content Candidate v2 validation, proposal-level accept/reject,
+  stale-checksum protection, and recomposition from the frozen base document;
+- a separate Subtitle Workspace UI with sessions, presence, lead-only round
+  completion, Cue locks, dirty-state gates, autosave, and server-authoritative
+  reload notifications;
+- scoped agent bearer tokens and leased Work Order
+  list/read/claim/submit/fail/retry operations. Only token hashes are stored.
+
+AgenticDub currently validates Work Order v2 and produces a dry-run realization
+plan. Real TTS/alignment/render execution, Voice Candidate v2, audiovisual
+exception review, portable Workspace export/import and recovery, and final UAT
+remain pending. No production workflow has cut over to this Workspace. The
+current contract and rollout order live in
 [`subtitle-workspace-agenticdub-refactor-plan.md`](subtitle-workspace-agenticdub-refactor-plan.md).
 
 ## Success Criteria
@@ -58,7 +75,7 @@ Observed review data supports a deliberately small action model. In a 487-cue ed
 
 | Owner | Responsibilities |
 |---|---|
-| FrameCue | Versioned package/result schemas, static viewer, immutable review revisions, draft autosave, media review, approval, export, validation, and migration tooling |
+| FrameCue | Versioned package/result schemas, static viewer, immutable review revisions, Workspace draft/collaboration state, Work Orders and Candidate decisions, media review, approval, export, validation, and migration tooling |
 | AgenticDub | STT, translation, glossary, punctuation policy, cue split/merge, semantic blocks, `speech_text`, pronunciation-risk generation, TTS, TTS/STT audit, and applying approved results |
 | Global FrameCue skill | Invoke the pinned FrameCue CLI to build, serve, validate, and collect packages; record implementation feedback |
 | HyperFrames project | Composition, project media, narration audio, and project-specific player configuration |
@@ -71,7 +88,9 @@ FrameCue never calls an LLM, STT service, TTS service, or renderer. It records r
 
 - The FrameCue repository is the only editable source for the viewer, schemas, and generic HyperFrames adapter.
 - v2 uses Svelte with Vite and emits portable static files.
-- v2 does not use SvelteKit, a router, a state library, a UI kit, a backend, accounts, or a database.
+- The static v2 runtime does not use SvelteKit, a router, a state library, a UI
+  kit, a backend, accounts, or a database. Subtitle Workspace is a separate
+  local SQLite/HTTP extension and does not change portable bundle behavior.
 - The global skill and downstream projects pin a Git tag. They do not follow `main`.
 - The package records the viewer version used to build it.
 
@@ -279,7 +298,8 @@ Each implementation phase must leave the smallest runnable check that proves its
 ## Non-goals
 
 - Subtitle generation, translation, cue timing, TTS, STT audit, or video rendering.
-- Collaborative accounts, remote persistence, comments, or a review backend.
+- Hosted accounts, remote multi-tenant persistence, or comments. Subtitle
+  Workspace collaboration uses short-lived local sessions and SQLite state.
 - A general nonlinear editor or timeline editor.
 - Supporting arbitrary plugin-defined workflows in v2.
 - Automatic v1 compatibility inside the v2 viewer.

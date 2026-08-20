@@ -1,8 +1,33 @@
 # FrameCue Subtitle Workspace × AgenticDub 重構規格
 
-Status: product decisions approved; cross-model findings incorporated; implementation not authorized
+Status: implementation active; content-review, collaboration, and agent Work Order milestone complete; acceptance build pending
 Last updated: 2026-08-20
 Owners: FrameCue Workspace / AgenticDub realization flow
+
+## 0. Implementation checkpoint — 2026-08-20
+
+The detailed sections below remain the target contract. The current branch has
+implemented the content-review and agent handoff foundation:
+
+- SQLite Workspace import with a complete Subtitle Document v2 draft and
+  compare-and-swap edit, split, same-Block merge, and needs-modification
+  operations;
+- reverse approval with lead-only completion, immutable Content Revisions, and
+  frozen content-correction or voice-realization Work Orders;
+- Content Candidate v2 validation, proposal dependencies, independent
+  accept/reject decisions, stale guards, and authoritative recomposition from
+  the frozen base document;
+- a dedicated Subtitle Workspace UI with session presence, lead transfer, Cue
+  locks, immediate dirty reporting, autosave, completion gates, and
+  server-authoritative event reloads;
+- scoped agent tokens plus leased Work Order list/read/claim/submit/fail/retry.
+
+The acceptance build is incomplete. AgenticDub has a Work Order v2 validator
+and dry-run planner, but real TTS, word alignment, timing fit, render, and
+Candidate media generation are not connected. Voice Candidate v2,
+audiovisual review and correction, portable Workspace export/import and
+recovery, and the final browser/UAT matrix remain to be implemented. Existing
+production workflows have not cut over.
 
 ## 1. Outcome
 
