@@ -31,6 +31,9 @@ MANIFEST_SCHEMA = "framecue_manifest_v2"
 SUBTITLE_DOCUMENT_SCHEMA = "framecue_subtitle_document_v1"
 WORK_ORDER_SCHEMA = "framecue_work_order_v1"
 CANDIDATE_REVISION_SCHEMA = "framecue_candidate_revision_v1"
+SUBTITLE_DOCUMENT_V2_SCHEMA = "framecue_subtitle_document_v2"
+WORK_ORDER_V2_SCHEMA = "framecue_work_order_v2"
+CANDIDATE_REVISION_V2_SCHEMA = "framecue_candidate_revision_v2"
 TIMING_PROFILES = {"synchronous_dub", "interpreter_lag"}
 WORKFLOW_ACTIONS = {
     "subtitle": {"use_edit", "rewrite", "resegment", "retime"},
@@ -905,6 +908,361 @@ def subtitle_document(package, timing_profile, result=None):
     return document
 
 
+def opaque_id(prefix):
+    return f"{prefix}-{secrets.token_hex(12)}"
+
+
+def workspace_draft_document(package, timing_profile):
+    if timing_profile not in TIMING_PROFILES:
+        raise FrameCueError("timing_profile is invalid")
+    block_by_cue = {}
+    for block in package["blocks"]:
+        for cue_id in block["cue_ids"]:
+            block_by_cue[cue_id] = block["id"]
+    document = {
+        "schema": SUBTITLE_DOCUMENT_V2_SCHEMA,
+        "workspace_id": package["review_id"],
+        "revision": package["revision"],
+        "revision_kind": "draft",
+        "source_checksum": package["content_checksum"],
+        "timing_profile": timing_profile,
+        "cues": [{
+            "id": cue["id"],
+            "source_start_ms": cue["start_ms"],
+            "source_end_ms": cue["end_ms"],
+            "output_start_ms": None,
+            "output_end_ms": None,
+            "timing_state": "unrealized",
+            "source_text": cue.get("original_text", ""),
+            "display_text": cue["text"],
+            "speech_text": cue["speech_text"],
+            "speech_linked": content_key(cue["speech_text"]) == content_key(cue["text"]),
+            "block_id": block_by_cue.get(cue["id"], ""),
+            "origin_cue_ids": [cue["id"]],
+            "lineage": {"operation": "import", "parent_cue_ids": []},
+        } for cue in package["cues"]],
+        "blocks": copy.deepcopy(package["blocks"]),
+        "assets": workspace_assets(package),
+        "source_package": copy.deepcopy(package),
+    }
+    document["checksum"] = document_checksum(document)
+    return document
+
+
+def refresh_document_checksum(document):
+    document["checksum"] = document_checksum(document)
+
+
+def recompute_draft_blocks(document):
+    cues = document.get("cues")
+    blocks = document.get("blocks")
+    if not isinstance(cues, list) or not isinstance(blocks, list):
+        raise FrameCueError("workspace draft document is incomplete")
+    cue_by_id = {cue.get("id"): cue for cue in cues if isinstance(cue, dict)}
+    if len(cue_by_id) != len(cues):
+        raise FrameCueError("workspace draft cues are invalid")
+    for block in blocks:
+        if not isinstance(block, dict) or not isinstance(block.get("cue_ids"), list):
+            raise FrameCueError("workspace draft blocks are invalid")
+        try:
+            block_cues = [cue_by_id[cue_id] for cue_id in block["cue_ids"]]
+        except KeyError as error:
+            raise FrameCueError(f"workspace draft block references an unknown cue: {error.args[0]}") from error
+        block["target_text"] = " ".join(cue["display_text"] for cue in block_cues)
+        block["speech_text"] = " ".join(cue["speech_text"] for cue in block_cues)
+
+
+def draft_row(connection, workspace):
+    row = connection.execute(
+        """SELECT draft_version, document_json, issues_json, direct_changes_json
+           FROM workspace_drafts WHERE review_id = ?""",
+        (workspace["review_id"],),
+    ).fetchone()
+    if row is None:
+        source_document, package = workspace_source_package(connection, workspace)
+        document = workspace_draft_document(package, source_document.get("timing_profile"))
+        connection.execute(
+            """INSERT INTO workspace_drafts
+               (review_id, draft_version, document_json, issues_json, direct_changes_json, frozen_revision_id)
+               VALUES (?, 0, ?, '[]', '[]', NULL)""",
+            (workspace["review_id"], canonical_json(document)),
+        )
+        return {
+            "draft_version": 0,
+            "document": document,
+            "issues": [],
+            "direct_changes": [],
+        }
+    try:
+        document = json.loads(row["document_json"])
+        issues = json.loads(row["issues_json"])
+        direct_changes = json.loads(row["direct_changes_json"])
+    except json.JSONDecodeError as error:
+        raise FrameCueError(f"workspace draft is invalid JSON: {workspace['review_id']}") from error
+    if (
+        type(row["draft_version"]) is not int
+        or not isinstance(document, dict)
+        or document.get("schema") != SUBTITLE_DOCUMENT_V2_SCHEMA
+        or not isinstance(issues, list)
+        or not isinstance(direct_changes, list)
+    ):
+        raise FrameCueError(f"workspace draft is invalid: {workspace['review_id']}")
+    return {
+        "draft_version": row["draft_version"],
+        "document": document,
+        "issues": issues,
+        "direct_changes": direct_changes,
+    }
+
+
+def apply_draft_edit(document, operation):
+    cue_id = ensure_id(operation.get("cue_id", ""), "draft edit cue_id")
+    display_text = as_text(operation.get("display_text"), "draft edit display_text")
+    cue = next((row for row in document["cues"] if row.get("id") == cue_id), None)
+    if cue is None:
+        raise FrameCueError(f"workspace draft cue not found: {cue_id}")
+    cue["display_text"] = display_text
+    if cue.get("speech_linked"):
+        cue["speech_text"] = display_text
+    recompute_draft_blocks(document)
+    refresh_document_checksum(document)
+    return {"kind": "edit", "cue_ids": [cue_id]}
+
+
+def split_draft_text(text, cursor, label):
+    if type(cursor) is not int or cursor <= 0 or cursor >= len(text):
+        raise FrameCueError(f"draft split cursor is invalid for {label}")
+    left = text[:cursor].strip()
+    right = text[cursor:].strip()
+    if not left or not right:
+        raise FrameCueError(f"draft split cursor creates an empty Cue: {label}")
+    return left, right
+
+
+def apply_draft_split(document, operation):
+    cue_id = ensure_id(operation.get("cue_id", ""), "draft split cue_id")
+    cue_index = next((index for index, row in enumerate(document["cues"]) if row.get("id") == cue_id), None)
+    if cue_index is None:
+        raise FrameCueError(f"workspace draft cue not found: {cue_id}")
+    cue = document["cues"][cue_index]
+    display_text = as_text(cue.get("display_text"), f"workspace draft cue display_text: {cue_id}")
+    cursor = operation.get("cursor")
+    if operation.get("word_timestamps") is not None:
+        raise FrameCueError("draft split trusted word timestamps are not implemented")
+    left_display, right_display = split_draft_text(display_text, cursor, cue_id)
+    if cue.get("speech_linked"):
+        left_speech, right_speech = left_display, right_display
+    else:
+        speech_text = as_text(cue.get("speech_text"), f"workspace draft cue speech_text: {cue_id}")
+        speech_cursor = min(len(speech_text) - 1, max(1, round(len(speech_text) * cursor / len(display_text))))
+        left_speech, right_speech = split_draft_text(speech_text, speech_cursor, cue_id)
+    start = as_ms(cue.get("source_start_ms"), f"workspace draft cue source_start_ms: {cue_id}")
+    end = as_ms(cue.get("source_end_ms"), f"workspace draft cue source_end_ms: {cue_id}")
+    if end - start < 2:
+        raise FrameCueError(f"workspace draft cue is too short to split: {cue_id}")
+    split_at = start + round((end - start) * cursor / len(display_text))
+    split_at = min(end - 1, max(start + 1, split_at))
+    origins = cue.get("origin_cue_ids")
+    if not isinstance(origins, list) or not all(isinstance(value, str) for value in origins):
+        origins = [cue_id]
+
+    def child(cue_id, source_start, source_end, display, speech):
+        value = copy.deepcopy(cue)
+        value.update({
+            "id": cue_id,
+            "source_start_ms": source_start,
+            "source_end_ms": source_end,
+            "output_start_ms": None,
+            "output_end_ms": None,
+            "timing_state": "provisional",
+            "display_text": display,
+            "speech_text": speech,
+            "origin_cue_ids": origins,
+            "lineage": {"operation": "split", "parent_cue_ids": [cue["id"]]},
+        })
+        return value
+
+    left = child(opaque_id("cue"), start, split_at, left_display, left_speech)
+    right = child(opaque_id("cue"), split_at, end, right_display, right_speech)
+    block = next((row for row in document["blocks"] if row.get("id") == cue.get("block_id")), None)
+    if block is None or cue_id not in block.get("cue_ids", []):
+        raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
+    block_index = block["cue_ids"].index(cue_id)
+    document["cues"][cue_index:cue_index + 1] = [left, right]
+    block["cue_ids"][block_index:block_index + 1] = [left["id"], right["id"]]
+    recompute_draft_blocks(document)
+    refresh_document_checksum(document)
+    return {"kind": "split", "cue_ids": [left["id"], right["id"]]}
+
+
+def apply_draft_merge(document, operation):
+    cue_id = ensure_id(operation.get("cue_id", ""), "draft merge cue_id")
+    adjacent_cue_id = ensure_id(operation.get("adjacent_cue_id", ""), "draft merge adjacent_cue_id")
+    if cue_id == adjacent_cue_id:
+        raise FrameCueError("draft merge requires two different Cues")
+    cue_by_id = {cue.get("id"): cue for cue in document["cues"] if isinstance(cue, dict)}
+    if cue_id not in cue_by_id or adjacent_cue_id not in cue_by_id:
+        raise FrameCueError("workspace draft merge Cue was not found")
+    first = cue_by_id[cue_id]
+    second = cue_by_id[adjacent_cue_id]
+    if first.get("block_id") != second.get("block_id"):
+        raise FrameCueError("draft merge Cues must share one Semantic Block")
+    block = next((row for row in document["blocks"] if row.get("id") == first.get("block_id")), None)
+    if block is None or not isinstance(block.get("cue_ids"), list):
+        raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
+    first_index = block["cue_ids"].index(cue_id) if cue_id in block["cue_ids"] else -1
+    second_index = block["cue_ids"].index(adjacent_cue_id) if adjacent_cue_id in block["cue_ids"] else -1
+    if first_index < 0 or second_index < 0 or abs(first_index - second_index) != 1:
+        raise FrameCueError("draft merge Cues must be adjacent in their Semantic Block")
+    left_id, right_id = (cue_id, adjacent_cue_id) if first_index < second_index else (adjacent_cue_id, cue_id)
+    left = cue_by_id[left_id]
+    right = cue_by_id[right_id]
+    origins = []
+    for cue in (left, right):
+        for origin in cue.get("origin_cue_ids", [cue["id"]]):
+            if origin not in origins:
+                origins.append(origin)
+    output_start = left.get("output_start_ms")
+    output_end = right.get("output_end_ms")
+    if type(output_start) is not int or type(output_end) is not int:
+        output_start = None
+        output_end = None
+    merged = {
+        "id": opaque_id("cue"),
+        "source_start_ms": min(left["source_start_ms"], right["source_start_ms"]),
+        "source_end_ms": max(left["source_end_ms"], right["source_end_ms"]),
+        "output_start_ms": output_start,
+        "output_end_ms": output_end,
+        "timing_state": "provisional" if "provisional" in {left.get("timing_state"), right.get("timing_state")} else "unrealized",
+        "source_text": " ".join(value for value in (left.get("source_text", ""), right.get("source_text", "")) if value),
+        "display_text": " ".join((left["display_text"], right["display_text"])),
+        "speech_text": " ".join((left["speech_text"], right["speech_text"])),
+        "speech_linked": bool(left.get("speech_linked")) and bool(right.get("speech_linked")),
+        "block_id": block["id"],
+        "origin_cue_ids": origins,
+        "lineage": {"operation": "merge", "parent_cue_ids": [left_id, right_id]},
+    }
+    cue_indexes = [index for index, cue in enumerate(document["cues"]) if cue.get("id") in {left_id, right_id}]
+    insert_at = min(cue_indexes)
+    document["cues"] = [cue for cue in document["cues"] if cue.get("id") not in {left_id, right_id}]
+    document["cues"].insert(insert_at, merged)
+    block_index = min(first_index, second_index)
+    block["cue_ids"][block_index:block_index + 2] = [merged["id"]]
+    recompute_draft_blocks(document)
+    refresh_document_checksum(document)
+    return {"kind": "merge", "cue_ids": [merged["id"]]}
+
+
+def apply_draft_flag(document, issues, operation):
+    requested_cues = operation.get("cue_ids")
+    if requested_cues is None:
+        requested_cues = [operation.get("cue_id")]
+    if not isinstance(requested_cues, list) or not requested_cues:
+        raise FrameCueError("draft flag cue_ids must be a non-empty array")
+    if not all(isinstance(cue_id, str) for cue_id in requested_cues) or len(set(requested_cues)) != len(requested_cues):
+        raise FrameCueError("draft flag cue_ids are invalid")
+    document_cue_ids = [cue.get("id") for cue in document["cues"] if isinstance(cue, dict)]
+    positions = [document_cue_ids.index(cue_id) if cue_id in document_cue_ids else -1 for cue_id in requested_cues]
+    if -1 in positions:
+        raise FrameCueError("workspace draft flag Cue was not found")
+    cue_ids = document_cue_ids[min(positions):max(positions) + 1]
+    if set(cue_ids) != set(requested_cues):
+        raise FrameCueError("draft flag Cues must be contiguous")
+    categories = operation.get("categories")
+    if not isinstance(categories, list) or not categories or not all(isinstance(category, str) and category for category in categories):
+        raise FrameCueError("draft flag categories must be a non-empty string array")
+    author = as_text(operation.get("author", "local"), "draft flag author")
+    note = as_text(operation.get("note", ""), "draft flag note")
+    if not author:
+        raise FrameCueError("draft flag author must not be empty")
+    if not isinstance(issues, list):
+        raise FrameCueError("workspace draft issues are invalid")
+    for category in sorted(set(categories)):
+        issue = next((row for row in issues if isinstance(row, dict) and row.get("cue_ids") == cue_ids and row.get("category") == category), None)
+        if issue is None:
+            issue = {
+                "flag_id": opaque_id("flag"),
+                "range_id": opaque_id("range"),
+                "cue_ids": cue_ids,
+                "category": category,
+                "authors": [],
+                "notes": [],
+            }
+            issues.append(issue)
+        if not isinstance(issue.get("authors"), list) or not isinstance(issue.get("notes"), list):
+            raise FrameCueError("workspace draft issue is invalid")
+        if author not in issue["authors"]:
+            issue["authors"].append(author)
+        if note and note not in issue["notes"]:
+            issue["notes"].append(note)
+
+
+def apply_draft_operation(database, review_id, operation):
+    if not isinstance(operation, dict):
+        raise FrameCueError("draft operation must be an object")
+    expected_version = operation.get("draft_version")
+    if type(expected_version) is not int or expected_version < 0:
+        raise FrameCueError("draft operation draft_version is invalid")
+    kind = operation.get("kind")
+    if kind not in {"edit", "split", "merge", "flag"}:
+        raise FrameCueError("draft operation kind is invalid")
+    connection = open_workspace_database(database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = workspace_row(connection, review_id)
+            if workspace["stage"] != "content_review":
+                raise FrameCueError(f"workspace is not accepting draft operations: {review_id}")
+            draft = draft_row(connection, workspace)
+            if draft["draft_version"] != expected_version:
+                raise FrameCueError(
+                    f"workspace draft version is stale: expected {draft['draft_version']}, got {expected_version}"
+                )
+            if kind == "edit":
+                change = apply_draft_edit(draft["document"], operation)
+            elif kind == "split":
+                change = apply_draft_split(draft["document"], operation)
+            elif kind == "merge":
+                change = apply_draft_merge(draft["document"], operation)
+            else:
+                apply_draft_flag(draft["document"], draft["issues"], operation)
+                change = None
+            if change is not None:
+                draft["direct_changes"].append(change)
+            next_version = expected_version + 1
+            if connection.execute(
+                """UPDATE workspace_drafts
+                   SET draft_version = ?, document_json = ?, issues_json = ?, direct_changes_json = ?
+                   WHERE review_id = ? AND draft_version = ?""",
+                (
+                    next_version,
+                    canonical_json(draft["document"]),
+                    canonical_json(draft["issues"]),
+                    canonical_json(draft["direct_changes"]),
+                    review_id,
+                    expected_version,
+                ),
+            ).rowcount != 1:
+                raise FrameCueError(f"workspace draft version is stale: {review_id}")
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    return {
+        "workspace_id": review_id,
+        "stage": "content_review",
+        "draft_version": next_version,
+        "document": draft["document"],
+        "issues": draft["issues"],
+        "direct_edit_count": len(draft["direct_changes"]),
+    }
+
+
 def open_workspace_database(database):
     connection = None
     try:
@@ -946,6 +1304,14 @@ def open_workspace_database(database):
                 created_at TEXT NOT NULL,
                 UNIQUE(review_id, base_revision, base_checksum, operation)
             );
+            CREATE TABLE IF NOT EXISTS workspace_drafts (
+                review_id TEXT PRIMARY KEY REFERENCES workspaces(review_id),
+                draft_version INTEGER NOT NULL,
+                document_json TEXT NOT NULL,
+                issues_json TEXT NOT NULL,
+                direct_changes_json TEXT NOT NULL,
+                frozen_revision_id INTEGER REFERENCES revisions(revision_id)
+            );
         """)
         return connection
     except (OSError, sqlite3.Error) as error:
@@ -979,6 +1345,208 @@ def workspace_source_package(connection, workspace):
     if not isinstance(package, dict):
         raise FrameCueError(f"workspace source package is missing: {workspace['review_id']}")
     return document, package
+
+
+def completed_draft_summary(connection, workspace, draft_version):
+    draft = connection.execute(
+        "SELECT draft_version, frozen_revision_id FROM workspace_drafts WHERE review_id = ?",
+        (workspace["review_id"],),
+    ).fetchone()
+    if draft is None or draft["draft_version"] != draft_version or draft["frozen_revision_id"] is None:
+        raise FrameCueError(f"workspace is not awaiting content review: {workspace['review_id']}")
+    order = connection.execute(
+        """SELECT request_id, operation, base_revision, base_checksum
+           FROM work_orders WHERE review_id = ? AND revision_id = ?
+           ORDER BY work_order_id DESC LIMIT 1""",
+        (workspace["review_id"], draft["frozen_revision_id"]),
+    ).fetchone()
+    if order is None:
+        raise FrameCueError(f"workspace completed round is incomplete: {workspace['review_id']}")
+    return {
+        "workspace_id": workspace["review_id"],
+        "stage": workspace["stage"],
+        "operation": order["operation"],
+        "request_id": order["request_id"],
+        "draft_version": draft_version,
+        "revision": order["base_revision"],
+        "checksum": order["base_checksum"],
+    }
+
+
+def workspace_work_order_target(document, cue_ids, range_id, allowed_operations, allowed_fields, categories=(), notes=(), direct_edit=False):
+    cue_by_id = {cue["id"]: cue for cue in document["cues"]}
+    try:
+        cues = [cue_by_id[cue_id] for cue_id in cue_ids]
+    except KeyError as error:
+        raise FrameCueError(f"workspace draft range references an unknown Cue: {error.args[0]}") from error
+    block_ids = []
+    for cue in cues:
+        if cue["block_id"] not in block_ids:
+            block_ids.append(cue["block_id"])
+    blocks = [block for block in document["blocks"] if block["id"] in block_ids]
+    projection = {"cues": cues, "blocks": blocks}
+    return {
+        "range_id": range_id,
+        "cue_ids": cue_ids,
+        "block_ids": block_ids,
+        "source_start_ms": min(cue["source_start_ms"] for cue in cues),
+        "source_end_ms": max(cue["source_end_ms"] for cue in cues),
+        "lineage_anchors": {cue["id"]: cue.get("origin_cue_ids", []) for cue in cues},
+        "allowed_operations": allowed_operations,
+        "allowed_fields": allowed_fields,
+        "before_checksum": hashlib.sha256(canonical_json(projection).encode("utf-8")).hexdigest(),
+        "context": {"direct_edit": direct_edit, "categories": list(categories), "notes": list(notes)},
+    }
+
+
+def correction_work_order_targets(document, direct_changes, issues):
+    cue_order = [cue["id"] for cue in document["cues"]]
+    ranges = []
+    for change in direct_changes:
+        ranges.append({"cue_ids": change["cue_ids"], "range_id": "", "direct_edit": True, "categories": [], "notes": []})
+    for issue in issues:
+        ranges.append({
+            "cue_ids": issue["cue_ids"], "range_id": issue["range_id"], "direct_edit": False,
+            "categories": [issue["category"]], "notes": issue["notes"],
+        })
+    merged = []
+    for value in ranges:
+        overlap = [row for row in merged if set(row["cue_ids"]) & set(value["cue_ids"])]
+        for row in overlap:
+            merged.remove(row)
+            value["cue_ids"] = [cue_id for cue_id in cue_order if cue_id in set(value["cue_ids"]) | set(row["cue_ids"])]
+            value["range_id"] = value["range_id"] or row["range_id"]
+            value["direct_edit"] = value["direct_edit"] or row["direct_edit"]
+            for key in ("categories", "notes"):
+                value[key] = list(dict.fromkeys(row[key] + value[key]))
+        merged.append(value)
+    return [
+        workspace_work_order_target(
+            document, value["cue_ids"], value["range_id"] or opaque_id("range"),
+            ["edit", "split", "merge"],
+            ["display_text", "speech_text", "block.target_text", "block.speech_text"],
+            value["categories"], value["notes"], value["direct_edit"],
+        )
+        for value in merged
+    ]
+
+
+def complete_workspace_round(database, review_id, draft_version):
+    if type(draft_version) is not int or draft_version < 0:
+        raise FrameCueError("workspace completion draft_version is invalid")
+    connection = open_workspace_database(database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = workspace_row(connection, review_id)
+            if workspace["stage"] != "content_review":
+                summary = completed_draft_summary(connection, workspace, draft_version)
+                connection.rollback()
+                return summary
+            draft = draft_row(connection, workspace)
+            if draft["draft_version"] != draft_version:
+                raise FrameCueError(
+                    f"workspace draft version is stale: expected {draft['draft_version']}, got {draft_version}"
+                )
+            needs_correction = bool(draft["direct_changes"] or draft["issues"])
+            document = copy.deepcopy(draft["document"])
+            document["revision_kind"] = "draft_snapshot" if needs_correction else "content"
+            refresh_document_checksum(document)
+            created_at = utc_now()
+            revision = connection.execute(
+                """INSERT INTO revisions
+                   (review_id, revision, kind, parent_revision_id, checksum, document_json, assets_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    review_id,
+                    document["revision"],
+                    document["revision_kind"],
+                    workspace["current_revision_id"],
+                    document["checksum"],
+                    canonical_json(document),
+                    canonical_json(document["assets"]),
+                    created_at,
+                ),
+            )
+            next_order = connection.execute(
+                "SELECT COALESCE(MAX(work_order_id), 0) + 1 AS value FROM work_orders"
+            ).fetchone()["value"]
+            request_id = f"req-{next_order:04d}"
+            if needs_correction:
+                targets = correction_work_order_targets(document, draft["direct_changes"], draft["issues"])
+                operation = "content_correction_review"
+                stage = "content_agent_review_pending"
+                required_outputs = ["document", "change_proposals"]
+            else:
+                targets = [workspace_work_order_target(
+                    document,
+                    [cue["id"] for cue in document["cues"]],
+                    opaque_id("range"),
+                    ["realize_voice_timeline"],
+                    ["output_start_ms", "output_end_ms", "assets"],
+                )]
+                operation = "realize_voice_timeline"
+                stage = "voice_realization_pending"
+                required_outputs = ["document", "block_audio", "word_alignment", "timing_audit"]
+            work_order = {
+                "schema": WORK_ORDER_V2_SCHEMA,
+                "request_id": request_id,
+                "workspace_id": review_id,
+                "operation": operation,
+                "base_revision": document["revision"],
+                "base_draft_version": draft_version,
+                "base_checksum": document["checksum"],
+                "timing_profile": document["timing_profile"],
+                "targets": targets,
+                "required_outputs": required_outputs,
+                "document": document,
+            }
+            connection.execute(
+                """INSERT INTO work_orders
+                   (request_id, review_id, revision_id, base_revision, base_checksum, operation, status, request_json, candidate_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+                (
+                    request_id,
+                    review_id,
+                    revision.lastrowid,
+                    document["revision"],
+                    document["checksum"],
+                    operation,
+                    "pending",
+                    canonical_json(work_order),
+                    created_at,
+                ),
+            )
+            if connection.execute(
+                """UPDATE workspace_drafts SET frozen_revision_id = ?
+                   WHERE review_id = ? AND draft_version = ? AND frozen_revision_id IS NULL""",
+                (revision.lastrowid, review_id, draft_version),
+            ).rowcount != 1:
+                raise FrameCueError(f"workspace draft version is stale: {review_id}")
+            if connection.execute(
+                """UPDATE workspaces SET stage = ?, current_revision_id = ?
+                   WHERE review_id = ? AND stage = 'content_review'""",
+                (stage, workspace["current_revision_id"] if needs_correction else revision.lastrowid, review_id),
+            ).rowcount != 1:
+                raise FrameCueError(f"workspace is not awaiting content review: {review_id}")
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    return {
+        "workspace_id": review_id,
+        "stage": stage,
+        "operation": operation,
+        "request_id": request_id,
+        "draft_version": draft_version,
+        "revision": document["revision"],
+        "checksum": document["checksum"],
+    }
 
 
 def migrate_v1(v1_package_path, semantic_blocks_path, review_id, revision, workflow):
@@ -1261,6 +1829,21 @@ def command_workspace_import(args):
         "revision": package["revision"],
         "checksum": document["checksum"],
     }, ensure_ascii=False))
+
+
+def command_workspace_apply(args):
+    operation = read_json(args.operation)
+    print(json.dumps(
+        apply_draft_operation(args.database, args.review_id, operation),
+        ensure_ascii=False,
+    ))
+
+
+def command_workspace_complete(args):
+    print(json.dumps(
+        complete_workspace_round(args.database, args.review_id, args.draft_version),
+        ensure_ascii=False,
+    ))
 
 
 def complete_content_revision(database, review_id, result):
@@ -1884,6 +2467,18 @@ def parser():
     workspace_import.add_argument("--package", required=True)
     workspace_import.add_argument("--timing-profile", choices=sorted(TIMING_PROFILES), required=True)
     workspace_import.set_defaults(func=command_workspace_import)
+
+    workspace_apply = commands.add_parser("workspace-apply", help="apply one versioned Workspace v2 draft operation")
+    workspace_apply.add_argument("--database", required=True)
+    workspace_apply.add_argument("--review-id", required=True)
+    workspace_apply.add_argument("--operation", required=True)
+    workspace_apply.set_defaults(func=command_workspace_apply)
+
+    workspace_complete = commands.add_parser("workspace-complete", help="complete one versioned Workspace v2 content round")
+    workspace_complete.add_argument("--database", required=True)
+    workspace_complete.add_argument("--review-id", required=True)
+    workspace_complete.add_argument("--draft-version", type=int, required=True)
+    workspace_complete.set_defaults(func=command_workspace_complete)
 
     content_complete = commands.add_parser("content-complete", help="save an approved content revision and create its pending work order")
     content_complete.add_argument("--database", required=True)

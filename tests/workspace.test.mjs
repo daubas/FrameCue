@@ -2,8 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  completeWorkspaceRound,
   isWorkspaceSubmitted,
   loadWorkspaceConfig,
+  loadWorkspaceSnapshot,
+  openWorkspaceEvents,
+  submitWorkspaceOperation,
   submitApprovedResult
 } from "../src/lib/workspace.js";
 
@@ -212,4 +216,103 @@ test("does not submit without workspace server configuration", async () => {
 
   assert.equal(response.submitted, false);
   assert.equal(calls, 0);
+});
+
+const workspaceSnapshot = {
+  schema: "framecue_workspace_snapshot_v2",
+  workspace_id: "fixture-workspace",
+  stage: "content_review",
+  draft_version: 3,
+  csrf_token: "workspace-token",
+  document: {
+    schema: "framecue_subtitle_document_v2",
+    cues: [{ id: "c0001", display_text: "哈囉", speech_text: "哈囉。", source_start_ms: 0, source_end_ms: 1000 }],
+    blocks: []
+  },
+  issues: [],
+  direct_edit_count: 0
+};
+
+test("loads the Workspace v2 snapshot and keeps a missing endpoint in static mode", async () => {
+  const calls = [];
+  const loaded = await loadWorkspaceSnapshot({
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      return { ok: true, status: 200, json: async () => workspaceSnapshot };
+    },
+    baseHref: "https://framecue.test/reviews/index.html"
+  });
+
+  assert.deepEqual(loaded, workspaceSnapshot);
+  assert.equal(calls[0].url, "https://framecue.test/api/workspace/snapshot");
+  assert.equal(calls[0].init.method, "GET");
+
+  assert.equal(await loadWorkspaceSnapshot({
+    fetchImpl: async () => ({ ok: false, status: 404 }),
+    baseHref: "https://framecue.test/reviews/index.html"
+  }), null);
+});
+
+test("submits one version-bound Workspace operation with same-origin CSRF", async () => {
+  const calls = [];
+  const response = await submitWorkspaceOperation(workspaceSnapshot, {
+    kind: "edit",
+    cue_id: "c0001",
+    display_text: "你好"
+  }, {
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      return { ok: true, status: 200, json: async () => ({ ...workspaceSnapshot, draft_version: 4 }) };
+    },
+    baseHref: "https://framecue.test/reviews/index.html"
+  });
+
+  assert.equal(response.draft_version, 4);
+  assert.equal(calls[0].url, "https://framecue.test/api/workspace/operation");
+  assert.equal(calls[0].init.headers["X-FrameCue-CSRF"], "workspace-token");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    kind: "edit",
+    cue_id: "c0001",
+    display_text: "你好",
+    draft_version: 3
+  });
+});
+
+test("completes the current Workspace round with its observed draft version", async () => {
+  const calls = [];
+  await completeWorkspaceRound(workspaceSnapshot, {
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), init });
+      return { ok: true, status: 200, json: async () => ({ stage: "voice_realization_pending" }) };
+    },
+    baseHref: "https://framecue.test/reviews/index.html"
+  });
+
+  assert.equal(calls[0].url, "https://framecue.test/api/workspace/complete");
+  assert.deepEqual(JSON.parse(calls[0].init.body), { draft_version: 3 });
+});
+
+test("Workspace events only notify the caller to reload the authoritative snapshot", () => {
+  const opened = [];
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      opened.push(this);
+    }
+    addEventListener(type, listener) {
+      this[type] = listener;
+    }
+    close() {}
+  }
+  let reloads = 0;
+  const stream = openWorkspaceEvents({
+    EventSourceImpl: FakeEventSource,
+    baseHref: "https://framecue.test/reviews/index.html",
+    onChange: () => { reloads += 1; }
+  });
+
+  assert.equal(opened[0].url, "https://framecue.test/api/workspace/events");
+  opened[0].snapshot(new Event("snapshot"));
+  assert.equal(reloads, 1);
+  assert.equal(stream, opened[0]);
 });

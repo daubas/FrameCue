@@ -24,6 +24,122 @@ function resolveEndpoint(endpoint, baseHref) {
   return resolved.href;
 }
 
+function resolveWorkspaceEndpoint(path, baseHref) {
+  let base;
+  let endpoint;
+  try {
+    base = new URL(baseHref);
+    endpoint = new URL(path, base);
+  } catch {
+    throw new Error("workspace endpoint is invalid");
+  }
+  if (endpoint.origin !== base.origin) throw new Error("workspace endpoint must be same-origin");
+  return endpoint.href;
+}
+
+function validateWorkspaceSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== "object" || snapshot.schema !== "framecue_workspace_snapshot_v2") {
+    throw new Error("workspace snapshot is invalid");
+  }
+  if (typeof snapshot.workspace_id !== "string" || !snapshot.workspace_id.trim()) {
+    throw new Error("workspace snapshot workspace_id is required");
+  }
+  if (typeof snapshot.stage !== "string" || !snapshot.stage.trim()) {
+    throw new Error("workspace snapshot stage is required");
+  }
+  if (!Number.isInteger(snapshot.draft_version) || snapshot.draft_version < 0) {
+    throw new Error("workspace snapshot draft_version is invalid");
+  }
+  if (typeof snapshot.csrf_token !== "string" || !snapshot.csrf_token.trim()) {
+    throw new Error("workspace snapshot CSRF token is required");
+  }
+  if (!snapshot.document || !Array.isArray(snapshot.document.cues) || !Array.isArray(snapshot.document.blocks)) {
+    throw new Error("workspace snapshot document is invalid");
+  }
+  return snapshot;
+}
+
+async function workspacePost(path, workspace, body, {
+  fetchImpl = globalThis.fetch,
+  baseHref = globalThis.location?.href
+} = {}) {
+  if (typeof fetchImpl !== "function") throw new Error("workspace fetch is unavailable");
+  validateWorkspaceSnapshot(workspace);
+  const endpoint = resolveWorkspaceEndpoint(path, baseHref);
+  const response = await fetchImpl(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-FrameCue-CSRF": workspace.csrf_token
+    },
+    credentials: "same-origin",
+    body: JSON.stringify(body)
+  });
+  if (!response?.ok) {
+    throw new Error(`workspace request failed (${response?.status ?? "unknown"})`);
+  }
+  try {
+    return await response.json();
+  } catch {
+    throw new Error("workspace response is invalid JSON");
+  }
+}
+
+export async function loadWorkspaceSnapshot({
+  fetchImpl = globalThis.fetch,
+  baseHref = globalThis.location?.href
+} = {}) {
+  if (typeof fetchImpl !== "function") throw new Error("workspace fetch is unavailable");
+  const endpoint = resolveWorkspaceEndpoint("/api/workspace/snapshot", baseHref);
+  const response = await fetchImpl(endpoint, {
+    method: "GET",
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+  if (response?.status === 404) return null;
+  if (!response?.ok) {
+    throw new Error(`workspace snapshot request failed (${response?.status ?? "unknown"})`);
+  }
+  let snapshot;
+  try {
+    snapshot = await response.json();
+  } catch {
+    throw new Error("workspace snapshot response is invalid JSON");
+  }
+  return validateWorkspaceSnapshot(snapshot);
+}
+
+export function submitWorkspaceOperation(workspace, operation, options = {}) {
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)) {
+    throw new Error("workspace operation is invalid");
+  }
+  return workspacePost("/api/workspace/operation", workspace, {
+    ...operation,
+    draft_version: workspace.draft_version
+  }, options);
+}
+
+export function completeWorkspaceRound(workspace, options = {}) {
+  return workspacePost("/api/workspace/complete", workspace, {
+    draft_version: workspace.draft_version
+  }, options);
+}
+
+export function openWorkspaceEvents({
+  EventSourceImpl = globalThis.EventSource,
+  baseHref = globalThis.location?.href,
+  onChange = () => {},
+  onOpen = () => {},
+  onError = () => {}
+} = {}) {
+  if (typeof EventSourceImpl !== "function") throw new Error("workspace events are unavailable");
+  const stream = new EventSourceImpl(resolveWorkspaceEndpoint("/api/workspace/events", baseHref));
+  stream.addEventListener("snapshot", onChange);
+  stream.addEventListener("open", onOpen);
+  stream.addEventListener("error", onError);
+  return stream;
+}
+
 function validateWorkspaceConfig(config, baseHref) {
   if (!config || typeof config !== "object") {
     throw new Error("workspace config is invalid");
