@@ -1,5 +1,8 @@
 import copy
+import hashlib
 import json
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -106,10 +109,241 @@ class CandidateV2Tests(unittest.TestCase):
             }],
         }
 
+    def _two_proposal_order(self, root):
+        fixture_root = root / "fixture"
+        shutil.copytree(FIXTURE.parent, fixture_root)
+        source_path = fixture_root / FIXTURE.name
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        source["blocks"] = [
+            {
+                "id": f"b000{index + 1}", "cue_ids": [cue["id"]],
+                "start_ms": cue["start_ms"], "end_ms": cue["end_ms"], "budget_ms": 1500,
+                "source_text": cue["original_text"], "target_text": cue["text"],
+                "speech_text": cue["speech_text"],
+            }
+            for index, cue in enumerate(source["cues"])
+        ]
+        source_path.write_text(json.dumps(source, ensure_ascii=False), encoding="utf-8")
+        bundle, database = root / "bundle", root / "workspace.sqlite3"
+        run_cli("build", "--input", str(source_path), "--out-dir", str(bundle))
+        package = json.loads((bundle / "review_package.json").read_text(encoding="utf-8"))
+        run_cli(
+            "workspace-import", "--database", str(database),
+            "--package", str(bundle / "review_package.json"), "--timing-profile", "synchronous_dub",
+        )
+        for version, cue_id in enumerate(("c0001", "c0002")):
+            operation_path = root / f"flag-{cue_id}.json"
+            operation_path.write_text(json.dumps({
+                "kind": "flag", "draft_version": version, "cue_id": cue_id,
+                "categories": ["translation"], "author": "lead", "note": f"請調整 {cue_id}",
+            }, ensure_ascii=False), encoding="utf-8")
+            run_cli(
+                "workspace-apply", "--database", str(database),
+                "--review-id", package["review_id"], "--operation", str(operation_path),
+            )
+        run_cli(
+            "workspace-complete", "--database", str(database),
+            "--review-id", package["review_id"], "--draft-version", "2",
+        )
+        order_path = root / "two-work-order.json"
+        run_cli(
+            "work-pull", "--database", str(database),
+            "--review-id", package["review_id"], "--out", str(order_path),
+        )
+        return database, package, json.loads(order_path.read_text(encoding="utf-8"))
+
+    def _two_proposal_candidate(self, work_order):
+        document = copy.deepcopy(work_order["document"])
+        for index, cue in enumerate(document["cues"], start=1):
+            cue["display_text"] = f"已修正字幕 {index}"
+            cue["speech_text"] = f"已修正字幕 {index}。"
+        framecue.recompute_draft_blocks(document)
+        framecue.refresh_document_checksum(document)
+        proposals = []
+        for index, target in enumerate(work_order["targets"], start=1):
+            proposals.append({
+                "proposal_id": f"proposal-{index}",
+                "range_id": target["range_id"],
+                "before_checksum": target["before_checksum"],
+                "replacement": {
+                    "cues": [copy.deepcopy(next(cue for cue in document["cues"] if cue["id"] == cue_id)) for cue_id in target["cue_ids"]],
+                    "blocks": [copy.deepcopy(next(block for block in document["blocks"] if block["id"] == block_id)) for block_id in target["block_ids"]],
+                },
+            })
+        candidate = self._candidate(work_order)
+        candidate["document"] = document
+        candidate["change_proposals"] = proposals
+        return candidate
+
     def _submit(self, root, database, name, candidate):
         path = root / name
         path.write_text(json.dumps(candidate, ensure_ascii=False), encoding="utf-8")
         return run_cli("work-submit", "--database", str(database), "--candidate", str(path))
+
+    def _decide(self, root, database, package, work_order, candidate, decisions, checksum=None):
+        path = root / "decisions.json"
+        path.write_text(json.dumps(decisions, ensure_ascii=False), encoding="utf-8")
+        return run_cli(
+            "candidate-decide",
+            "--database", str(database),
+            "--review-id", package["review_id"],
+            "--request-id", work_order["request_id"],
+            "--candidate-checksum", checksum or hashlib.sha256(framecue.canonical_json(candidate).encode("utf-8")).hexdigest(),
+            "--decisions", str(path),
+        )
+
+    def test_accepting_every_content_proposal_creates_the_voice_work_order(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-candidate-v2-accept-") as temp:
+            root = Path(temp)
+            database, package, work_order = self._correction_order(root)
+            candidate = self._candidate(work_order)
+            self._submit(root, database, "candidate.json", candidate)
+
+            summary = json.loads(self._decide(
+                root, database, package, work_order, candidate,
+                [{"proposal_id": "proposal-1", "decision": "accept"}],
+            ).stdout)
+
+            self.assertEqual(summary["stage"], "voice_realization_pending")
+            self.assertEqual(summary["status"], "accepted")
+            next_order_path = root / "voice-order.json"
+            run_cli(
+                "work-pull", "--database", str(database),
+                "--review-id", package["review_id"], "--out", str(next_order_path),
+            )
+            next_order = json.loads(next_order_path.read_text(encoding="utf-8"))
+            self.assertEqual(next_order["operation"], "realize_voice_timeline")
+            self.assertEqual(next_order["document"]["cues"][0]["display_text"], "OpenClaw 仍保留明確的人工審稿步驟")
+
+    def test_rejecting_one_proposal_reopens_only_that_range(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-candidate-v2-partial-") as temp:
+            root = Path(temp)
+            database, package, work_order = self._two_proposal_order(root)
+            candidate = self._two_proposal_candidate(work_order)
+            self._submit(root, database, "candidate.json", candidate)
+
+            summary = json.loads(self._decide(
+                root, database, package, work_order, candidate,
+                [
+                    {"proposal_id": "proposal-1", "decision": "accept"},
+                    {"proposal_id": "proposal-2", "decision": "reject"},
+                ],
+            ).stdout)
+
+            self.assertEqual(summary["stage"], "content_review")
+            self.assertEqual(summary["status"], "changes_requested")
+            snapshot = framecue.workspace_snapshot(database, package["review_id"], "test")
+            self.assertEqual(snapshot["document"]["cues"][0]["display_text"], "已修正字幕 1")
+            self.assertEqual(snapshot["document"]["cues"][1]["display_text"], work_order["document"]["cues"][1]["display_text"])
+            self.assertEqual([issue["cue_ids"] for issue in snapshot["issues"]], [["c0002"]])
+
+            run_cli(
+                "workspace-complete", "--database", str(database),
+                "--review-id", package["review_id"], "--draft-version", str(summary["draft_version"]),
+            )
+            next_order_path = root / "retry-order.json"
+            run_cli(
+                "work-pull", "--database", str(database),
+                "--review-id", package["review_id"], "--out", str(next_order_path),
+            )
+            next_order = json.loads(next_order_path.read_text(encoding="utf-8"))
+            self.assertEqual([target["cue_ids"] for target in next_order["targets"]], [["c0002"]])
+
+            retry_candidate = self._candidate(next_order)
+            self._submit(root, database, "retry-candidate.json", retry_candidate)
+            retry_summary = json.loads(self._decide(
+                root, database, package, next_order, retry_candidate,
+                [{"proposal_id": "proposal-1", "decision": "reject"}],
+            ).stdout)
+            run_cli(
+                "workspace-complete", "--database", str(database),
+                "--review-id", package["review_id"], "--draft-version", str(retry_summary["draft_version"]),
+            )
+            repeated_order_path = root / "repeated-order.json"
+            run_cli(
+                "work-pull", "--database", str(database),
+                "--review-id", package["review_id"], "--out", str(repeated_order_path),
+            )
+            repeated_order = json.loads(repeated_order_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(repeated_order["request_id"], next_order["request_id"])
+            self.assertEqual(repeated_order["base_checksum"], next_order["base_checksum"])
+
+    def test_candidate_decisions_fail_atomically_when_incomplete_stale_or_dependency_split(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-candidate-v2-atomic-") as temp:
+            root = Path(temp)
+            database, package, work_order = self._two_proposal_order(root)
+            candidate = self._two_proposal_candidate(work_order)
+            for proposal in candidate["change_proposals"]:
+                proposal["dependencies"] = ["shared-meaning"]
+            self._submit(root, database, "candidate.json", candidate)
+
+            invalid = [
+                ([{"proposal_id": "proposal-1", "decision": "accept"}], None),
+                ([
+                    {"proposal_id": "proposal-1", "decision": "accept"},
+                    {"proposal_id": "proposal-1", "decision": "reject"},
+                ], None),
+                ([
+                    {"proposal_id": "proposal-1", "decision": "accept"},
+                    {"proposal_id": "unknown", "decision": "reject"},
+                ], None),
+                ([
+                    {"proposal_id": "proposal-1", "decision": "accept"},
+                    {"proposal_id": "proposal-2", "decision": "reject"},
+                ], None),
+                ([
+                    {"proposal_id": "proposal-1", "decision": "accept"},
+                    {"proposal_id": "proposal-2", "decision": "accept"},
+                ], "0" * 64),
+            ]
+            for decisions, checksum in invalid:
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self._decide(root, database, package, work_order, candidate, decisions, checksum)
+                self.assertEqual(
+                    framecue.workspace_snapshot(database, package["review_id"], "test")["stage"],
+                    "content_candidate_review",
+                )
+
+            summary = json.loads(self._decide(
+                root, database, package, work_order, candidate,
+                [
+                    {"proposal_id": "proposal-1", "decision": "accept"},
+                    {"proposal_id": "proposal-2", "decision": "accept"},
+                ],
+            ).stdout)
+            self.assertEqual(summary["stage"], "voice_realization_pending")
+
+    def test_legacy_work_order_constraint_migration_preserves_existing_rows(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-work-order-migration-") as temp:
+            root = Path(temp)
+            database, _, work_order = self._correction_order(root)
+            connection = sqlite3.connect(database)
+            connection.executescript("""
+                PRAGMA foreign_keys = OFF;
+                ALTER TABLE work_orders RENAME TO current_work_orders;
+                CREATE TABLE work_orders (
+                    work_order_id INTEGER PRIMARY KEY,
+                    request_id TEXT UNIQUE NOT NULL,
+                    review_id TEXT NOT NULL REFERENCES workspaces(review_id),
+                    revision_id INTEGER NOT NULL REFERENCES revisions(revision_id),
+                    base_revision TEXT NOT NULL,
+                    base_checksum TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    candidate_json TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(review_id, base_revision, base_checksum, operation)
+                );
+                INSERT INTO work_orders SELECT * FROM current_work_orders;
+                DROP TABLE current_work_orders;
+            """)
+            connection.close()
+
+            migrated = framecue.open_workspace_database(database)
+            rows = migrated.execute("SELECT request_id FROM work_orders").fetchall()
+            migrated.close()
+            self.assertEqual([row["request_id"] for row in rows], [work_order["request_id"]])
 
     def test_content_candidate_submit_marks_the_workspace_ready_for_human_decision(self):
         with tempfile.TemporaryDirectory(prefix="framecue-candidate-v2-happy-") as temp:

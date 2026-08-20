@@ -1316,11 +1316,56 @@ def open_workspace_database(database):
                 frozen_revision_id INTEGER REFERENCES revisions(revision_id)
             );
         """)
+        work_orders_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_orders'"
+        ).fetchone()["sql"]
+        if "unique(review_id,base_revision,base_checksum,operation)" in re.sub(r"\s+", "", work_orders_sql.lower()):
+            connection.executescript("""
+                BEGIN;
+                DROP TABLE IF EXISTS work_orders_without_base_unique;
+                CREATE TABLE work_orders_without_base_unique (
+                    work_order_id INTEGER PRIMARY KEY,
+                    request_id TEXT UNIQUE NOT NULL,
+                    review_id TEXT NOT NULL REFERENCES workspaces(review_id),
+                    revision_id INTEGER NOT NULL REFERENCES revisions(revision_id),
+                    base_revision TEXT NOT NULL,
+                    base_checksum TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    candidate_json TEXT,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO work_orders_without_base_unique SELECT * FROM work_orders;
+                DROP TABLE work_orders;
+                ALTER TABLE work_orders_without_base_unique RENAME TO work_orders;
+                COMMIT;
+            """)
         return connection
     except (OSError, sqlite3.Error) as error:
         if connection is not None:
             connection.close()
         raise FrameCueError(f"workspace database error: {error}") from error
+
+
+def insert_workspace_revision(connection, review_id, revision, kind, parent_revision_id, document, created_at):
+    document_json = canonical_json(document)
+    connection.execute(
+        """INSERT OR IGNORE INTO revisions
+           (review_id, revision, kind, parent_revision_id, checksum, document_json, assets_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            review_id, revision, kind, parent_revision_id, document["checksum"], document_json,
+            canonical_json(document["assets"]), created_at,
+        ),
+    )
+    row = connection.execute(
+        "SELECT revision_id, document_json FROM revisions WHERE review_id = ? AND kind = ? AND checksum = ?",
+        (review_id, kind, document["checksum"]),
+    ).fetchone()
+    if row is None or row["document_json"] != document_json:
+        raise FrameCueError("workspace revision checksum collision")
+    return row["revision_id"]
 
 
 def workspace_row(connection, review_id):
@@ -1456,20 +1501,9 @@ def complete_workspace_round(database, review_id, draft_version):
             document["revision_kind"] = "draft_snapshot" if needs_correction else "content"
             refresh_document_checksum(document)
             created_at = utc_now()
-            revision = connection.execute(
-                """INSERT INTO revisions
-                   (review_id, revision, kind, parent_revision_id, checksum, document_json, assets_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    review_id,
-                    document["revision"],
-                    document["revision_kind"],
-                    workspace["current_revision_id"],
-                    document["checksum"],
-                    canonical_json(document),
-                    canonical_json(document["assets"]),
-                    created_at,
-                ),
+            revision_id = insert_workspace_revision(
+                connection, review_id, document["revision"], document["revision_kind"],
+                workspace["current_revision_id"], document, created_at,
             )
             next_order = connection.execute(
                 "SELECT COALESCE(MAX(work_order_id), 0) + 1 AS value FROM work_orders"
@@ -1511,7 +1545,7 @@ def complete_workspace_round(database, review_id, draft_version):
                 (
                     request_id,
                     review_id,
-                    revision.lastrowid,
+                    revision_id,
                     document["revision"],
                     document["checksum"],
                     operation,
@@ -1523,13 +1557,13 @@ def complete_workspace_round(database, review_id, draft_version):
             if connection.execute(
                 """UPDATE workspace_drafts SET frozen_revision_id = ?
                    WHERE review_id = ? AND draft_version = ? AND frozen_revision_id IS NULL""",
-                (revision.lastrowid, review_id, draft_version),
+                (revision_id, review_id, draft_version),
             ).rowcount != 1:
                 raise FrameCueError(f"workspace draft version is stale: {review_id}")
             if connection.execute(
                 """UPDATE workspaces SET stage = ?, current_revision_id = ?
                    WHERE review_id = ? AND stage = 'content_review'""",
-                (stage, workspace["current_revision_id"] if needs_correction else revision.lastrowid, review_id),
+                (stage, workspace["current_revision_id"] if needs_correction else revision_id, review_id),
             ).rowcount != 1:
                 raise FrameCueError(f"workspace is not awaiting content review: {review_id}")
             connection.commit()
@@ -3106,6 +3140,217 @@ def command_work_submit(args):
     }, ensure_ascii=False))
 
 
+def candidate_checksum(candidate):
+    return hashlib.sha256(canonical_json(candidate).encode("utf-8")).hexdigest()
+
+
+def apply_candidate_proposals(base_document, proposals):
+    document = copy.deepcopy(base_document)
+    for proposal in proposals:
+        replacement = proposal["replacement"]
+        origins = {
+            cue_id
+            for cue in replacement["cues"]
+            for cue_id in cue.get("origin_cue_ids", [cue.get("id")])
+        }
+        indexes = [index for index, cue in enumerate(document["cues"]) if cue.get("id") in origins]
+        if not indexes or indexes != list(range(min(indexes), max(indexes) + 1)):
+            raise FrameCueError(f"candidate proposal base range is invalid: {proposal['proposal_id']}")
+        document["cues"][min(indexes):max(indexes) + 1] = copy.deepcopy(replacement["cues"])
+        blocks = {block["id"]: copy.deepcopy(block) for block in replacement["blocks"]}
+        document["blocks"] = [blocks.get(block["id"], block) for block in document["blocks"]]
+    recompute_draft_blocks(document)
+    return document
+
+
+def decide_content_candidate(database, review_id, request_id, supplied_checksum, decisions):
+    if not isinstance(decisions, list) or not decisions:
+        raise FrameCueError("candidate decisions must be a non-empty array")
+    connection = open_workspace_database(database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = workspace_row(connection, review_id)
+            if workspace["stage"] != "content_candidate_review":
+                raise FrameCueError(f"workspace is not awaiting candidate decisions: {review_id}")
+            order = connection.execute(
+                """SELECT work_orders.*, revisions.document_json
+                   FROM work_orders JOIN revisions ON revisions.revision_id = work_orders.revision_id
+                   WHERE work_orders.review_id = ? AND work_orders.request_id = ?
+                     AND work_orders.status = 'candidate_ready'""",
+                (review_id, request_id),
+            ).fetchone()
+            if order is None:
+                raise FrameCueError(f"content candidate is not ready: {request_id}")
+            candidate = json.loads(order["candidate_json"])
+            if candidate_checksum(candidate) != supplied_checksum:
+                raise FrameCueError("content candidate checksum is stale")
+            proposals = candidate.get("change_proposals")
+            proposal_ids = [proposal.get("proposal_id") for proposal in proposals]
+            decision_ids = [decision.get("proposal_id") for decision in decisions if isinstance(decision, dict)]
+            if (
+                len(decision_ids) != len(decisions)
+                or len(set(decision_ids)) != len(decision_ids)
+                or set(decision_ids) != set(proposal_ids)
+                or any(decision.get("decision") not in {"accept", "reject"} for decision in decisions)
+            ):
+                raise FrameCueError("candidate decisions must cover every proposal exactly once")
+            decision_by_id = {decision["proposal_id"]: decision["decision"] for decision in decisions}
+            dependency_decisions = {}
+            for proposal in proposals:
+                dependencies = proposal.get("dependencies", [])
+                if (
+                    not isinstance(dependencies, list)
+                    or any(not isinstance(value, str) or not value for value in dependencies)
+                    or len(set(dependencies)) != len(dependencies)
+                ):
+                    raise FrameCueError("candidate proposal dependencies must be unique non-empty strings")
+                decision = decision_by_id[proposal["proposal_id"]]
+                for dependency in dependencies:
+                    prior = dependency_decisions.setdefault(dependency, decision)
+                    if prior != decision:
+                        raise FrameCueError(f"candidate dependency group has conflicting decisions: {dependency}")
+            base_document = json.loads(order["document_json"])
+            accepted = [proposal for proposal in proposals if decision_by_id[proposal["proposal_id"]] == "accept"]
+            rejected = [proposal for proposal in proposals if decision_by_id[proposal["proposal_id"]] == "reject"]
+            document = apply_candidate_proposals(base_document, accepted)
+            request = json.loads(order["request_json"])
+            target_by_range = {target["range_id"]: target for target in request["targets"]}
+            if rejected:
+                document["revision_kind"] = "draft"
+                refresh_document_checksum(document)
+                issues = []
+                for proposal in rejected:
+                    target = target_by_range[proposal["range_id"]]
+                    context = target.get("context", {})
+                    categories = context.get("categories") or ["candidate_rejected"]
+                    for category in categories:
+                        issues.append({
+                            "flag_id": opaque_id("flag"),
+                            "range_id": target["range_id"],
+                            "cue_ids": target["cue_ids"],
+                            "category": category,
+                            "authors": ["candidate-review"],
+                            "notes": list(context.get("notes", [])),
+                        })
+                draft = connection.execute(
+                    "SELECT draft_version FROM workspace_drafts WHERE review_id = ?",
+                    (review_id,),
+                ).fetchone()
+                if draft is None:
+                    raise FrameCueError(f"workspace draft not found: {review_id}")
+                next_version = draft["draft_version"] + 1
+                created_at = utc_now()
+                revision_id = insert_workspace_revision(
+                    connection, review_id, document["revision"], "draft_snapshot",
+                    order["revision_id"], document, created_at,
+                )
+                candidate["status"] = "changes_requested"
+                candidate["decisions"] = decisions
+                connection.execute(
+                    "UPDATE work_orders SET status = 'changes_requested', candidate_json = ? WHERE work_order_id = ?",
+                    (canonical_json(candidate), order["work_order_id"]),
+                )
+                if connection.execute(
+                    """UPDATE workspace_drafts
+                       SET draft_version = ?, document_json = ?, issues_json = ?, direct_changes_json = '[]', frozen_revision_id = NULL
+                       WHERE review_id = ? AND draft_version = ?""",
+                    (next_version, canonical_json(document), canonical_json(issues), review_id, draft["draft_version"]),
+                ).rowcount != 1:
+                    raise FrameCueError(f"workspace draft version is stale: {review_id}")
+                connection.execute(
+                    "UPDATE workspaces SET stage = 'content_review', current_revision_id = ? WHERE review_id = ?",
+                    (revision_id, review_id),
+                )
+                connection.commit()
+                return {
+                    "workspace_id": review_id,
+                    "stage": "content_review",
+                    "status": "changes_requested",
+                    "request_id": request_id,
+                    "draft_version": next_version,
+                    "checksum": document["checksum"],
+                }
+
+            document["revision_kind"] = "content"
+            refresh_document_checksum(document)
+            created_at = utc_now()
+            revision_id = insert_workspace_revision(
+                connection, review_id, document["revision"], "content",
+                order["revision_id"], document, created_at,
+            )
+            next_order = connection.execute(
+                "SELECT COALESCE(MAX(work_order_id), 0) + 1 AS value FROM work_orders"
+            ).fetchone()["value"]
+            next_request_id = f"req-{next_order:04d}"
+            target = workspace_work_order_target(
+                document, [cue["id"] for cue in document["cues"]], opaque_id("range"),
+                ["realize_voice_timeline"], ["output_start_ms", "output_end_ms", "assets"],
+            )
+            work_order = {
+                "schema": WORK_ORDER_V2_SCHEMA,
+                "request_id": next_request_id,
+                "workspace_id": review_id,
+                "operation": "realize_voice_timeline",
+                "base_revision": document["revision"],
+                "base_draft_version": request["base_draft_version"],
+                "base_checksum": document["checksum"],
+                "timing_profile": document["timing_profile"],
+                "targets": [target],
+                "required_outputs": ["document", "block_audio", "word_alignment", "timing_audit"],
+                "document": document,
+            }
+            candidate["status"] = "accepted"
+            candidate["decisions"] = decisions
+            connection.execute(
+                "UPDATE work_orders SET status = 'accepted', candidate_json = ? WHERE work_order_id = ?",
+                (canonical_json(candidate), order["work_order_id"]),
+            )
+            connection.execute(
+                """INSERT INTO work_orders
+                   (request_id, review_id, revision_id, base_revision, base_checksum, operation, status, request_json, candidate_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'realize_voice_timeline', 'pending', ?, NULL, ?)""",
+                (
+                    next_request_id, review_id, revision_id, document["revision"], document["checksum"],
+                    canonical_json(work_order), created_at,
+                ),
+            )
+            connection.execute(
+                """UPDATE workspace_drafts
+                   SET document_json = ?, issues_json = '[]', direct_changes_json = '[]', frozen_revision_id = ?
+                   WHERE review_id = ?""",
+                (canonical_json(document), revision_id, review_id),
+            )
+            connection.execute(
+                "UPDATE workspaces SET stage = 'voice_realization_pending', current_revision_id = ? WHERE review_id = ?",
+                (revision_id, review_id),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    return {
+        "workspace_id": review_id,
+        "stage": "voice_realization_pending",
+        "status": "accepted",
+        "request_id": request_id,
+        "next_request_id": next_request_id,
+        "checksum": document["checksum"],
+    }
+
+
+def command_candidate_decide(args):
+    decisions = read_json(args.decisions)
+    print(json.dumps(decide_content_candidate(
+        args.database, args.review_id, args.request_id, args.candidate_checksum, decisions,
+    ), ensure_ascii=False))
+
+
 def command_migrate(args):
     source = migrate_v1(args.package, args.semantic_blocks, args.review_id, args.revision, args.workflow)
     summary = build_package(source, Path(args.package).expanduser().resolve().parent, args.out_dir, args.viewer_version)
@@ -3210,6 +3455,14 @@ def parser():
     work_submit.add_argument("--database", required=True)
     work_submit.add_argument("--candidate", required=True)
     work_submit.set_defaults(func=command_work_submit)
+
+    candidate_decide = commands.add_parser("candidate-decide", help="accept or reject every proposal in a content Candidate")
+    candidate_decide.add_argument("--database", required=True)
+    candidate_decide.add_argument("--review-id", required=True)
+    candidate_decide.add_argument("--request-id", required=True)
+    candidate_decide.add_argument("--candidate-checksum", required=True)
+    candidate_decide.add_argument("--decisions", required=True)
+    candidate_decide.set_defaults(func=command_candidate_decide)
 
     migrate = commands.add_parser("migrate-v1", help="create a new v2 revision from a v1 package")
     migrate.add_argument("--package", required=True)
