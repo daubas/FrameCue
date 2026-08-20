@@ -2272,6 +2272,10 @@ def agent_work_order_metadata(row):
 
 def make_workspace_server(database, bundle_dir, port=0):
     directory = Path(bundle_dir).expanduser().resolve()
+    database_path = Path(database).expanduser().absolute()
+    for candidate in (database_path, Path(f"{database_path}-wal"), Path(f"{database_path}-shm")):
+        if candidate.is_relative_to(directory) or candidate.resolve().is_relative_to(directory):
+            raise FrameCueError("workspace database files must not be inside the served bundle tree")
     package, _ = bundle_summary(directory / "review_package.json")
     review_id = package["review_id"]
     connection = open_workspace_database(database)
@@ -2310,9 +2314,6 @@ def make_workspace_server(database, bundle_dir, port=0):
             self.wfile.write(body)
 
         def request_session_id(self):
-            header = self.headers.get("X-FrameCue-Session", "").strip()
-            if header:
-                return header
             try:
                 cookies = SimpleCookie(self.headers.get("Cookie", ""))
                 morsel = cookies.get("framecue_session")

@@ -104,7 +104,7 @@ class WorkspaceHTTPTests(unittest.TestCase):
         return {
             "Origin": base,
             "X-FrameCue-CSRF": snapshot["csrf_token"],
-            "X-FrameCue-Session": session_id,
+            "Cookie": f"framecue_session={session_id}",
         }
 
     def _agent_token(self, database, package, *permissions, label="agent"):
@@ -627,7 +627,7 @@ class WorkspaceHTTPTests(unittest.TestCase):
                 events = urllib.request.Request(
                     f"{base}/api/workspace/events",
                     headers={
-                        "X-FrameCue-Session": session_id,
+                        "Cookie": f"framecue_session={session_id}",
                         "Last-Event-ID": "0",
                     },
                 )
@@ -779,7 +779,7 @@ class WorkspaceHTTPTests(unittest.TestCase):
                         "Content-Type": "application/json",
                         "Origin": base,
                         "X-FrameCue-CSRF": bootstrap["csrf_token"],
-                        "X-FrameCue-Session": first["session_id"],
+                        "Cookie": f"framecue_session={first['session_id']}",
                     },
                 )
                 with self.assertRaises(urllib.error.HTTPError) as failure:
@@ -789,13 +789,41 @@ class WorkspaceHTTPTests(unittest.TestCase):
                 _, _, registered = self._json_request(
                     base,
                     "/api/workspace/snapshot",
-                    headers={"X-FrameCue-Session": first["session_id"]},
+                    headers={"Cookie": f"framecue_session={first['session_id']}"},
                 )
                 self.assertNotEqual(registered["session_id"], first["session_id"])
             finally:
                 restarted.shutdown()
                 restarted_thread.join(timeout=5)
                 restarted.server_close()
+
+    def test_workspace_session_header_cannot_impersonate_http_only_cookie(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-session-header-") as temp:
+            root = Path(temp)
+            _, _, server, thread = self._workspace_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                _, _, alice = self._json_request(base, "/api/workspace/snapshot")
+                _, _, bob = self._json_request(base, "/api/workspace/snapshot")
+                request = urllib.request.Request(
+                    f"{base}/api/workspace/complete",
+                    data=json.dumps({"draft_version": 0}).encode("utf-8"),
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": base,
+                        "X-FrameCue-CSRF": bob["csrf_token"],
+                        "Cookie": f"framecue_session={bob['session_id']}",
+                        "X-FrameCue-Session": alice["session_id"],
+                    },
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(failure.exception.code, 403)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
 
     def test_workspace_presence_and_lead_transfer_are_version_bound(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-lead-") as temp:
@@ -949,7 +977,7 @@ class WorkspaceHTTPTests(unittest.TestCase):
                     self._json_request(
                         base,
                         "/api/workspace/snapshot",
-                        headers={"X-FrameCue-Session": bob["session_id"]},
+                        headers={"Cookie": f"framecue_session={bob['session_id']}"},
                     )
 
                 with mock.patch.object(framecue.time, "monotonic", return_value=121):
@@ -1060,6 +1088,38 @@ class WorkspaceHTTPTests(unittest.TestCase):
                 server.shutdown()
                 thread.join(timeout=5)
                 server.server_close()
+
+    def test_workspace_server_rejects_database_files_inside_served_tree(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-public-db-") as temp:
+            root = Path(temp)
+            bundle = root / "bundle"
+            database = root / "workspace.sqlite3"
+            run_cli("build", "--input", str(FIXTURE), "--out-dir", str(bundle))
+            run_cli(
+                "workspace-import",
+                "--database",
+                str(database),
+                "--package",
+                str(bundle / "review_package.json"),
+                "--timing-profile",
+                "synchronous_dub",
+            )
+
+            public_database = bundle / "workspace.sqlite3"
+            public_database.write_bytes(database.read_bytes())
+            with self.assertRaisesRegex(framecue.FrameCueError, "served bundle"):
+                framecue.make_workspace_server(public_database, bundle, port=0)
+
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{database}{suffix}")
+                exposed = bundle / f"exposed{suffix}"
+                exposed.touch()
+                sidecar.symlink_to(exposed)
+                try:
+                    with self.assertRaisesRegex(framecue.FrameCueError, "served bundle"):
+                        framecue.make_workspace_server(database, bundle, port=0)
+                finally:
+                    sidecar.unlink()
 
     def test_content_completion_requires_csrf_and_creates_pending_work_order(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-http-") as temp:
