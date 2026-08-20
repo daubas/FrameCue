@@ -5,14 +5,20 @@ import argparse
 import copy
 import datetime as dt
 import hashlib
+import hmac
 import json
 import re
+import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unicodedata
+import wave
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +28,10 @@ VIEWER_VERSION = "2.6.0"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
+SUBTITLE_DOCUMENT_SCHEMA = "framecue_subtitle_document_v1"
+WORK_ORDER_SCHEMA = "framecue_work_order_v1"
+CANDIDATE_REVISION_SCHEMA = "framecue_candidate_revision_v1"
+TIMING_PROFILES = {"synchronous_dub", "interpreter_lag"}
 WORKFLOW_ACTIONS = {
     "subtitle": {"use_edit", "rewrite", "resegment", "retime"},
     "redraw": {"use_edit", "rewrite", "resegment", "retime"},
@@ -840,6 +850,137 @@ def bundle_summary(package_path):
     return package, summary
 
 
+def document_checksum(document):
+    payload = copy.deepcopy(document)
+    payload.pop("checksum", None)
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def workspace_assets(package):
+    return {
+        "media": copy.deepcopy(package.get("media", {})),
+        "scenes": [{"id": scene["id"], "image": scene["image"]} for scene in package["scenes"]],
+        "cue_audio": [{"id": cue["id"], "audio": cue["audio"]} for cue in package["cues"] if cue.get("audio")],
+    }
+
+
+def subtitle_document(package, timing_profile, result=None):
+    if timing_profile not in TIMING_PROFILES:
+        raise FrameCueError("timing_profile is invalid")
+    result_cues = {row["id"]: row for row in result["cues"]} if result else {}
+    result_blocks = {row["id"]: row for row in result["blocks"]} if result else {}
+    block_by_cue = {}
+    for block in package["blocks"]:
+        for cue_id in block["cue_ids"]:
+            block_by_cue.setdefault(cue_id, block["id"])
+    assets = workspace_assets(package)
+    document = {
+        "schema": SUBTITLE_DOCUMENT_SCHEMA,
+        "workspace_id": package["review_id"],
+        "revision": package["revision"],
+        "revision_kind": "content" if result else "source",
+        "source_checksum": package["content_checksum"],
+        "timing_profile": timing_profile,
+        "cues": [{
+            "id": cue["id"],
+            "source_start_ms": cue["start_ms"],
+            "source_end_ms": cue["end_ms"],
+            "output_start_ms": None,
+            "output_end_ms": None,
+            "source_text": cue.get("original_text", ""),
+            "display_text": result_cues.get(cue["id"], cue)["text"],
+            "speech_text": result_cues.get(cue["id"], cue)["speech_text"],
+            "block_id": block_by_cue.get(cue["id"], ""),
+        } for cue in package["cues"]],
+        "blocks": [{
+            **block,
+            "target_text": result_blocks.get(block["id"], block)["target_text"],
+            "speech_text": result_blocks.get(block["id"], block)["speech_text"],
+        } for block in package["blocks"]],
+        "assets": assets,
+        "source_package": copy.deepcopy(package),
+        "approval_snapshot": copy.deepcopy(result) if result else None,
+    }
+    document["checksum"] = document_checksum(document)
+    return document
+
+
+def open_workspace_database(database):
+    connection = None
+    try:
+        database_path = Path(database).expanduser().resolve()
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(database_path)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS workspaces (
+                review_id TEXT PRIMARY KEY,
+                stage TEXT NOT NULL,
+                current_revision_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS revisions (
+                revision_id INTEGER PRIMARY KEY,
+                review_id TEXT NOT NULL REFERENCES workspaces(review_id),
+                revision TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                parent_revision_id INTEGER REFERENCES revisions(revision_id),
+                checksum TEXT NOT NULL,
+                document_json TEXT NOT NULL,
+                assets_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(review_id, kind, checksum)
+            );
+            CREATE TABLE IF NOT EXISTS work_orders (
+                work_order_id INTEGER PRIMARY KEY,
+                request_id TEXT UNIQUE NOT NULL,
+                review_id TEXT NOT NULL REFERENCES workspaces(review_id),
+                revision_id INTEGER NOT NULL REFERENCES revisions(revision_id),
+                base_revision TEXT NOT NULL,
+                base_checksum TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                candidate_json TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(review_id, base_revision, base_checksum, operation)
+            );
+        """)
+        return connection
+    except (OSError, sqlite3.Error) as error:
+        if connection is not None:
+            connection.close()
+        raise FrameCueError(f"workspace database error: {error}") from error
+
+
+def workspace_row(connection, review_id):
+    row = connection.execute(
+        "SELECT review_id, stage, current_revision_id FROM workspaces WHERE review_id = ?",
+        (review_id,),
+    ).fetchone()
+    if row is None:
+        raise FrameCueError(f"workspace not found: {review_id}")
+    return row
+
+
+def workspace_source_package(connection, workspace):
+    row = connection.execute(
+        "SELECT document_json FROM revisions WHERE revision_id = ?",
+        (workspace["current_revision_id"],),
+    ).fetchone()
+    if row is None:
+        raise FrameCueError(f"workspace has no current revision: {workspace['review_id']}")
+    try:
+        document = json.loads(row["document_json"])
+    except json.JSONDecodeError as error:
+        raise FrameCueError(f"workspace revision is invalid JSON: {workspace['review_id']}") from error
+    package = document.get("source_package")
+    if not isinstance(package, dict):
+        raise FrameCueError(f"workspace source package is missing: {workspace['review_id']}")
+    return document, package
+
+
 def migrate_v1(v1_package_path, semantic_blocks_path, review_id, revision, workflow):
     v1_path = Path(v1_package_path).expanduser().resolve()
     v1 = read_json(v1_path)
@@ -1070,6 +1211,610 @@ def command_collect(args):
     print(json.dumps(summary, ensure_ascii=False))
 
 
+def command_workspace_import(args):
+    package, _ = bundle_summary(args.package)
+    document = subtitle_document(package, args.timing_profile)
+    connection = open_workspace_database(args.database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM workspaces WHERE review_id = ?",
+                (package["review_id"],),
+            ).fetchone():
+                raise FrameCueError(f"workspace already exists: {package['review_id']}")
+            created_at = utc_now()
+            connection.execute(
+                "INSERT INTO workspaces (review_id, stage, current_revision_id, created_at) VALUES (?, ?, NULL, ?)",
+                (package["review_id"], "content_review", created_at),
+            )
+            cursor = connection.execute(
+                """INSERT INTO revisions
+                   (review_id, revision, kind, parent_revision_id, checksum, document_json, assets_json, created_at)
+                   VALUES (?, ?, ?, NULL, ?, ?, ?, ?)""",
+                (
+                    package["review_id"],
+                    package["revision"],
+                    "source",
+                    document["checksum"],
+                    canonical_json(document),
+                    canonical_json(document["assets"]),
+                    created_at,
+                ),
+            )
+            connection.execute(
+                "UPDATE workspaces SET current_revision_id = ? WHERE review_id = ?",
+                (cursor.lastrowid, package["review_id"]),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    print(json.dumps({
+        "workspace_id": package["review_id"],
+        "stage": "content_review",
+        "revision": package["revision"],
+        "checksum": document["checksum"],
+    }, ensure_ascii=False))
+
+
+def complete_content_revision(database, review_id, result):
+    connection = open_workspace_database(database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = workspace_row(connection, review_id)
+            source_document, package = workspace_source_package(connection, workspace)
+            if workspace["stage"] != "content_review":
+                validate_result(result, package, require_approved=True)
+                existing_result = copy.deepcopy(source_document.get("approval_snapshot"))
+                repeated_result = copy.deepcopy(result)
+                if isinstance(existing_result, dict):
+                    existing_result.pop("generated_at", None)
+                if isinstance(repeated_result, dict):
+                    repeated_result.pop("generated_at", None)
+                order = connection.execute(
+                    """SELECT request_id FROM work_orders
+                       WHERE review_id = ? AND revision_id = ? AND base_checksum = ?
+                       ORDER BY work_order_id DESC LIMIT 1""",
+                    (review_id, workspace["current_revision_id"], source_document.get("checksum")),
+                ).fetchone()
+                if (
+                    source_document.get("revision_kind") == "content"
+                    and canonical_json(existing_result) == canonical_json(repeated_result)
+                    and order is not None
+                ):
+                    connection.rollback()
+                    return {
+                        "workspace_id": review_id,
+                        "stage": workspace["stage"],
+                        "request_id": order["request_id"],
+                        "revision": package["revision"],
+                        "checksum": source_document["checksum"],
+                    }
+                raise FrameCueError(f"workspace is not awaiting content review: {review_id}")
+            validate_result(result, package, require_approved=True)
+            document = subtitle_document(package, source_document.get("timing_profile"), result)
+            created_at = utc_now()
+            cursor = connection.execute(
+                """INSERT INTO revisions
+                   (review_id, revision, kind, parent_revision_id, checksum, document_json, assets_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    review_id,
+                    package["revision"],
+                    "content",
+                    workspace["current_revision_id"],
+                    document["checksum"],
+                    canonical_json(document),
+                    canonical_json(document["assets"]),
+                    created_at,
+                ),
+            )
+            next_order = connection.execute(
+                "SELECT COALESCE(MAX(work_order_id), 0) + 1 AS value FROM work_orders"
+            ).fetchone()["value"]
+            request_id = f"req-{next_order:04d}"
+            work_order = {
+                "schema": WORK_ORDER_SCHEMA,
+                "request_id": request_id,
+                "workspace_id": review_id,
+                "operation": "realize_voice_timeline",
+                "base_revision": package["revision"],
+                "base_checksum": document["checksum"],
+                "timing_profile": document["timing_profile"],
+                "target_block_ids": "all",
+                "instructions": [],
+                "required_outputs": ["document", "block_audio", "word_alignment", "timing_audit"],
+                "document": document,
+            }
+            connection.execute(
+                """INSERT INTO work_orders
+                   (request_id, review_id, revision_id, base_revision, base_checksum, operation, status, request_json, candidate_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
+                (
+                    request_id,
+                    review_id,
+                    cursor.lastrowid,
+                    package["revision"],
+                    document["checksum"],
+                    "realize_voice_timeline",
+                    "pending",
+                    canonical_json(work_order),
+                    created_at,
+                ),
+            )
+            connection.execute(
+                "UPDATE workspaces SET stage = ?, current_revision_id = ? WHERE review_id = ?",
+                ("voice_realization_pending", cursor.lastrowid, review_id),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    return {
+        "workspace_id": review_id,
+        "stage": "voice_realization_pending",
+        "request_id": request_id,
+        "revision": package["revision"],
+        "checksum": document["checksum"],
+    }
+
+
+def command_content_complete(args):
+    result = read_json(args.result)
+    print(json.dumps(complete_content_revision(args.database, args.review_id, result), ensure_ascii=False))
+
+
+def make_workspace_server(database, bundle_dir, port=0):
+    directory = Path(bundle_dir).expanduser().resolve()
+    package, _ = bundle_summary(directory / "review_package.json")
+    review_id = package["review_id"]
+    connection = open_workspace_database(database)
+    try:
+        workspace_row(connection, review_id)
+    finally:
+        connection.close()
+    csrf_token = secrets.token_urlsafe(32)
+
+    class WorkspaceHandler(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            self._range_length = None
+            super().__init__(*args, directory=str(directory), **kwargs)
+
+        def translate_path(self, path):
+            request_path = unquote(urlsplit(path).path)
+            if request_path in {"/", "/index.html"}:
+                return str(DIST_DIR / "index.html")
+            if request_path.startswith("/assets/"):
+                viewer_assets = (DIST_DIR / "assets").resolve()
+                candidate = (DIST_DIR / request_path.lstrip("/")).resolve()
+                if candidate.is_file() and candidate.is_relative_to(viewer_assets):
+                    return str(candidate)
+            return super().translate_path(path)
+
+        def send_json(self, status, value):
+            body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_unsatisfiable_range(self, size):
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def send_head(self):
+            self._range_length = None
+            range_header = self.headers.get("Range")
+            path = self.translate_path(self.path)
+            if not range_header or not Path(path).is_file():
+                return super().send_head()
+            file = open(path, "rb")
+            file.seek(0, 2)
+            size = file.tell()
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            if not match or not size:
+                file.close()
+                return self.send_unsatisfiable_range(size)
+            start_text, end_text = match.groups()
+            if not start_text and not end_text:
+                file.close()
+                return self.send_unsatisfiable_range(size)
+            if start_text:
+                start = int(start_text)
+                end = min(int(end_text), size - 1) if end_text else size - 1
+            else:
+                suffix = int(end_text)
+                start = max(0, size - suffix)
+                end = size - 1
+            if start >= size or start > end or (not start_text and not int(end_text)):
+                file.close()
+                return self.send_unsatisfiable_range(size)
+            self._range_length = end - start + 1
+            file.seek(start)
+            self.send_response(206)
+            self.send_header("Content-Type", self.guess_type(path))
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(self._range_length))
+            self.end_headers()
+            return file
+
+        def copyfile(self, source, outputfile):
+            if self._range_length is None:
+                return super().copyfile(source, outputfile)
+            remaining = self._range_length
+            while remaining:
+                chunk = source.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                outputfile.write(chunk)
+                remaining -= len(chunk)
+
+        def do_GET(self):
+            if self.path != "/api/workspace":
+                return super().do_GET()
+            connection = open_workspace_database(database)
+            try:
+                workspace = workspace_row(connection, review_id)
+            finally:
+                connection.close()
+            self.send_json(200, {
+                "mode": "server",
+                "workspace_id": review_id,
+                "stage": workspace["stage"],
+                "content_complete_endpoint": "/api/content-complete",
+                "csrf_token": csrf_token,
+                "endpoint": "/api/content-complete",
+                "csrf": csrf_token,
+            })
+
+        def do_POST(self):
+            if self.path != "/api/content-complete":
+                self.send_error(404)
+                return
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                self.send_error(415)
+                return
+            try:
+                content_length = int(self.headers["Content-Length"])
+            except (KeyError, TypeError, ValueError):
+                self.send_error(411)
+                return
+            if content_length < 0:
+                self.send_error(400)
+                return
+            if content_length > 10 * 1024 * 1024:
+                self.send_error(413)
+                return
+            origin = self.headers.get("Origin", "")
+            parsed_origin = urlsplit(origin)
+            same_host = (
+                parsed_origin.scheme in {"http", "https"}
+                and parsed_origin.netloc == self.headers.get("Host", "")
+                and not parsed_origin.path
+                and not parsed_origin.query
+                and not parsed_origin.fragment
+            )
+            token = self.headers.get("X-FrameCue-CSRF", "")
+            if not same_host or not hmac.compare_digest(token, csrf_token):
+                self.send_error(403)
+                return
+            try:
+                result = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self.send_error(400)
+                return
+            try:
+                summary = complete_content_revision(database, review_id, result)
+            except FrameCueError as error:
+                self.send_json(409, {"error": str(error)})
+                return
+            self.send_json(200, summary)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), WorkspaceHandler)
+    return server
+
+
+def command_workspace_serve(args):
+    server = make_workspace_server(args.database, args.dir, args.port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def command_work_pull(args):
+    connection = open_workspace_database(args.database)
+    try:
+        try:
+            workspace_row(connection, args.review_id)
+            orders = connection.execute(
+                """SELECT request_id, request_json FROM work_orders
+                   WHERE review_id = ? AND status = 'pending'
+                   ORDER BY work_order_id DESC LIMIT 2""",
+                (args.review_id,),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise FrameCueError(f"workspace database error: {error}") from error
+    finally:
+        connection.close()
+    if not orders:
+        raise FrameCueError(f"workspace has no pending work order: {args.review_id}")
+    if len(orders) != 1:
+        raise FrameCueError(f"workspace has multiple pending work orders: {args.review_id}")
+    try:
+        work_order = json.loads(orders[0]["request_json"])
+    except json.JSONDecodeError as error:
+        raise FrameCueError(f"work order is invalid JSON: {orders[0]['request_id']}") from error
+    if work_order.get("request_id") != orders[0]["request_id"]:
+        raise FrameCueError(f"work order request ID does not match storage: {orders[0]['request_id']}")
+    try:
+        out_path = Path(args.out).expanduser().resolve()
+        if out_path.exists():
+            raise FrameCueError(f"refusing to overwrite work order: {out_path}")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(out_path, work_order)
+    except OSError as error:
+        raise FrameCueError(f"unable to write work order: {out_path}: {error}") from error
+    print(json.dumps({
+        "workspace_id": args.review_id,
+        "request_id": orders[0]["request_id"],
+        "out": str(out_path),
+    }, ensure_ascii=False))
+
+
+def verify_candidate_asset(candidate_root, asset, label):
+    if not isinstance(asset, dict):
+        raise FrameCueError(f"{label} evidence must be an object")
+    path_value = asset.get("path")
+    checksum = asset.get("sha256")
+    if not isinstance(path_value, str) or not path_value:
+        raise FrameCueError(f"{label} evidence path is invalid")
+    if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise FrameCueError(f"{label} evidence sha256 is invalid")
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = candidate_root / path
+    path = path.resolve()
+    if not path.is_file():
+        raise FrameCueError(f"{label} evidence file is missing: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != checksum:
+        raise FrameCueError(f"{label} evidence sha256 does not match: {path}")
+    return path
+
+
+def validate_candidate_wav(path, label):
+    try:
+        with wave.open(str(path), "rb") as audio:
+            frame = audio.readframes(1)
+            if audio.getnframes() < 1 or len(frame) != audio.getnchannels() * audio.getsampwidth():
+                raise FrameCueError(f"{label} evidence WAV is empty or truncated: {path}")
+    except (EOFError, wave.Error) as error:
+        raise FrameCueError(f"{label} evidence is not a decodable WAV: {path}") from error
+
+
+def validate_word_alignment_evidence(path, order, document):
+    alignment = read_json(path)
+    if not isinstance(alignment, dict):
+        raise FrameCueError("candidate word alignment evidence must be an object")
+    if alignment.get("schema") != "agenticdub_word_alignment_v1":
+        raise FrameCueError("candidate word alignment evidence schema is invalid")
+    if alignment.get("request_id") != order["request_id"]:
+        raise FrameCueError("candidate word alignment evidence request_id does not match work order")
+    if alignment.get("base_checksum") != order["base_checksum"]:
+        raise FrameCueError("candidate word alignment evidence base_checksum does not match work order")
+    if alignment.get("document_checksum") != document["checksum"]:
+        raise FrameCueError("candidate word alignment evidence document_checksum does not match candidate")
+    expected_cues = [{
+        "id": cue["id"],
+        "start_ms": cue["output_start_ms"],
+        "end_ms": cue["output_end_ms"],
+    } for cue in document["cues"]]
+    if canonical_json(alignment.get("cues")) != canonical_json(expected_cues):
+        raise FrameCueError("candidate word alignment evidence cue ranges do not match candidate")
+
+
+def validate_timing_audit_evidence(path, order, document):
+    audit = read_json(path)
+    if not isinstance(audit, dict):
+        raise FrameCueError("candidate timing audit evidence must be an object")
+    if audit.get("schema") != "agenticdub_timing_audit_v1":
+        raise FrameCueError("candidate timing audit evidence schema is invalid")
+    if audit.get("request_id") != order["request_id"]:
+        raise FrameCueError("candidate timing audit evidence request_id does not match work order")
+    if audit.get("base_checksum") != order["base_checksum"]:
+        raise FrameCueError("candidate timing audit evidence base_checksum does not match work order")
+    if audit.get("document_checksum") != document["checksum"]:
+        raise FrameCueError("candidate timing audit evidence document_checksum does not match candidate")
+    if audit.get("timing_profile") != document["timing_profile"]:
+        raise FrameCueError("candidate timing audit evidence timing_profile does not match candidate")
+    if audit.get("status") != "passed":
+        raise FrameCueError("candidate timing audit evidence status is not passed")
+    if type(audit.get("overlap_count")) is not int or audit["overlap_count"] != 0:
+        raise FrameCueError("candidate timing audit evidence overlap_count is not zero")
+
+
+def validate_candidate_evidence(candidate, order, document, base_blocks, candidate_root):
+    validation = candidate.get("validation")
+    if not isinstance(validation, dict):
+        raise FrameCueError("candidate validation must be an object")
+    if validation.get("word_alignment_status") != "passed":
+        raise FrameCueError("candidate word_alignment_status is not passed")
+    if validation.get("timing_audit_status") != "passed":
+        raise FrameCueError("candidate timing_audit_status is not passed")
+
+    assets = candidate.get("assets")
+    if not isinstance(assets, dict):
+        raise FrameCueError("candidate assets must be an object")
+    block_audio = assets.get("block_audio")
+    if not isinstance(block_audio, list) or not all(isinstance(asset, dict) for asset in block_audio):
+        raise FrameCueError("candidate block_audio evidence must be an array of objects")
+    block_ids = [block.get("id") for block in base_blocks]
+    if [asset.get("block_id") for asset in block_audio] != block_ids:
+        raise FrameCueError("candidate block_audio evidence IDs do not match base blocks")
+    for asset in block_audio:
+        label = f"candidate block audio {asset['block_id']}"
+        validate_candidate_wav(verify_candidate_asset(candidate_root, asset, label), label)
+    word_alignment = verify_candidate_asset(candidate_root, assets.get("word_alignment"), "candidate word alignment")
+    validate_word_alignment_evidence(word_alignment, order, document)
+    timing_audit = verify_candidate_asset(candidate_root, assets.get("timing_audit"), "candidate timing audit")
+    validate_timing_audit_evidence(timing_audit, order, document)
+
+
+def validate_candidate_document_immutable(base_document, document):
+    expected = copy.deepcopy(base_document)
+    submitted = copy.deepcopy(document)
+    expected.pop("checksum", None)
+    submitted.pop("checksum", None)
+    submitted["revision_kind"] = expected.get("revision_kind")
+    for base_cue, candidate_cue in zip(expected["cues"], submitted["cues"]):
+        candidate_cue["output_start_ms"] = base_cue.get("output_start_ms")
+        candidate_cue["output_end_ms"] = base_cue.get("output_end_ms")
+    if canonical_json(submitted) != canonical_json(expected):
+        raise FrameCueError("candidate document changes immutable base fields")
+
+
+def command_work_submit(args):
+    candidate = read_json(args.candidate)
+    if not isinstance(candidate, dict):
+        raise FrameCueError("candidate revision must be an object")
+    request_id = candidate.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise FrameCueError("candidate request_id is required")
+
+    connection = open_workspace_database(args.database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            orders = connection.execute(
+                """SELECT work_orders.work_order_id, work_orders.request_id, work_orders.review_id,
+                          work_orders.base_revision, work_orders.base_checksum, revisions.document_json
+                   FROM work_orders
+                   JOIN revisions ON revisions.revision_id = work_orders.revision_id
+                   WHERE work_orders.request_id = ? AND work_orders.status = 'pending'""",
+                (request_id,),
+            ).fetchall()
+            if not orders:
+                raise FrameCueError(f"work order is not pending: {request_id}")
+            if len(orders) != 1:
+                raise FrameCueError(f"work order is not unique: {request_id}")
+            order = orders[0]
+
+            if candidate.get("schema") != CANDIDATE_REVISION_SCHEMA:
+                raise FrameCueError("candidate schema is invalid")
+            if candidate.get("status") != "ready_for_review":
+                raise FrameCueError("candidate status is not ready_for_review")
+            if candidate.get("base_revision") != order["base_revision"]:
+                raise FrameCueError("candidate base_revision does not match work order")
+            if candidate.get("base_checksum") != order["base_checksum"]:
+                raise FrameCueError("candidate base_checksum does not match work order")
+            try:
+                base_document = json.loads(order["document_json"])
+            except json.JSONDecodeError as error:
+                raise FrameCueError(f"work order base document is invalid JSON: {request_id}") from error
+            if not isinstance(base_document, dict):
+                raise FrameCueError(f"work order base document is invalid: {request_id}")
+            if (
+                base_document.get("checksum") != order["base_checksum"]
+                or document_checksum(base_document) != order["base_checksum"]
+            ):
+                raise FrameCueError(f"work order base checksum does not match storage: {request_id}")
+
+            document = candidate.get("document")
+            if not isinstance(document, dict):
+                raise FrameCueError("candidate document must be an object")
+            if document.get("schema") != SUBTITLE_DOCUMENT_SCHEMA:
+                raise FrameCueError("candidate document schema is invalid")
+            if document.get("revision_kind") != "voice_aligned":
+                raise FrameCueError("candidate document revision_kind is invalid")
+            if document.get("workspace_id") != order["review_id"]:
+                raise FrameCueError("candidate document workspace_id does not match work order")
+            if document.get("checksum") != document_checksum(document):
+                raise FrameCueError("candidate document checksum does not match content")
+
+            base_cues = base_document.get("cues")
+            candidate_cues = document.get("cues")
+            base_blocks = base_document.get("blocks")
+            candidate_blocks = document.get("blocks")
+            if not all(isinstance(rows, list) for rows in (base_cues, candidate_cues, base_blocks, candidate_blocks)):
+                raise FrameCueError("candidate document cues and blocks must be arrays")
+            if not all(isinstance(row, dict) for row in base_cues + base_blocks):
+                raise FrameCueError(f"work order base document is invalid: {request_id}")
+            if not all(isinstance(row, dict) for row in candidate_cues + candidate_blocks):
+                raise FrameCueError("candidate document cues and blocks must contain objects")
+            if [cue.get("id") for cue in candidate_cues] != [cue.get("id") for cue in base_cues]:
+                raise FrameCueError("candidate cue IDs do not match base document")
+            if [block.get("id") for block in candidate_blocks] != [block.get("id") for block in base_blocks]:
+                raise FrameCueError("candidate block IDs do not match base document")
+            previous_output_end = None
+            for cue in candidate_cues:
+                output_start = cue.get("output_start_ms")
+                output_end = cue.get("output_end_ms")
+                if type(output_start) is not int or output_start < 0:
+                    raise FrameCueError(f"candidate cue output_start_ms is invalid: {cue.get('id')}")
+                if type(output_end) is not int or output_end < 0:
+                    raise FrameCueError(f"candidate cue output_end_ms is invalid: {cue.get('id')}")
+                if output_start >= output_end:
+                    raise FrameCueError(f"candidate cue output range is invalid: {cue.get('id')}")
+                if previous_output_end is not None and output_start < previous_output_end:
+                    raise FrameCueError(f"candidate cue output ranges overlap: {cue.get('id')}")
+                previous_output_end = output_end
+
+            validate_candidate_document_immutable(base_document, document)
+            candidate_root = Path(args.candidate).expanduser().resolve().parent
+            validate_candidate_evidence(candidate, order, document, base_blocks, candidate_root)
+
+            if connection.execute(
+                """UPDATE work_orders SET status = ?, candidate_json = ?
+                   WHERE work_order_id = ? AND status = 'pending'""",
+                ("candidate_ready", canonical_json(candidate), order["work_order_id"]),
+            ).rowcount != 1:
+                raise FrameCueError(f"work order is not pending: {request_id}")
+            if connection.execute(
+                "UPDATE workspaces SET stage = ? WHERE review_id = ?",
+                ("audiovisual_review", order["review_id"]),
+            ).rowcount != 1:
+                raise FrameCueError(f"workspace not found: {order['review_id']}")
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    print(json.dumps({
+        "stage": "audiovisual_review",
+        "status": "candidate_ready",
+        "request_id": request_id,
+    }, ensure_ascii=False))
+
+
 def command_migrate(args):
     source = migrate_v1(args.package, args.semantic_blocks, args.review_id, args.revision, args.workflow)
     summary = build_package(source, Path(args.package).expanduser().resolve().parent, args.out_dir, args.viewer_version)
@@ -1133,6 +1878,35 @@ def parser():
     collect.add_argument("--result", required=True)
     collect.add_argument("--out")
     collect.set_defaults(func=command_collect)
+
+    workspace_import = commands.add_parser("workspace-import", help="import an immutable v2 package into a local subtitle workspace")
+    workspace_import.add_argument("--database", required=True)
+    workspace_import.add_argument("--package", required=True)
+    workspace_import.add_argument("--timing-profile", choices=sorted(TIMING_PROFILES), required=True)
+    workspace_import.set_defaults(func=command_workspace_import)
+
+    content_complete = commands.add_parser("content-complete", help="save an approved content revision and create its pending work order")
+    content_complete.add_argument("--database", required=True)
+    content_complete.add_argument("--review-id", required=True)
+    content_complete.add_argument("--result", required=True)
+    content_complete.set_defaults(func=command_content_complete)
+
+    workspace_serve = commands.add_parser("workspace-serve", help="serve one local subtitle workspace")
+    workspace_serve.add_argument("--database", required=True)
+    workspace_serve.add_argument("--dir", required=True)
+    workspace_serve.add_argument("--port", type=int, default=3069)
+    workspace_serve.set_defaults(func=command_workspace_serve)
+
+    work_pull = commands.add_parser("work-pull", help="write the workspace's pending work order")
+    work_pull.add_argument("--database", required=True)
+    work_pull.add_argument("--review-id", required=True)
+    work_pull.add_argument("--out", required=True)
+    work_pull.set_defaults(func=command_work_pull)
+
+    work_submit = commands.add_parser("work-submit", help="save a voice-aligned candidate revision for audiovisual review")
+    work_submit.add_argument("--database", required=True)
+    work_submit.add_argument("--candidate", required=True)
+    work_submit.set_defaults(func=command_work_submit)
 
     migrate = commands.add_parser("migrate-v1", help="create a new v2 revision from a v1 package")
     migrate.add_argument("--package", required=True)

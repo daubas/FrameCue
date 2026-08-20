@@ -1,7 +1,7 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: implementation complete; latest validated runtime pinned at `v2.6.0`
-Last updated: 2026-08-07
+Status: v2 static runtime complete at `v2.6.0`; subtitle Workspace refactor in progress
+Last updated: 2026-08-20
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
 
@@ -10,6 +10,23 @@ Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md
 This is the canonical implementation note for the FrameCue v2 refactor. It records the agreed product boundary, contracts, rollout order, validation gates, and implementation feedback. Update this document as implementation or user feedback changes the plan.
 
 FrameCue v2 has one job: provide a portable, static human-review gate for media-aligned content. Subtitle generation, translation, speech synthesis, and rendering stay outside FrameCue.
+
+## 2026-08-20 — Subtitle Workspace extension
+
+The v2 static package/result contract remains immutable and portable. The new
+subtitle Workspace adds a same-machine SQLite/CLI path around that contract so
+the reviewer no longer has to download a result before the agent continues.
+FrameCue still does not run TTS: it owns revisions and Work Orders; AgenticDub
+returns a checksum-bound Candidate with audio/alignment/timing evidence.
+
+The first implemented slice imports Peter r2 without modifying its bundle,
+serves the current viewer with Range 206 media, stores an approved Content
+Revision and pending Work Order in one idempotent transaction, and accepts only
+Candidates that preserve approved content and carry SHA-256-verified evidence.
+AgenticDub currently supports validation and dry-run planning only; formal TTS,
+audiovisual exception review, scoped reruns, portable Work Order bundles, and
+final acceptance remain pending. The current contract and rollout order live in
+[`subtitle-workspace-agenticdub-refactor-plan.md`](subtitle-workspace-agenticdub-refactor-plan.md).
 
 ## Success Criteria
 

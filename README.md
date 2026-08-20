@@ -222,5 +222,6 @@ Markdown bundles, including workflow-specific result actions.
 ## Architecture Notes
 
 - [FrameCue v2 refactor implementation note](docs/framecue-v2-refactor-implementation-note.md)
+- [Subtitle Workspace × AgenticDub refactor plan](docs/subtitle-workspace-agenticdub-refactor-plan.md)
 - [HyperFrames Review Player integration proposal](docs/hyperframes-review-integration.md)
 - [HyperFrames Review Player implementation note](docs/hyperframes-review-implementation-note.md)

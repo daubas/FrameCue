@@ -5,6 +5,7 @@
   import DetailsPanel from "./components/DetailsPanel.svelte";
   import { downloadText, resultFileName } from "./lib/download.js";
   import { loadDraft, removeDraft, saveDraft } from "./lib/storage.js";
+  import { isWorkspaceSubmitted, loadWorkspaceConfig, submitApprovedResult } from "./lib/workspace.js";
   import {
     approveReviewedBlock,
     blockContentIssue,
@@ -29,6 +30,10 @@
   let currentItemId = "";
   let loading = true;
   let error = "";
+  let workspace = null;
+  let workspaceError = "";
+  let workspaceSubmitting = false;
+  let workspaceSubmitted = false;
   let stageMode = "still";
   let playbackCueId = "";
 
@@ -61,6 +66,8 @@
   async function loadItem(item) {
     loading = true;
     error = "";
+    workspaceError = "";
+    workspaceSubmitted = isWorkspaceSubmitted(workspace);
     playbackCueId = "";
     stageMode = "still";
     try {
@@ -84,6 +91,8 @@
 
   async function boot() {
     try {
+      workspace = await loadWorkspaceConfig({ baseHref: window.location.href });
+      workspaceSubmitted = isWorkspaceSubmitted(workspace);
       const response = await fetch("framecue_manifest.json", { cache: "no-store" });
       if (response.ok) {
         const manifest = await response.json();
@@ -178,10 +187,38 @@
     return count;
   }
 
-  function approvePackage() {
+  async function approvePackage() {
     if (!approvalAllowed) return;
-    const approvedAt = new Date().toISOString();
-    persist({ ...draft, final_approval: { approved_at: approvedAt } });
+    if (workspaceSubmitting || (workspace && workspaceSubmitted)) return;
+    const approvedAt = draft.final_approval?.approved_at || new Date().toISOString();
+    const approvedDraft = draft.final_approval
+      ? draft
+      : { ...draft, final_approval: { approved_at: approvedAt } };
+    persist(approvedDraft);
+    if (!workspace) return;
+    workspaceSubmitting = true;
+    workspaceError = "";
+    try {
+      await submitApprovedResult(packageData, approvedDraft, workspace, { baseHref: window.location.href });
+      workspaceSubmitted = true;
+    } catch (cause) {
+      try {
+        const refreshedWorkspace = await loadWorkspaceConfig({ baseHref: window.location.href });
+        if (isWorkspaceSubmitted(refreshedWorkspace)) {
+          workspace = refreshedWorkspace;
+          workspaceSubmitted = true;
+          workspaceError = "";
+          return;
+        }
+        if (refreshedWorkspace) workspace = refreshedWorkspace;
+      } catch {
+        // Keep the local approval and the existing server config available for retry.
+      }
+      workspaceSubmitted = false;
+      workspaceError = "同步失敗，仍可輸出審閱結果";
+    } finally {
+      workspaceSubmitting = false;
+    }
   }
 
   function downloadResult() {
@@ -281,11 +318,18 @@
           <button type="button" on:click={downloadSrt}>輸出 SRT</button>
         {/if}
         <button type="button" on:click={downloadResult}>輸出審閱結果</button>
-        <button class:approved={Boolean(draft.final_approval)} class="approve-package" disabled={!approvalAllowed || Boolean(draft.final_approval)} type="button" on:click={approvePackage}>
-          {draft.final_approval ? "套件已核准" : "核准套件"}
+        <button class:approved={workspace ? workspaceSubmitted : Boolean(draft.final_approval)} class="approve-package" disabled={!approvalAllowed || workspaceSubmitting || (workspace ? workspaceSubmitted : Boolean(draft.final_approval))} type="button" on:click={approvePackage}>
+          {#if workspace}
+            {workspaceSubmitting ? "處理中" : workspaceSubmitted ? "內容已送出" : workspaceError ? "重新送出" : "完成內容審查"}
+          {:else}
+            {draft.final_approval ? "套件已核准" : "核准套件"}
+          {/if}
         </button>
         <button class="icon-button" type="button" title="只捨棄這個修訂版的瀏覽器草稿" aria-label="捨棄瀏覽器草稿" on:click={resetDraft}>↺</button>
       </div>
+      {#if workspaceError}
+        <p class="workspace-error" role="alert">{workspaceError}</p>
+      {/if}
     </header>
 
     <div class="review-grid">
