@@ -264,11 +264,28 @@
     }
   }
 
+  async function toggleSelectedIssue() {
+    const selectedIssues = (snapshot.issues || []).filter((issue) => issue.cue_ids?.includes(selectedCue.id));
+    if (!selectedIssues.length) {
+      await submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" });
+      return;
+    }
+    for (const issue of selectedIssues) {
+      await submit({
+        kind: "flag",
+        cue_ids: issue.cue_ids,
+        categories: [issue.category],
+        author: snapshot.display_name || "reviewer",
+        enabled: false
+      });
+    }
+  }
+
   function handleKeys(event) {
     const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target?.tagName);
-    if (!editing && event.key.toLowerCase() === "m" && canEdit && !selectedHasIssue) {
+    if (!editing && event.key.toLowerCase() === "m" && canEdit) {
       event.preventDefault();
-      submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" });
+      toggleSelectedIssue();
     }
     if (editing && event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
@@ -371,8 +388,8 @@
           <div class="cue-actions">
             <button type="button" disabled={!canEdit} on:click={splitCue}>從游標切開</button>
             <button type="button" disabled={!canEdit || !nextMergeCue} on:click={() => structuralOperation({ kind: "merge", cue_id: selectedCue.id, adjacent_cue_id: nextMergeCue.id }, [selectedCue.id, nextMergeCue.id])}>與下一句合併</button>
-            <button type="button" class:flagged={selectedHasIssue} disabled={!canEdit || selectedHasIssue} on:click={() => submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" })}>
-              {selectedHasIssue ? "已標記需修改" : "標記需修改"}
+            <button type="button" class:flagged={selectedHasIssue} disabled={!canEdit} on:click={toggleSelectedIssue}>
+              {selectedHasIssue ? "取消需修改" : "標記需修改"}
             </button>
           </div>
         </div>

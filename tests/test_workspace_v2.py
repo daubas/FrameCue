@@ -296,6 +296,23 @@ class WorkspaceV2Tests(unittest.TestCase):
                 self.assertEqual(issue["authors"], ["lead", "peer"])
                 self.assertEqual(issue["notes"], ["術語需要確認", "請由 agent 一併處理"])
 
+            removed = json.loads(self._apply(
+                root,
+                database,
+                package["review_id"],
+                "unflag.json",
+                {
+                    "kind": "flag",
+                    "draft_version": 2,
+                    "cue_ids": ["c0001", "c0002"],
+                    "categories": ["translation"],
+                    "author": "lead",
+                    "enabled": False,
+                },
+            ).stdout)
+            self.assertEqual(removed["draft_version"], 3)
+            self.assertEqual([issue["category"] for issue in removed["issues"]], ["terminology"])
+
     def test_clean_completion_creates_one_content_revision_and_voice_order(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-v2-clean-complete-") as temp:
             root = Path(temp)

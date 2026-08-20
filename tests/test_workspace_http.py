@@ -594,6 +594,36 @@ class WorkspaceHTTPTests(unittest.TestCase):
                 self.assertEqual(changed["draft_version"], 1)
                 self.assertEqual(changed["document"]["cues"][0]["display_text"], "已由伺服器保存的字幕")
 
+                _, _, flagged = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "flag",
+                        "draft_version": 1,
+                        "cue_ids": ["c0001"],
+                        "categories": ["other"],
+                        "author": "Alice",
+                    },
+                    headers=operation_headers,
+                )
+                self.assertEqual(len(flagged["issues"]), 1)
+                _, _, unflagged = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "flag",
+                        "draft_version": 2,
+                        "cue_ids": ["c0001"],
+                        "categories": ["other"],
+                        "author": "Alice",
+                        "enabled": False,
+                    },
+                    headers=operation_headers,
+                )
+                self.assertEqual(unflagged["issues"], [])
+
                 events = urllib.request.Request(
                     f"{base}/api/workspace/events",
                     headers={

@@ -1178,6 +1178,9 @@ def apply_draft_flag(document, issues, operation):
     categories = operation.get("categories")
     if not isinstance(categories, list) or not categories or not all(isinstance(category, str) and category for category in categories):
         raise FrameCueError("draft flag categories must be a non-empty string array")
+    enabled = operation.get("enabled", True)
+    if type(enabled) is not bool:
+        raise FrameCueError("draft flag enabled must be a boolean")
     author = as_text(operation.get("author", "local"), "draft flag author")
     note = as_text(operation.get("note", ""), "draft flag note")
     if not author:
@@ -1186,6 +1189,10 @@ def apply_draft_flag(document, issues, operation):
         raise FrameCueError("workspace draft issues are invalid")
     for category in sorted(set(categories)):
         issue = next((row for row in issues if isinstance(row, dict) and row.get("cue_ids") == cue_ids and row.get("category") == category), None)
+        if not enabled:
+            if issue is not None:
+                issues.remove(issue)
+            continue
         if issue is None:
             issue = {
                 "flag_id": opaque_id("flag"),
