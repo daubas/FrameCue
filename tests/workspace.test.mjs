@@ -223,7 +223,12 @@ const workspaceSnapshot = {
   workspace_id: "fixture-workspace",
   stage: "content_review",
   draft_version: 3,
+  snapshot_version: 7,
   csrf_token: "workspace-token",
+  session_id: "session-alice",
+  lead_session_id: "session-alice",
+  participants: [{ session_id: "session-alice", display_name: "Alice", dirty: false, selected_cue_id: "c0001" }],
+  locks: [],
   document: {
     schema: "framecue_subtitle_document_v2",
     cues: [{ id: "c0001", display_text: "哈囉", speech_text: "哈囉。", source_start_ms: 0, source_end_ms: 1000 }],
@@ -251,6 +256,20 @@ test("loads the Workspace v2 snapshot and keeps a missing endpoint in static mod
     fetchImpl: async () => ({ ok: false, status: 404 }),
     baseHref: "https://framecue.test/reviews/index.html"
   }), null);
+});
+
+test("rejects Workspace snapshots without collaboration identity", async () => {
+  await assert.rejects(
+    () => loadWorkspaceSnapshot({
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ ...workspaceSnapshot, session_id: undefined })
+      }),
+      baseHref: "https://framecue.test/reviews/index.html"
+    }),
+    /session_id/
+  );
 });
 
 test("submits one version-bound Workspace operation with same-origin CSRF", async () => {

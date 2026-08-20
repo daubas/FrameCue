@@ -14,5 +14,13 @@ test("Workspace v2 has its own reverse-approval shell while static pages keep Ap
   assert.match(shell, /完成本輪/);
   assert.match(shell, /submitWorkspaceOperation/);
   assert.match(shell, /completeWorkspaceRound/);
+  assert.match(shell, /kind: "presence"/);
+  assert.match(shell, /kind: "lock"/);
+  assert.match(shell, /kind: "unlock"/);
+  assert.match(shell, /kind: "dirty", dirty: true/);
+  assert.match(shell, /800/);
+  assert.match(shell, /5000/);
+  assert.match(shell, /lead_session_id === snapshot\.session_id/);
+  assert.match(shell, /等待 .*lead/i);
   assert.doesNotMatch(shell, /已審|reviewed_cues|完成百分比/);
 });

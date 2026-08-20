@@ -18,9 +18,16 @@
   let stageMode = snapshot.document.source_package?.media?.video ? "video" : "still";
   let connected = true;
   let syncing = false;
+  let localDirty = false;
+  let busy = false;
   let completing = false;
   let phone = false;
   let message = "";
+  let heldCueIds = [];
+  let saveTimer;
+  let renewTimer;
+  let dirtyPromise = Promise.resolve();
+  let savePromise = null;
 
   $: cues = snapshot.document.cues || [];
   $: selectedCue = cues.find((cue) => cue.id === selectedCueId) || cues[0] || null;
@@ -52,7 +59,13 @@
   $: issueCount = new Set((snapshot.issues || []).map((issue) => issue.range_id || issue.flag_id)).size;
   $: selectedHasIssue = Boolean(selectedCue && (snapshot.issues || []).some((issue) => issue.cue_ids?.includes(selectedCue.id)));
   $: agentPending = snapshot.stage.endsWith("_pending");
-  $: canEdit = snapshot.stage === "content_review" && connected && !syncing && !completing && !phone;
+  $: selectedLock = snapshot.locks.find((lock) => lock.cue_id === selectedCue?.id) || null;
+  $: lockedByOther = Boolean(selectedLock && selectedLock.session_id !== snapshot.session_id);
+  $: isLead = snapshot.lead_session_id === snapshot.session_id;
+  $: leadName = snapshot.participants.find((participant) => participant.session_id === snapshot.lead_session_id)?.display_name || "lead";
+  $: canEdit = snapshot.stage === "content_review" && connected && !busy && !completing && !phone && !lockedByOther;
+  $: canType = canEdit && heldCueIds.includes(selectedCue?.id);
+  $: canComplete = canEdit && isLead && !localDirty && !snapshot.participants.some((participant) => participant.dirty) && !snapshot.locks.length;
   $: nextMergeCue = (() => {
     const index = cues.findIndex((cue) => cue.id === selectedCue?.id);
     const next = cues[index + 1];
@@ -61,6 +74,17 @@
 
   function assetUrl(path) {
     return new URL(path || "", window.location.href).href;
+  }
+
+  function mergeSnapshot(changed) {
+    if (!changed?.document || changed.snapshot_version < snapshot.snapshot_version) return;
+    snapshot = { ...snapshot, ...changed, schema: snapshot.schema, csrf_token: snapshot.csrf_token };
+  }
+
+  async function post(operation) {
+    const changed = await submitWorkspaceOperation(snapshot, operation, { baseHref: window.location.href });
+    mergeSnapshot(changed);
+    return changed;
   }
 
   async function reload() {
@@ -78,39 +102,156 @@
   }
 
   async function submit(operation) {
-    if (!canEdit) return;
+    if (!canEdit) return null;
     syncing = true;
     message = "";
     try {
-      const changed = await submitWorkspaceOperation(snapshot, operation, { baseHref: window.location.href });
-      snapshot = { ...snapshot, ...changed, schema: snapshot.schema, csrf_token: snapshot.csrf_token };
-      if (!snapshot.document.cues.some((cue) => cue.id === selectedCueId)) {
-        selectedCueId = changed.document.cues.find((cue) => changed.operation?.cue_ids?.includes(cue.id))?.id
-          || changed.document.cues[0]?.id
-          || "";
-      }
+      return await post(operation);
     } catch (cause) {
       message = cause?.message || "修改同步失敗";
       await reload();
+      return null;
     } finally {
       syncing = false;
     }
   }
 
+  function stopRenewing() {
+    clearInterval(renewTimer);
+    renewTimer = undefined;
+  }
+
+  async function lockCues(cueIds) {
+    const changed = await post({ kind: "lock", cue_ids: cueIds });
+    heldCueIds = [...cueIds];
+    return changed;
+  }
+
+  async function unlockCues(cueIds = heldCueIds) {
+    const existing = cueIds.filter((cueId) => snapshot.document.cues.some((cue) => cue.id === cueId));
+    heldCueIds = [];
+    if (existing.length) await post({ kind: "unlock", cue_ids: existing });
+  }
+
+  async function focusEditor() {
+    if (!canEdit || !selectedCue) return;
+    try {
+      await lockCues([selectedCue.id]);
+      stopRenewing();
+      renewTimer = setInterval(async () => {
+        if (document.activeElement !== editor || !heldCueIds.length) return;
+        try {
+          await lockCues(heldCueIds);
+        } catch {
+          connected = false;
+          stopRenewing();
+        }
+      }, 5000);
+    } catch (cause) {
+      message = cause?.message || "這句字幕正由其他人修改";
+      await reload();
+      editor?.blur();
+    }
+  }
+
+  function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveText, 800);
+  }
+
+  function handleInput() {
+    if (!canType) return;
+    window.dispatchEvent(new Event("framecue:pause-playback"));
+    if (!localDirty) {
+      localDirty = true;
+      dirtyPromise = post({ kind: "dirty", dirty: true }).catch(async (cause) => {
+        message = cause?.message || "無法同步編輯狀態";
+        await reload();
+      });
+    }
+    scheduleSave();
+  }
+
   async function saveText() {
-    if (!selectedCue || editText === selectedCue.display_text) return;
-    await submit({ kind: "edit", cue_id: selectedCue.id, display_text: editText });
+    if (savePromise) return savePromise;
+    clearTimeout(saveTimer);
+    savePromise = (async () => {
+      await dirtyPromise;
+      const cue = snapshot.document.cues.find((item) => item.id === editCueId);
+      try {
+        if (cue && editText !== cue.display_text) {
+          syncing = true;
+          await post({ kind: "edit", cue_id: cue.id, display_text: editText });
+          heldCueIds = [];
+          if (document.activeElement === editor) await lockCues([cue.id]);
+        }
+        if (localDirty) await post({ kind: "dirty", dirty: false });
+        localDirty = false;
+        message = "";
+      } catch (cause) {
+        message = cause?.message || "修改同步失敗";
+        await reload();
+        if (document.activeElement === editor) scheduleSave();
+      } finally {
+        syncing = false;
+      }
+    })();
+    try {
+      await savePromise;
+    } finally {
+      savePromise = null;
+    }
+  }
+
+  async function leaveEditor() {
+    stopRenewing();
+    await saveText();
+    try {
+      await unlockCues();
+    } catch {
+      await reload();
+    }
+  }
+
+  async function selectCue(cueId) {
+    if (cueId === selectedCueId) return;
+    await leaveEditor();
+    selectedCueId = cueId;
+    await post({ kind: "presence", selected_cue_id: cueId });
+  }
+
+  async function structuralOperation(operation, cueIds) {
+    if (!canEdit) return;
+    await leaveEditor();
+    busy = true;
+    message = "";
+    try {
+      await lockCues(cueIds);
+      const changed = await post(operation);
+      heldCueIds = [];
+      selectedCueId = changed.document.cues.find((cue) => operation.cue_id === cue.id)?.id
+        || changed.document.cues.find((cue) => operation.cue_id && cue.lineage?.parent_cue_ids?.includes(operation.cue_id))?.id
+        || changed.document.cues[0]?.id
+        || "";
+      await post({ kind: "presence", selected_cue_id: selectedCueId });
+    } catch (cause) {
+      message = cause?.message || "字幕結構修改失敗";
+      try { await unlockCues(); } catch { /* server may have already released transformed Cue IDs */ }
+      await reload();
+    } finally {
+      busy = false;
+    }
   }
 
   async function splitCue() {
     const cursor = editor?.selectionStart;
     if (!Number.isInteger(cursor)) return;
-    await submit({ kind: "split", cue_id: selectedCue.id, cursor });
+    await structuralOperation({ kind: "split", cue_id: selectedCue.id, cursor }, [selectedCue.id]);
   }
 
   async function completeRound() {
-    if (!canEdit) return;
-    await saveText();
+    if (!canComplete) return;
+    await leaveEditor();
     completing = true;
     message = "";
     try {
@@ -141,6 +282,7 @@
     updatePhone();
     phoneQuery.addEventListener("change", updatePhone);
     window.addEventListener("keydown", handleKeys);
+    post({ kind: "presence", selected_cue_id: selectedCueId }).catch(() => { connected = false; });
     const stream = openWorkspaceEvents({
       baseHref: window.location.href,
       onChange: reload,
@@ -148,6 +290,8 @@
       onError: () => { connected = false; }
     });
     return () => {
+      clearTimeout(saveTimer);
+      stopRenewing();
       stream.close();
       phoneQuery.removeEventListener("change", updatePhone);
       window.removeEventListener("keydown", handleKeys);
@@ -160,14 +304,15 @@
     <div>
       <strong>FrameCue</strong>
       <span>{snapshot.workspace_id}</span>
+      <span>{snapshot.participants.map((participant) => participant.display_name).join(" · ")}</span>
     </div>
     <div class="workspace-counts" aria-label="本輪摘要">
       <span>需修改 {issueCount}</span>
       <span>直接修改 {snapshot.direct_edit_count || 0}</span>
-      <span class:warning={!connected}>{syncing ? "同步中" : connected ? "已同步" : "已離線"}</span>
+      <span class:warning={!connected || localDirty}>{localDirty ? "尚未同步" : syncing ? "同步中" : connected ? "已同步" : "已離線"}</span>
     </div>
-    <button type="button" class="complete" disabled={!canEdit} on:click={completeRound}>
-      {completing ? "完成中…" : "完成本輪"}
+    <button type="button" class="complete" disabled={!canComplete} on:click={completeRound}>
+      {isLead ? completing ? "完成中…" : "完成本輪" : `等待 ${leadName} lead`}
     </button>
   </header>
 
@@ -176,6 +321,10 @@
     <p class="pending-note">Agent 正在處理，本輪內容暫時唯讀。</p>
   {:else if phone}
     <p class="pending-note">手機版提供唯讀檢視；請用平板或電腦修改。</p>
+  {:else if lockedByOther}
+    <p class="pending-note">{snapshot.participants.find((participant) => participant.session_id === selectedLock.session_id)?.display_name || "其他審稿者"} 正在修改這句字幕。</p>
+  {:else if !isLead}
+    <p class="pending-note">你可以修改字幕；完成本輪需等待 {leadName} lead。</p>
   {/if}
 
   <div class="workspace-grid">
@@ -186,15 +335,18 @@
       {stageMode}
       {assetUrl}
       onStageMode={(mode) => { stageMode = mode; }}
-      onPlaybackCue={(cueId) => { if (cues.some((cue) => cue.id === cueId)) selectedCueId = cueId; }}
+      onPlaybackCue={(cueId) => { if (cues.some((cue) => cue.id === cueId)) selectCue(cueId); }}
     />
 
     <section class="cue-workspace" aria-label="字幕工作區">
       <div class="cue-list" aria-label="字幕清單">
         {#each cues as cue, index}
-          <button class:active={cue.id === selectedCue?.id} class:needs-change={(snapshot.issues || []).some((issue) => issue.cue_ids?.includes(cue.id))} type="button" on:click={() => { selectedCueId = cue.id; }}>
+          <button class:active={cue.id === selectedCue?.id} class:needs-change={(snapshot.issues || []).some((issue) => issue.cue_ids?.includes(cue.id))} class:locked={snapshot.locks.some((lock) => lock.cue_id === cue.id && lock.session_id !== snapshot.session_id)} type="button" on:click={() => selectCue(cue.id)}>
             <small>{index + 1}</small>
             <span>{cue.display_text}</span>
+            {#if snapshot.participants.some((participant) => participant.selected_cue_id === cue.id && participant.session_id !== snapshot.session_id)}
+              <small>{snapshot.participants.filter((participant) => participant.selected_cue_id === cue.id && participant.session_id !== snapshot.session_id).map((participant) => participant.display_name).join(", ")}</small>
+            {/if}
           </button>
         {/each}
       </div>
@@ -210,14 +362,15 @@
             <textarea
               bind:this={editor}
               bind:value={editText}
-              readonly={!canEdit}
-              on:input={() => window.dispatchEvent(new Event("framecue:pause-playback"))}
-              on:blur={saveText}
+              readonly={!canType}
+              on:focus={focusEditor}
+              on:input={handleInput}
+              on:blur={leaveEditor}
             ></textarea>
           </label>
           <div class="cue-actions">
             <button type="button" disabled={!canEdit} on:click={splitCue}>從游標切開</button>
-            <button type="button" disabled={!canEdit || !nextMergeCue} on:click={() => submit({ kind: "merge", cue_id: selectedCue.id, adjacent_cue_id: nextMergeCue.id })}>與下一句合併</button>
+            <button type="button" disabled={!canEdit || !nextMergeCue} on:click={() => structuralOperation({ kind: "merge", cue_id: selectedCue.id, adjacent_cue_id: nextMergeCue.id }, [selectedCue.id, nextMergeCue.id])}>與下一句合併</button>
             <button type="button" class:flagged={selectedHasIssue} disabled={!canEdit || selectedHasIssue} on:click={() => submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" })}>
               {selectedHasIssue ? "已標記需修改" : "標記需修改"}
             </button>
@@ -246,6 +399,7 @@
   .cue-list button { display: grid; width: 100%; min-height: 64px; grid-template-columns: 28px 1fr; align-items: start; gap: 6px; padding: 10px; border: 0; border-bottom: 1px solid #323a34; border-radius: 0; background: transparent; text-align: left; }
   .cue-list button.active { background: #394f40; }
   .cue-list button.needs-change { box-shadow: inset 3px 0 #cf765e; }
+  .cue-list button.locked { opacity: .68; }
   .cue-list small { color: #9da99d; }
   .cue-list span { overflow-wrap: anywhere; color: #eef2ec; line-height: 1.4; }
   .cue-editor { min-width: 0; overflow: auto; padding: 16px; }

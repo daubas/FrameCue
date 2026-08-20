@@ -56,6 +56,23 @@ function validateWorkspaceSnapshot(snapshot) {
   if (!snapshot.document || !Array.isArray(snapshot.document.cues) || !Array.isArray(snapshot.document.blocks)) {
     throw new Error("workspace snapshot document is invalid");
   }
+  if (typeof snapshot.session_id !== "string" || !snapshot.session_id.trim()) {
+    throw new Error("workspace snapshot session_id is required");
+  }
+  if (typeof snapshot.lead_session_id !== "string" || !Array.isArray(snapshot.participants) || !Array.isArray(snapshot.locks)) {
+    throw new Error("workspace snapshot collaboration state is invalid");
+  }
+  if (!snapshot.participants.every((participant) => participant
+    && typeof participant.session_id === "string"
+    && typeof participant.display_name === "string"
+    && typeof participant.dirty === "boolean"
+    && typeof participant.selected_cue_id === "string")
+    || !snapshot.locks.every((lock) => lock && typeof lock.cue_id === "string" && typeof lock.session_id === "string")) {
+    throw new Error("workspace snapshot collaboration entries are invalid");
+  }
+  if (!Number.isInteger(snapshot.snapshot_version) || snapshot.snapshot_version < 0) {
+    throw new Error("workspace snapshot snapshot_version is invalid");
+  }
   return snapshot;
 }
 
