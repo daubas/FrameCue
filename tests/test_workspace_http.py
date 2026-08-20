@@ -1,3 +1,4 @@
+import copy
 import json
 import hashlib
 import re
@@ -120,6 +121,50 @@ class WorkspaceHTTPTests(unittest.TestCase):
         database, package, server, thread = self._workspace_server(root)
         summary = framecue.complete_workspace_round(database, package["review_id"], 0)
         return database, package, summary, server, thread
+
+    def _correction_order_server(self, root):
+        database, package, server, thread = self._workspace_server(root)
+        framecue.apply_draft_operation(database, package["review_id"], {
+            "kind": "flag", "draft_version": 0, "cue_id": "c0001",
+            "categories": ["translation"], "author": "lead", "note": "please revise",
+        })
+        summary = framecue.complete_workspace_round(database, package["review_id"], 1)
+        return database, package, summary, server, thread
+
+    def _content_candidate(self, database, request_id):
+        connection = framecue.open_workspace_database(database)
+        row = connection.execute(
+            "SELECT request_json FROM work_orders WHERE request_id = ?", (request_id,)
+        ).fetchone()
+        connection.close()
+        order = json.loads(row["request_json"])
+        document = copy.deepcopy(order["document"])
+        target = order["targets"][0]
+        cue = next(value for value in document["cues"] if value["id"] == target["cue_ids"][0])
+        cue["display_text"] = "已修正字幕"
+        cue["speech_text"] = "已修正字幕。"
+        framecue.recompute_draft_blocks(document)
+        framecue.refresh_document_checksum(document)
+        return {
+            "schema": "framecue_candidate_revision_v2",
+            "status": "ready_for_review",
+            "request_id": request_id,
+            "workspace_id": order["workspace_id"],
+            "operation": order["operation"],
+            "base_revision": order["base_revision"],
+            "base_draft_version": order["base_draft_version"],
+            "base_checksum": order["base_checksum"],
+            "document": document,
+            "change_proposals": [{
+                "proposal_id": "proposal-1",
+                "range_id": target["range_id"],
+                "before_checksum": target["before_checksum"],
+                "replacement": {
+                    "cues": [copy.deepcopy(next(value for value in document["cues"] if value["id"] == cue_id)) for cue_id in target["cue_ids"]],
+                    "blocks": [copy.deepcopy(next(value for value in document["blocks"] if value["id"] == block_id)) for block_id in target["block_ids"]],
+                },
+            }],
+        }
 
     def test_agent_token_cli_stores_only_hash_and_revocation_is_idempotent(self):
         with tempfile.TemporaryDirectory(prefix="framecue-agent-token-") as temp:
@@ -265,6 +310,234 @@ class WorkspaceHTTPTests(unittest.TestCase):
                     reclaimed = claim(third)
                 self.assertEqual(reclaimed["attempt_count"], 3)
                 self.assertEqual(reclaimed["lease_owner_token_id"], third["token_id"])
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_agent_owner_can_submit_valid_content_candidate_but_other_and_expired_leases_cannot(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-submit-") as temp:
+            root = Path(temp)
+            database, package, summary, server, thread = self._correction_order_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                owner = self._agent_token(database, package, "claim", "submit", label="owner")
+                other = self._agent_token(database, package, "submit", label="other")
+                owner_auth = {"Authorization": f"Bearer {owner['token']}"}
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:00:00+00:00"):
+                    self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/claim",
+                        method="POST", headers=owner_auth,
+                    )
+                candidate = self._content_candidate(database, summary["request_id"])
+                candidate_path = root / "candidate.json"
+                candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+                with self.assertRaises(subprocess.CalledProcessError):
+                    run_cli("work-submit", "--database", str(database), "--candidate", str(candidate_path))
+
+                wrong_permission = self._agent_token(database, package, "read", label="reader")
+                request = urllib.request.Request(
+                    f"{base}/api/agent/work-orders/{summary['request_id']}/submit",
+                    data=json.dumps(candidate).encode(), method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {wrong_permission['token']}",
+                    },
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(failure.exception.code, 403)
+
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:01:00+00:00"):
+                    request = urllib.request.Request(
+                        f"{base}/api/agent/work-orders/{summary['request_id']}/submit",
+                        data=json.dumps(candidate).encode(), method="POST",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {other['token']}"},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as failure:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(failure.exception.code, 409)
+
+                    _, _, submitted = self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/submit",
+                        method="POST", value=candidate, headers=owner_auth,
+                    )
+                self.assertEqual(submitted["status"], "candidate_ready")
+                self.assertEqual(submitted["stage"], "content_candidate_review")
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_agent_fail_and_retry_replace_request_id_atomically(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-retry-") as temp:
+            root = Path(temp)
+            database, package, summary, server, thread = self._correction_order_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                worker = self._agent_token(database, package, "claim", "fail", "retry")
+                auth = {"Authorization": f"Bearer {worker['token']}"}
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:00:00+00:00"):
+                    self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/claim",
+                        method="POST", headers=auth,
+                    )
+                    _, _, failed = self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/fail",
+                        method="POST",
+                        value={"category": "provider", "message": "temporary outage", "retryable": True},
+                        headers=auth,
+                    )
+                expected_error = {"category": "provider", "message": "temporary outage", "retryable": True}
+                self.assertEqual(failed, {
+                    "request_id": summary["request_id"], "status": "failed", "last_error": expected_error,
+                })
+                connection = framecue.open_workspace_database(database)
+                failed_row = connection.execute("SELECT * FROM work_orders").fetchone()
+                connection.close()
+                self.assertEqual(failed_row["last_error_json"], framecue.canonical_json(expected_error))
+                self.assertIsNone(failed_row["lease_owner_token_id"])
+
+                outside = json.loads(run_cli(
+                    "agent-token-create", "--database", str(database), "--label", "outside",
+                    "--workspace", "different", "--permission", "retry",
+                ).stdout)
+                request = urllib.request.Request(
+                    f"{base}/api/agent/work-orders/{summary['request_id']}/retry",
+                    data=b"{}", method="POST",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {outside['token']}"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(failure.exception.code, 403)
+
+                _, _, retried = self._json_request(
+                    base, f"/api/agent/work-orders/{summary['request_id']}/retry",
+                    method="POST", value={}, headers=auth,
+                )
+                self.assertEqual(retried["status"], "pending")
+                self.assertNotEqual(retried["request_id"], summary["request_id"])
+                connection = framecue.open_workspace_database(database)
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM work_orders WHERE request_id = ?", (summary["request_id"],)
+                ).fetchone())
+                row = connection.execute("SELECT * FROM work_orders").fetchone()
+                connection.close()
+                self.assertEqual(json.loads(row["request_json"])["request_id"], retried["request_id"])
+                self.assertEqual(row["attempt_count"], 1)
+                self.assertIsNone(row["last_error_json"])
+                self.assertIsNone(row["candidate_json"])
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_agent_fail_retry_reject_nonowner_expired_invalid_nonretryable_and_wrong_permission(self):
+        def post_expect(base, path, token, value, code):
+            request = urllib.request.Request(
+                f"{base}{path}", data=json.dumps(value).encode(), method="POST",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as failure:
+                urllib.request.urlopen(request, timeout=5)
+            self.assertEqual(failure.exception.code, code)
+
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-fail-closed-") as temp:
+            root = Path(temp)
+            database, package, summary, server, thread = self._correction_order_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                owner = self._agent_token(database, package, "claim", "fail", "retry")
+                other = self._agent_token(database, package, "fail", label="other")
+                wrong = self._agent_token(database, package, "read", label="reader")
+                owner_auth = {"Authorization": f"Bearer {owner['token']}"}
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:00:00+00:00"):
+                    self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/claim",
+                        method="POST", headers=owner_auth,
+                    )
+                    post_expect(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/retry",
+                        owner["token"], {}, 409,
+                    )
+                    post_expect(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/fail",
+                        other["token"], {"category": "x", "message": "x", "retryable": True}, 409,
+                    )
+                    post_expect(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/fail",
+                        wrong["token"], {"category": "x", "message": "x", "retryable": True}, 403,
+                    )
+                    for invalid in (
+                        {"category": "", "message": "x", "retryable": True},
+                        {"category": "x" * 65, "message": "x", "retryable": True},
+                        {"category": "x", "message": "", "retryable": True},
+                        {"category": "x", "message": "x" * 2001, "retryable": True},
+                        {"category": "x", "message": "x", "retryable": 1},
+                    ):
+                        post_expect(
+                            base, f"/api/agent/work-orders/{summary['request_id']}/fail",
+                            owner["token"], invalid, 409,
+                        )
+                    self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/fail",
+                        method="POST",
+                        value={"category": "validation", "message": "bad input", "retryable": False},
+                        headers=owner_auth,
+                    )
+                post_expect(
+                    base, f"/api/agent/work-orders/{summary['request_id']}/retry",
+                    owner["token"], {}, 409,
+                )
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-fail-expired-") as temp:
+            root = Path(temp)
+            database, package, summary, server, thread = self._correction_order_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                owner = self._agent_token(database, package, "claim", "fail")
+                auth = {"Authorization": f"Bearer {owner['token']}"}
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:00:00+00:00"):
+                    self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/claim",
+                        method="POST", headers=auth,
+                    )
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:06:00+00:00"):
+                    post_expect(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/fail",
+                        owner["token"], {"category": "x", "message": "x", "retryable": True}, 409,
+                    )
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+        with tempfile.TemporaryDirectory(prefix="framecue-agent-submit-expired-") as temp:
+            root = Path(temp)
+            database, package, summary, server, thread = self._correction_order_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                owner = self._agent_token(database, package, "claim", "submit")
+                auth = {"Authorization": f"Bearer {owner['token']}"}
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:00:00+00:00"):
+                    self._json_request(
+                        base, f"/api/agent/work-orders/{summary['request_id']}/claim",
+                        method="POST", headers=auth,
+                    )
+                candidate = self._content_candidate(database, summary["request_id"])
+                with mock.patch("framecue.agent_utc_now", return_value="2026-08-20T00:06:00+00:00"):
+                    request = urllib.request.Request(
+                        f"{base}/api/agent/work-orders/{summary['request_id']}/submit",
+                        data=json.dumps(candidate).encode(), method="POST",
+                        headers={"Content-Type": "application/json", **auth},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as failure:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(failure.exception.code, 409)
             finally:
                 server.shutdown()
                 thread.join(timeout=5)

@@ -2518,6 +2518,177 @@ def make_workspace_server(database, bundle_dir, port=0):
                 connection.close()
             self.send_json(200, value)
 
+        def send_agent_submit(self, identity, request_id, candidate):
+            now = agent_utc_now()
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, now)
+                order = connection.execute(
+                    """SELECT work_orders.*, revisions.document_json
+                       FROM work_orders
+                       JOIN revisions ON revisions.revision_id = work_orders.revision_id
+                       WHERE work_orders.request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if order is None:
+                    connection.commit()
+                    self.send_json(404, {"error": "work order was not found"})
+                    return
+                if order["review_id"] not in identity["workspace_ids"]:
+                    connection.commit()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                if (
+                    order["status"] != "processing"
+                    or order["lease_owner_token_id"] != identity["token_id"]
+                    or order["lease_expires_at"] is None
+                    or order["lease_expires_at"] <= now
+                ):
+                    connection.commit()
+                    self.send_json(409, {"error": "work order lease is not owned by this agent"})
+                    return
+                store_content_candidate_v2(connection, order, candidate, "processing", identity["token_id"])
+                connection.commit()
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, {
+                "stage": "content_candidate_review",
+                "status": "candidate_ready",
+                "request_id": request_id,
+            })
+
+        def send_agent_fail(self, identity, request_id, value):
+            category = value.get("category")
+            message = value.get("message")
+            retryable = value.get("retryable")
+            if (
+                not isinstance(category, str) or not 1 <= len(category.strip()) <= 64
+                or not isinstance(message, str) or not 1 <= len(message.strip()) <= 2000
+                or type(retryable) is not bool
+            ):
+                self.send_json(409, {"error": "agent failure must include a valid category, message, and retryable flag"})
+                return
+            last_error = {"category": category.strip(), "message": message.strip(), "retryable": retryable}
+            now = agent_utc_now()
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, now)
+                row = connection.execute(
+                    """SELECT review_id, status, lease_owner_token_id, lease_expires_at
+                       FROM work_orders WHERE request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    self.send_json(404, {"error": "work order was not found"})
+                    return
+                if row["review_id"] not in identity["workspace_ids"]:
+                    connection.commit()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                if (
+                    row["status"] != "processing"
+                    or row["lease_owner_token_id"] != identity["token_id"]
+                    or row["lease_expires_at"] is None
+                    or row["lease_expires_at"] <= now
+                ):
+                    connection.commit()
+                    self.send_json(409, {"error": "work order lease is not owned by this agent"})
+                    return
+                if connection.execute(
+                    """UPDATE work_orders
+                       SET status = 'failed', last_error_json = ?,
+                           lease_owner_token_id = NULL, lease_expires_at = NULL
+                       WHERE request_id = ? AND status = 'processing' AND lease_owner_token_id = ?""",
+                    (canonical_json(last_error), request_id, identity["token_id"]),
+                ).rowcount != 1:
+                    raise FrameCueError("work order lease changed")
+                connection.commit()
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, {"request_id": request_id, "status": "failed", "last_error": last_error})
+
+        def send_agent_retry(self, identity, request_id):
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, agent_utc_now())
+                row = connection.execute(
+                    """SELECT request_id, review_id, request_json, status, last_error_json,
+                              operation, base_revision, base_checksum, attempt_count
+                       FROM work_orders WHERE request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    self.send_json(404, {"error": "work order was not found"})
+                    return
+                if row["review_id"] not in identity["workspace_ids"]:
+                    connection.commit()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                try:
+                    last_error = json.loads(row["last_error_json"] or "null")
+                    request = json.loads(row["request_json"])
+                except json.JSONDecodeError:
+                    last_error = request = None
+                if row["status"] != "failed" or not isinstance(last_error, dict) or last_error.get("retryable") is not True:
+                    connection.commit()
+                    self.send_json(409, {"error": "work order is not retryable"})
+                    return
+                if not isinstance(request, dict):
+                    raise FrameCueError("work order request is invalid")
+                next_request_id = opaque_id("req")
+                request["request_id"] = next_request_id
+                if connection.execute(
+                    """UPDATE work_orders
+                       SET request_id = ?, request_json = ?, status = 'pending', candidate_json = NULL,
+                           last_error_json = NULL, lease_owner_token_id = NULL, lease_expires_at = NULL
+                       WHERE request_id = ? AND status = 'failed'""",
+                    (next_request_id, canonical_json(request), request_id),
+                ).rowcount != 1:
+                    raise FrameCueError("work order status changed")
+                connection.commit()
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, {
+                "request_id": next_request_id,
+                "workspace_id": row["review_id"],
+                "operation": row["operation"],
+                "base_revision": row["base_revision"],
+                "base_checksum": row["base_checksum"],
+                "status": "pending",
+                "lease_owner_token_id": None,
+                "lease_expires_at": None,
+                "attempt_count": row["attempt_count"],
+            })
+
         def require_session(self):
             session = collaboration.session(self.request_session_id())
             if session is None:
@@ -2761,6 +2932,33 @@ def make_workspace_server(database, bundle_dir, port=0):
                 identity = self.require_agent("claim")
                 if identity is not None:
                     self.send_agent_claim(identity, unquote(agent_claim.group(1)))
+                return
+            agent_submit = re.fullmatch(r"/api/agent/work-orders/([^/]+)/submit", path)
+            if agent_submit:
+                identity = self.require_agent("submit")
+                if identity is None:
+                    return
+                value = self.read_workspace_json()
+                if value is not None:
+                    self.send_agent_submit(identity, unquote(agent_submit.group(1)), value)
+                return
+            agent_fail = re.fullmatch(r"/api/agent/work-orders/([^/]+)/fail", path)
+            if agent_fail:
+                identity = self.require_agent("fail")
+                if identity is None:
+                    return
+                value = self.read_workspace_json()
+                if value is not None:
+                    self.send_agent_fail(identity, unquote(agent_fail.group(1)), value)
+                return
+            agent_retry = re.fullmatch(r"/api/agent/work-orders/([^/]+)/retry", path)
+            if agent_retry:
+                identity = self.require_agent("retry")
+                if identity is None:
+                    return
+                value = self.read_workspace_json()
+                if value is not None:
+                    self.send_agent_retry(identity, unquote(agent_retry.group(1)))
                 return
             if path not in {"/api/content-complete", "/api/workspace/operation", "/api/workspace/complete"}:
                 self.send_error(404)
@@ -3323,6 +3521,41 @@ def validate_content_candidate_v2(candidate, order, base_document):
         raise FrameCueError("candidate replacement Blocks do not match the full document")
 
 
+def store_content_candidate_v2(connection, order, candidate, expected_status, lease_owner_token_id=None):
+    if candidate.get("schema") != CANDIDATE_REVISION_V2_SCHEMA:
+        raise FrameCueError("candidate schema is invalid")
+    try:
+        base_document = json.loads(order["document_json"])
+    except json.JSONDecodeError as error:
+        raise FrameCueError(f"work order base document is invalid JSON: {order['request_id']}") from error
+    if not isinstance(base_document, dict):
+        raise FrameCueError(f"work order base document is invalid: {order['request_id']}")
+    if (
+        base_document.get("checksum") != order["base_checksum"]
+        or document_checksum(base_document) != order["base_checksum"]
+    ):
+        raise FrameCueError(f"work order base checksum does not match storage: {order['request_id']}")
+    validate_content_candidate_v2(candidate, order, base_document)
+    conditions = "work_order_id = ? AND status = ?"
+    values = [order["work_order_id"], expected_status]
+    if lease_owner_token_id is not None:
+        conditions += " AND lease_owner_token_id = ?"
+        values.append(lease_owner_token_id)
+    if connection.execute(
+        f"""UPDATE work_orders
+               SET status = 'candidate_ready', candidate_json = ?,
+                   lease_owner_token_id = NULL, lease_expires_at = NULL
+               WHERE {conditions}""",
+        [canonical_json(candidate), *values],
+    ).rowcount != 1:
+        raise FrameCueError(f"work order is not {expected_status}: {order['request_id']}")
+    if connection.execute(
+        "UPDATE workspaces SET stage = 'content_candidate_review' WHERE review_id = ?",
+        (order["review_id"],),
+    ).rowcount != 1:
+        raise FrameCueError(f"workspace not found: {order['review_id']}")
+
+
 def command_work_submit(args):
     candidate = read_json(args.candidate)
     if not isinstance(candidate, dict):
@@ -3371,18 +3604,7 @@ def command_work_submit(args):
                 raise FrameCueError(f"work order base checksum does not match storage: {request_id}")
 
             if candidate.get("schema") == CANDIDATE_REVISION_V2_SCHEMA:
-                validate_content_candidate_v2(candidate, order, base_document)
-                if connection.execute(
-                    """UPDATE work_orders SET status = ?, candidate_json = ?
-                       WHERE work_order_id = ? AND status = 'pending'""",
-                    ("candidate_ready", canonical_json(candidate), order["work_order_id"]),
-                ).rowcount != 1:
-                    raise FrameCueError(f"work order is not pending: {request_id}")
-                if connection.execute(
-                    "UPDATE workspaces SET stage = ? WHERE review_id = ?",
-                    ("content_candidate_review", order["review_id"]),
-                ).rowcount != 1:
-                    raise FrameCueError(f"workspace not found: {order['review_id']}")
+                store_content_candidate_v2(connection, order, candidate, "pending")
                 connection.commit()
                 print(json.dumps({
                     "stage": "content_candidate_review",
