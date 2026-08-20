@@ -2684,6 +2684,289 @@ def validate_candidate_document_immutable(base_document, document):
         raise FrameCueError("candidate document changes immutable base fields")
 
 
+def validate_content_candidate_v2(candidate, order, base_document):
+    try:
+        request = json.loads(order["request_json"])
+    except json.JSONDecodeError as error:
+        raise FrameCueError(f"work order request is invalid JSON: {order['request_id']}") from error
+    bindings = {
+        "request_id": order["request_id"],
+        "workspace_id": order["review_id"],
+        "operation": order["operation"],
+        "base_revision": order["base_revision"],
+        "base_draft_version": request.get("base_draft_version"),
+        "base_checksum": order["base_checksum"],
+    }
+    if request.get("schema") != WORK_ORDER_V2_SCHEMA or order["operation"] != "content_correction_review":
+        raise FrameCueError("candidate operation is not supported")
+    for key, value in bindings.items():
+        if candidate.get(key) != value:
+            raise FrameCueError(f"candidate {key} does not match work order")
+    if candidate.get("status") != "ready_for_review":
+        raise FrameCueError("candidate status is not ready_for_review")
+
+    document = candidate.get("document")
+    if not isinstance(document, dict) or document.get("schema") != SUBTITLE_DOCUMENT_V2_SCHEMA:
+        raise FrameCueError("candidate document schema is invalid")
+    if document.get("workspace_id") != order["review_id"]:
+        raise FrameCueError("candidate document workspace_id does not match work order")
+    if document.get("checksum") != document_checksum(document):
+        raise FrameCueError("candidate document checksum does not match content")
+    base_cues = base_document.get("cues")
+    base_blocks = base_document.get("blocks")
+    cues = document.get("cues")
+    blocks = document.get("blocks")
+    if not all(isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
+               for rows in (base_cues, base_blocks, cues, blocks)):
+        raise FrameCueError("candidate document cues and blocks must be arrays of objects")
+    base_cue_by_id = {row.get("id"): row for row in base_cues}
+    cue_by_id = {row.get("id"): row for row in cues}
+    base_block_by_id = {row.get("id"): row for row in base_blocks}
+    block_by_id = {row.get("id"): row for row in blocks}
+    if None in base_cue_by_id or None in cue_by_id or len(cue_by_id) != len(cues):
+        raise FrameCueError("candidate cue IDs are invalid")
+    if list(block_by_id) != list(base_block_by_id) or len(block_by_id) != len(blocks):
+        raise FrameCueError("candidate block IDs do not match base document")
+
+    targets = request.get("targets")
+    proposals = candidate.get("change_proposals")
+    if not isinstance(targets, list) or not isinstance(proposals, list) or not proposals:
+        raise FrameCueError("candidate change_proposals are required")
+    target_by_range = {row.get("range_id"): row for row in targets if isinstance(row, dict)}
+    if None in target_by_range or len(target_by_range) != len(targets):
+        raise FrameCueError("work order targets are invalid")
+    proposal_ids = [row.get("proposal_id") for row in proposals if isinstance(row, dict)]
+    range_ids = [row.get("range_id") for row in proposals if isinstance(row, dict)]
+    if len(proposal_ids) != len(proposals) or any(not isinstance(value, str) or not value for value in proposal_ids):
+        raise FrameCueError("candidate proposal_id is invalid")
+    if len(set(proposal_ids)) != len(proposal_ids) or len(set(range_ids)) != len(range_ids):
+        raise FrameCueError("candidate proposals must have unique IDs and ranges")
+
+    authorized_cues = set()
+    authorized_blocks = set()
+    cue_owner = {}
+    structural_operations = set()
+    replacement_cues = {}
+    replacement_blocks = {}
+    for proposal in proposals:
+        target = target_by_range.get(proposal.get("range_id"))
+        if target is None:
+            raise FrameCueError("candidate proposal range is not authorized")
+        if proposal.get("before_checksum") != target.get("before_checksum"):
+            raise FrameCueError("candidate proposal before_checksum is stale")
+        base_slice = {
+            "cues": [base_cue_by_id.get(cue_id) for cue_id in target.get("cue_ids", [])],
+            "blocks": [base_block_by_id.get(block_id) for block_id in target.get("block_ids", [])],
+        }
+        if None in base_slice["cues"] or None in base_slice["blocks"]:
+            raise FrameCueError("work order target references missing document rows")
+        if hashlib.sha256(canonical_json(base_slice).encode("utf-8")).hexdigest() != target.get("before_checksum"):
+            raise FrameCueError("work order target before_checksum does not match base document")
+        replacement = proposal.get("replacement")
+        if not isinstance(replacement, dict) or not all(
+            isinstance(replacement.get(key), list) and all(isinstance(row, dict) for row in replacement[key])
+            for key in ("cues", "blocks")
+        ):
+            raise FrameCueError("candidate proposal replacement is invalid")
+        target_cue_ids = set(target["cue_ids"])
+        replacement_slice = [
+            cue for cue in cues
+            if cue.get("id") in target_cue_ids
+            or (
+                cue.get("id") not in base_cue_by_id
+                and isinstance(cue.get("origin_cue_ids"), list)
+                and bool(set(cue["origin_cue_ids"]) & target_cue_ids)
+            )
+        ]
+        if replacement["cues"] != replacement_slice:
+            raise FrameCueError("candidate replacement Cues do not match their target range")
+        if replacement["blocks"] != [block_by_id[block_id] for block_id in target["block_ids"]]:
+            raise FrameCueError("candidate replacement Blocks do not match their target range")
+        structural_slice = [cue for cue in replacement_slice if cue.get("id") not in base_cue_by_id]
+        for cue in structural_slice:
+            lineage = cue.get("lineage")
+            if (
+                not isinstance(lineage, dict)
+                or lineage.get("operation") not in target.get("allowed_operations", [])
+                or not set(cue.get("origin_cue_ids", [])).issubset(target_cue_ids)
+                or not set(lineage.get("parent_cue_ids", [])).issubset(target_cue_ids)
+            ):
+                raise FrameCueError(f"candidate Cue lineage is not authorized for range: {cue.get('id')}")
+            parents = [base_cue_by_id[parent_id] for parent_id in lineage["parent_cue_ids"]]
+            if lineage["operation"] == "split":
+                if len(parents) != 1:
+                    raise FrameCueError(f"candidate split lineage is invalid: {cue.get('id')}")
+                parent = parents[0]
+                derived = {
+                    "id", "source_start_ms", "source_end_ms", "output_start_ms", "output_end_ms",
+                    "timing_state", "source_text", "display_text", "speech_text", "origin_cue_ids", "lineage",
+                }
+                if (
+                    any(cue.get(key) != parent.get(key) for key in set(cue) | set(parent) if key not in derived)
+                    or cue.get("output_start_ms") is not None
+                    or cue.get("output_end_ms") is not None
+                    or cue.get("timing_state") != "provisional"
+                    or cue.get("origin_cue_ids") != parent.get("origin_cue_ids", [parent["id"]])
+                    or cue.get("block_id") != parent.get("block_id")
+                ):
+                    raise FrameCueError(f"candidate split changes immutable Cue fields: {cue.get('id')}")
+            else:
+                if len(parents) != 2:
+                    raise FrameCueError(f"candidate merge lineage is invalid: {cue.get('id')}")
+                positions = [base_cues.index(parent) for parent in parents]
+                if (
+                    abs(positions[0] - positions[1]) != 1
+                    or parents[0].get("block_id") != parents[1].get("block_id")
+                    or any(parent["id"] in cue_by_id for parent in parents)
+                ):
+                    raise FrameCueError(f"candidate merge parents are not adjacent in one Block: {cue.get('id')}")
+                left, right = sorted(parents, key=base_cues.index)
+                origins = list(dict.fromkeys(left.get("origin_cue_ids", [left["id"]]) + right.get("origin_cue_ids", [right["id"]])))
+                output_start, output_end = left.get("output_start_ms"), right.get("output_end_ms")
+                if type(output_start) is not int or type(output_end) is not int:
+                    output_start = output_end = None
+                expected = {
+                    "source_start_ms": min(left["source_start_ms"], right["source_start_ms"]),
+                    "source_end_ms": max(left["source_end_ms"], right["source_end_ms"]),
+                    "output_start_ms": output_start,
+                    "output_end_ms": output_end,
+                    "timing_state": "provisional" if "provisional" in {left.get("timing_state"), right.get("timing_state")} else "unrealized",
+                    "source_text": " ".join(value for value in (left.get("source_text", ""), right.get("source_text", "")) if value),
+                    "speech_linked": bool(left.get("speech_linked")) and bool(right.get("speech_linked")),
+                    "block_id": left.get("block_id"),
+                    "origin_cue_ids": origins,
+                    "lineage": {"operation": "merge", "parent_cue_ids": [left["id"], right["id"]]},
+                }
+                if set(cue) != set(expected) | {"id", "display_text", "speech_text"} or any(cue.get(key) != value for key, value in expected.items()):
+                    raise FrameCueError(f"candidate merge changes immutable Cue fields: {cue.get('id')}")
+        split_parents = {cue["lineage"]["parent_cue_ids"][0] for cue in structural_slice if cue["lineage"]["operation"] == "split"}
+        for parent_id in split_parents:
+            children = [cue for cue in replacement_slice if cue.get("lineage") == {"operation": "split", "parent_cue_ids": [parent_id]}]
+            parent = base_cue_by_id[parent_id]
+            if (
+                len(children) != 2
+                or parent_id in cue_by_id
+                or children[0].get("source_start_ms") != parent.get("source_start_ms")
+                or children[0].get("source_end_ms") != children[1].get("source_start_ms")
+                or children[1].get("source_end_ms") != parent.get("source_end_ms")
+                or "".join("".join(child.get("source_text", "").split()) for child in children)
+                != "".join(parent.get("source_text", "").split())
+            ):
+                raise FrameCueError(f"candidate split does not exactly partition its parent: {parent_id}")
+        if structural_slice:
+            base_text = "".join("".join(cue.get("source_text", "").split()) for cue in base_slice["cues"])
+            replacement_text = "".join("".join(cue.get("source_text", "").split()) for cue in replacement_slice)
+            if (
+                replacement_text != base_text
+                or replacement_slice[0].get("source_start_ms") != base_slice["cues"][0].get("source_start_ms")
+                or replacement_slice[-1].get("source_end_ms") != base_slice["cues"][-1].get("source_end_ms")
+            ):
+                raise FrameCueError("candidate structural replacement changes immutable source content")
+        authorized_cues.update(target["cue_ids"])
+        authorized_blocks.update(target["block_ids"])
+        for cue_id in target["cue_ids"]:
+            if cue_id in cue_owner:
+                raise FrameCueError("work order target Cue ranges overlap")
+            cue_owner[cue_id] = target["range_id"]
+        structural_operations.update(set(target.get("allowed_operations", [])) & {"split", "merge"})
+        for row in replacement["cues"]:
+            if row.get("id") in replacement_cues:
+                raise FrameCueError("candidate replacement Cue appears in multiple proposals")
+            replacement_cues[row.get("id")] = row
+        for row in replacement["blocks"]:
+            if row.get("id") in replacement_blocks:
+                raise FrameCueError("candidate replacement Block appears in multiple proposals")
+            replacement_blocks[row.get("id")] = row
+
+    for key in set(base_document) | set(document):
+        if key not in {"checksum", "cues", "blocks"} and document.get(key) != base_document.get(key):
+            raise FrameCueError(f"candidate document changes immutable field: {key}")
+    for cue_id, base_cue in base_cue_by_id.items():
+        if cue_id not in authorized_cues and cue_by_id.get(cue_id) != base_cue:
+            raise FrameCueError(f"candidate changes Cue outside an authorized range: {cue_id}")
+
+    candidate_slice_cues = []
+    covered_origins = set()
+    for cue in cues:
+        cue_id = cue["id"]
+        if cue_id in authorized_cues:
+            expected = copy.deepcopy(base_cue_by_id[cue_id])
+            expected["display_text"] = cue.get("display_text")
+            expected["speech_text"] = cue.get("speech_text")
+            if cue != expected:
+                raise FrameCueError(f"candidate changes unauthorized Cue fields: {cue_id}")
+            covered_origins.add(cue_id)
+            candidate_slice_cues.append(cue)
+        elif cue_id not in base_cue_by_id:
+            origins = cue.get("origin_cue_ids")
+            lineage = cue.get("lineage")
+            operation = lineage.get("operation") if isinstance(lineage, dict) else None
+            parents = lineage.get("parent_cue_ids") if isinstance(lineage, dict) else None
+            if (
+                operation not in structural_operations
+                or not isinstance(origins, list) or not origins
+                or not isinstance(parents, list) or not parents
+                or not set(origins).issubset(authorized_cues)
+                or not set(parents).issubset(authorized_cues)
+                or cue.get("block_id") not in authorized_blocks
+            ):
+                raise FrameCueError(f"candidate Cue lineage is not authorized: {cue_id}")
+            covered_origins.update(set(origins) & authorized_cues)
+            candidate_slice_cues.append(cue)
+        elif cue_id not in authorized_cues and cue != base_cue_by_id[cue_id]:
+            raise FrameCueError(f"candidate changes Cue outside an authorized range: {cue_id}")
+    if covered_origins != authorized_cues:
+        raise FrameCueError("candidate structural replacement does not preserve target lineage")
+
+    structural = any(cue["id"] not in base_cue_by_id for cue in candidate_slice_cues)
+    if not structural and [cue["id"] for cue in cues] != [cue["id"] for cue in base_cues]:
+        raise FrameCueError("candidate Cue order does not match base document")
+    if structural:
+        for range_id in range_ids:
+            indexes = [index for index, cue in enumerate(base_cues) if cue["id"] in target_by_range[range_id]["cue_ids"]]
+            if indexes != list(range(min(indexes), max(indexes) + 1)):
+                raise FrameCueError(f"work order target Cue range is not contiguous: {range_id}")
+        base_order = [cue_owner.get(cue["id"], cue["id"]) for cue in base_cues]
+        candidate_order = []
+        for cue in cues:
+            owners = {cue_owner[value] for value in cue.get("origin_cue_ids", []) if value in cue_owner}
+            owner = cue_owner.get(cue["id"])
+            if owner:
+                owners.add(owner)
+            if len(owners) > 1:
+                raise FrameCueError(f"candidate Cue crosses authorized ranges: {cue['id']}")
+            candidate_order.append(next(iter(owners), cue["id"]))
+        compact = lambda values: [value for index, value in enumerate(values) if index == 0 or value != values[index - 1]]
+        if compact(candidate_order) != compact(base_order):
+            raise FrameCueError("candidate structural replacement moves an authorized Cue range")
+    for block_id, base_block in base_block_by_id.items():
+        block = block_by_id[block_id]
+        if block_id not in authorized_blocks:
+            if block != base_block:
+                raise FrameCueError(f"candidate changes Block outside an authorized range: {block_id}")
+            continue
+        expected = copy.deepcopy(base_block)
+        expected["target_text"] = block.get("target_text")
+        expected["speech_text"] = block.get("speech_text")
+        if structural:
+            expected["cue_ids"] = block.get("cue_ids")
+        if block != expected:
+            raise FrameCueError(f"candidate changes unauthorized Block fields: {block_id}")
+        block_cues = [cue_by_id.get(cue_id) for cue_id in block.get("cue_ids", [])]
+        if None in block_cues:
+            raise FrameCueError(f"candidate Block references an unknown Cue: {block_id}")
+        if block.get("target_text") != " ".join(cue.get("display_text", "") for cue in block_cues):
+            raise FrameCueError(f"candidate Block target_text is inconsistent: {block_id}")
+        if block.get("speech_text") != " ".join(cue.get("speech_text", "") for cue in block_cues):
+            raise FrameCueError(f"candidate Block speech_text is inconsistent: {block_id}")
+
+    candidate_slice_blocks = [block for block in blocks if block["id"] in authorized_blocks]
+    if replacement_cues != {row["id"]: row for row in candidate_slice_cues}:
+        raise FrameCueError("candidate replacement Cues do not match the full document")
+    if replacement_blocks != {row["id"]: row for row in candidate_slice_blocks}:
+        raise FrameCueError("candidate replacement Blocks do not match the full document")
+
+
 def command_work_submit(args):
     candidate = read_json(args.candidate)
     if not isinstance(candidate, dict):
@@ -2698,7 +2981,8 @@ def command_work_submit(args):
             connection.execute("BEGIN IMMEDIATE")
             orders = connection.execute(
                 """SELECT work_orders.work_order_id, work_orders.request_id, work_orders.review_id,
-                          work_orders.base_revision, work_orders.base_checksum, revisions.document_json
+                          work_orders.base_revision, work_orders.base_checksum, work_orders.operation,
+                          work_orders.request_json, revisions.document_json
                    FROM work_orders
                    JOIN revisions ON revisions.revision_id = work_orders.revision_id
                    WHERE work_orders.request_id = ? AND work_orders.status = 'pending'""",
@@ -2710,7 +2994,7 @@ def command_work_submit(args):
                 raise FrameCueError(f"work order is not unique: {request_id}")
             order = orders[0]
 
-            if candidate.get("schema") != CANDIDATE_REVISION_SCHEMA:
+            if candidate.get("schema") not in {CANDIDATE_REVISION_SCHEMA, CANDIDATE_REVISION_V2_SCHEMA}:
                 raise FrameCueError("candidate schema is invalid")
             if candidate.get("status") != "ready_for_review":
                 raise FrameCueError("candidate status is not ready_for_review")
@@ -2729,6 +3013,27 @@ def command_work_submit(args):
                 or document_checksum(base_document) != order["base_checksum"]
             ):
                 raise FrameCueError(f"work order base checksum does not match storage: {request_id}")
+
+            if candidate.get("schema") == CANDIDATE_REVISION_V2_SCHEMA:
+                validate_content_candidate_v2(candidate, order, base_document)
+                if connection.execute(
+                    """UPDATE work_orders SET status = ?, candidate_json = ?
+                       WHERE work_order_id = ? AND status = 'pending'""",
+                    ("candidate_ready", canonical_json(candidate), order["work_order_id"]),
+                ).rowcount != 1:
+                    raise FrameCueError(f"work order is not pending: {request_id}")
+                if connection.execute(
+                    "UPDATE workspaces SET stage = ? WHERE review_id = ?",
+                    ("content_candidate_review", order["review_id"]),
+                ).rowcount != 1:
+                    raise FrameCueError(f"workspace not found: {order['review_id']}")
+                connection.commit()
+                print(json.dumps({
+                    "stage": "content_candidate_review",
+                    "status": "candidate_ready",
+                    "request_id": request_id,
+                }, ensure_ascii=False))
+                return
 
             document = candidate.get("document")
             if not isinstance(document, dict):
