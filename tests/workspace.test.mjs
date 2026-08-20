@@ -227,6 +227,7 @@ const workspaceSnapshot = {
   csrf_token: "workspace-token",
   session_id: "session-alice",
   lead_session_id: "session-alice",
+  lead_active: true,
   participants: [{ session_id: "session-alice", display_name: "Alice", dirty: false, selected_cue_id: "c0001" }],
   locks: [],
   document: {

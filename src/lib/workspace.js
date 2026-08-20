@@ -59,7 +59,8 @@ function validateWorkspaceSnapshot(snapshot) {
   if (typeof snapshot.session_id !== "string" || !snapshot.session_id.trim()) {
     throw new Error("workspace snapshot session_id is required");
   }
-  if (typeof snapshot.lead_session_id !== "string" || !Array.isArray(snapshot.participants) || !Array.isArray(snapshot.locks)) {
+  if (typeof snapshot.lead_session_id !== "string" || typeof snapshot.lead_active !== "boolean"
+    || !Array.isArray(snapshot.participants) || !Array.isArray(snapshot.locks)) {
     throw new Error("workspace snapshot collaboration state is invalid");
   }
   if (!snapshot.participants.every((participant) => participant

@@ -57,7 +57,10 @@
     scenes: sourcePackage.scenes || []
   };
   $: issueCount = new Set((snapshot.issues || []).map((issue) => issue.range_id || issue.flag_id)).size;
-  $: selectedHasIssue = Boolean(selectedCue && (snapshot.issues || []).some((issue) => issue.cue_ids?.includes(selectedCue.id)));
+  $: selectedOwnIssues = selectedCue ? (snapshot.issues || []).filter((issue) =>
+    issue.cue_ids?.includes(selectedCue.id) && issue.authors?.includes(snapshot.display_name)
+  ) : [];
+  $: selectedHasIssue = selectedOwnIssues.length > 0;
   $: agentPending = snapshot.stage.endsWith("_pending");
   $: selectedLock = snapshot.locks.find((lock) => lock.cue_id === selectedCue?.id) || null;
   $: lockedByOther = Boolean(selectedLock && selectedLock.session_id !== snapshot.session_id);
@@ -264,13 +267,30 @@
     }
   }
 
+  async function claimLead() {
+    if (!canEdit || snapshot.lead_active) return;
+    busy = true;
+    message = "";
+    try {
+      await post({
+        kind: "lead",
+        expected_lead_session_id: snapshot.lead_session_id,
+        new_lead_session_id: snapshot.session_id
+      });
+    } catch (cause) {
+      message = cause?.message || "無法接手 lead";
+      await reload();
+    } finally {
+      busy = false;
+    }
+  }
+
   async function toggleSelectedIssue() {
-    const selectedIssues = (snapshot.issues || []).filter((issue) => issue.cue_ids?.includes(selectedCue.id));
-    if (!selectedIssues.length) {
+    if (!selectedOwnIssues.length) {
       await submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" });
       return;
     }
-    for (const issue of selectedIssues) {
+    for (const issue of selectedOwnIssues) {
       await submit({
         kind: "flag",
         cue_ids: issue.cue_ids,
@@ -328,9 +348,13 @@
       <span>直接修改 {snapshot.direct_edit_count || 0}</span>
       <span class:warning={!connected || localDirty}>{localDirty ? "尚未同步" : syncing ? "同步中" : connected ? "已同步" : "已離線"}</span>
     </div>
-    <button type="button" class="complete" disabled={!canComplete} on:click={completeRound}>
-      {isLead ? completing ? "完成中…" : "完成本輪" : `等待 ${leadName} lead`}
-    </button>
+    {#if !isLead && !snapshot.lead_active}
+      <button type="button" class="complete" disabled={!canEdit} on:click={claimLead}>接手 lead</button>
+    {:else}
+      <button type="button" class="complete" disabled={!canComplete} on:click={completeRound}>
+        {isLead ? completing ? "完成中…" : "完成本輪" : `等待 ${leadName} lead`}
+      </button>
+    {/if}
   </header>
 
   {#if message}<p class="workspace-message" role="alert">{message}</p>{/if}
@@ -340,6 +364,8 @@
     <p class="pending-note">手機版提供唯讀檢視；請用平板或電腦修改。</p>
   {:else if lockedByOther}
     <p class="pending-note">{snapshot.participants.find((participant) => participant.session_id === selectedLock.session_id)?.display_name || "其他審稿者"} 正在修改這句字幕。</p>
+  {:else if !isLead && !snapshot.lead_active}
+    <p class="pending-note">原 lead 已離線；接手後即可完成本輪。</p>
   {:else if !isLead}
     <p class="pending-note">你可以修改字幕；完成本輪需等待 {leadName} lead。</p>
   {/if}

@@ -1191,7 +1191,12 @@ def apply_draft_flag(document, issues, operation):
         issue = next((row for row in issues if isinstance(row, dict) and row.get("cue_ids") == cue_ids and row.get("category") == category), None)
         if not enabled:
             if issue is not None:
-                issues.remove(issue)
+                if not isinstance(issue.get("authors"), list):
+                    raise FrameCueError("workspace draft issue is invalid")
+                if author in issue["authors"]:
+                    issue["authors"].remove(author)
+                if not issue["authors"]:
+                    issues.remove(issue)
             continue
         if issue is None:
             issue = {

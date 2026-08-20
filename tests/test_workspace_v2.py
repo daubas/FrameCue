@@ -311,7 +311,25 @@ class WorkspaceV2Tests(unittest.TestCase):
                 },
             ).stdout)
             self.assertEqual(removed["draft_version"], 3)
-            self.assertEqual([issue["category"] for issue in removed["issues"]], ["terminology"])
+            translation = next(issue for issue in removed["issues"] if issue["category"] == "translation")
+            self.assertEqual(translation["authors"], ["peer"])
+            self.assertEqual({issue["category"] for issue in removed["issues"]}, {"translation", "terminology"})
+
+            cleared = json.loads(self._apply(
+                root,
+                database,
+                package["review_id"],
+                "unflag-last-author.json",
+                {
+                    "kind": "flag",
+                    "draft_version": 3,
+                    "cue_ids": ["c0001", "c0002"],
+                    "categories": ["translation"],
+                    "author": "peer",
+                    "enabled": False,
+                },
+            ).stdout)
+            self.assertEqual([issue["category"] for issue in cleared["issues"]], ["terminology"])
 
     def test_clean_completion_creates_one_content_revision_and_voice_order(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-v2-clean-complete-") as temp:
