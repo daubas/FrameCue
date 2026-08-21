@@ -1057,6 +1057,16 @@ def apply_draft_split(document, operation):
     if operation.get("word_timestamps") is not None:
         raise FrameCueError("draft split trusted word timestamps are not implemented")
     left_display, right_display = split_draft_text(display_text, cursor, cue_id)
+    source_text = as_text(cue.get("source_text"), f"workspace draft cue source_text: {cue_id}")
+    if len(source_text) < 2:
+        left_source, right_source = source_text, ""
+    else:
+        source_cursor = min(len(source_text) - 1, max(1, round(len(source_text) * cursor / len(display_text))))
+        boundaries = [index for index, char in enumerate(source_text) if char.isspace() and 0 < index < len(source_text)]
+        if boundaries:
+            source_cursor = min(boundaries, key=lambda index: abs(index - source_cursor))
+        # ponytail: proportional source split; use trusted word alignment when that input exists.
+        left_source, right_source = split_draft_text(source_text, source_cursor, cue_id)
     if cue.get("speech_linked"):
         left_speech, right_speech = left_display, right_display
     else:
@@ -1073,7 +1083,7 @@ def apply_draft_split(document, operation):
     if not isinstance(origins, list) or not all(isinstance(value, str) for value in origins):
         origins = [cue_id]
 
-    def child(cue_id, source_start, source_end, display, speech):
+    def child(cue_id, source_start, source_end, source, display, speech):
         value = copy.deepcopy(cue)
         value.update({
             "id": cue_id,
@@ -1082,6 +1092,7 @@ def apply_draft_split(document, operation):
             "output_start_ms": None,
             "output_end_ms": None,
             "timing_state": "provisional",
+            "source_text": source,
             "display_text": display,
             "speech_text": speech,
             "origin_cue_ids": origins,
@@ -1089,8 +1100,8 @@ def apply_draft_split(document, operation):
         })
         return value
 
-    left = child(opaque_id("cue"), start, split_at, left_display, left_speech)
-    right = child(opaque_id("cue"), split_at, end, right_display, right_speech)
+    left = child(opaque_id("cue"), start, split_at, left_source, left_display, left_speech)
+    right = child(opaque_id("cue"), split_at, end, right_source, right_display, right_speech)
     block = next((row for row in document["blocks"] if row.get("id") == cue.get("block_id")), None)
     if block is None or cue_id not in block.get("cue_ids", []):
         raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
@@ -1216,6 +1227,16 @@ def apply_draft_flag(document, issues, operation):
             issue["notes"].append(note)
 
 
+def replace_draft_cue_references(rows, replaced_cue_ids, replacement_cue_ids):
+    for row in rows:
+        rewritten = []
+        for cue_id in row["cue_ids"]:
+            for value in replacement_cue_ids if cue_id in replaced_cue_ids else [cue_id]:
+                if value not in rewritten:
+                    rewritten.append(value)
+        row["cue_ids"] = rewritten
+
+
 def apply_draft_operation(database, review_id, operation):
     if not isinstance(operation, dict):
         raise FrameCueError("draft operation must be an object")
@@ -1246,6 +1267,12 @@ def apply_draft_operation(database, review_id, operation):
             else:
                 apply_draft_flag(draft["document"], draft["issues"], operation)
                 change = None
+            if kind in {"split", "merge"}:
+                replaced = {operation["cue_id"]}
+                if kind == "merge":
+                    replaced.add(operation["adjacent_cue_id"])
+                replace_draft_cue_references(draft["direct_changes"], replaced, change["cue_ids"])
+                replace_draft_cue_references(draft["issues"], replaced, change["cue_ids"])
             if change is not None:
                 draft["direct_changes"].append(change)
             next_version = expected_version + 1
@@ -2797,33 +2824,43 @@ def make_workspace_server(database, bundle_dir, port=0):
             collaboration.set_presence(session, operation, cue_ids)
 
         def send_workspace_event(self):
+            session_id = self.request_session_id()
             with collaboration.condition:
-                session = self.require_session()
+                session = collaboration.session(session_id)
                 if session is None:
+                    self.send_json(403, {"error": "workspace session is not registered"})
                     return
                 try:
                     last_version = int(self.headers.get("Last-Event-ID", "-1"))
                 except ValueError:
                     last_version = -1
-                collaboration.expire()
-                if collaboration.version <= last_version:
-                    collaboration.condition.wait(timeout=15)
-                    collaboration.expire()
-                version = collaboration.version
-            if version <= last_version:
-                body = b": keepalive\n\n"
-            else:
-                body = (
-                    f"retry: 1000\nid: {version}\nevent: snapshot\n"
-                    f"data: {json.dumps({'version': version})}\n\n"
-                ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
             try:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
+                self.wfile.flush()
+                while True:
+                    with collaboration.condition:
+                        session = collaboration.session(session_id)
+                        if session is None:
+                            return
+                        if collaboration.version <= last_version:
+                            collaboration.condition.wait(timeout=10)
+                        session = collaboration.session(session_id)
+                        if session is None:
+                            return
+                        version = collaboration.version
+                    if version <= last_version:
+                        body = b": keepalive\n\n"
+                    else:
+                        body = (
+                            f"retry: 1000\nid: {version}\nevent: snapshot\n"
+                            f"data: {json.dumps({'version': version})}\n\n"
+                        ).encode("utf-8")
+                        last_version = version
+                    self.wfile.write(body)
+                    self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
 

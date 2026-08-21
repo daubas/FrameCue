@@ -210,6 +210,10 @@ class WorkspaceV2Tests(unittest.TestCase):
                 {"kind": "split", "draft_version": 0, "cue_id": "c0001", "cursor": 10},
             ).stdout)
             left, right = split["document"]["cues"][:2]
+            self.assertEqual(
+                " ".join((left["source_text"], right["source_text"])),
+                package["cues"][0]["original_text"],
+            )
             merged = json.loads(self._apply(
                 root,
                 database,
@@ -232,8 +236,43 @@ class WorkspaceV2Tests(unittest.TestCase):
                 "parent_cue_ids": [left["id"], right["id"]],
             })
             self.assertEqual((cue["source_start_ms"], cue["source_end_ms"]), (0, 1500))
+            self.assertEqual(cue["source_text"], package["cues"][0]["original_text"])
             self.assertEqual(cue["timing_state"], "provisional")
             self.assertEqual(merged["document"]["blocks"][0]["cue_ids"][0], cue["id"])
+
+    def test_completion_tracks_edits_through_split_and_merge(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-v2-lineage-") as temp:
+            root = Path(temp)
+            database, package = self._workspace(root)
+            self._apply(root, database, package["review_id"], "flag.json", {
+                "kind": "flag", "draft_version": 0, "cue_id": "c0001",
+                "categories": ["translation"], "author": "lead",
+            })
+            self._apply(root, database, package["review_id"], "edit.json", {
+                "kind": "edit", "draft_version": 1, "cue_id": "c0001",
+                "display_text": "OpenClaw 審查流程已更新",
+            })
+            split = json.loads(self._apply(root, database, package["review_id"], "split.json", {
+                "kind": "split", "draft_version": 2, "cue_id": "c0001", "cursor": 8,
+            }).stdout)
+            left, right = split["document"]["cues"][:2]
+            merged = json.loads(self._apply(root, database, package["review_id"], "merge.json", {
+                "kind": "merge", "draft_version": 3, "cue_id": left["id"],
+                "adjacent_cue_id": right["id"],
+            }).stdout)
+
+            completed = json.loads(self._complete(database, package["review_id"], 4).stdout)
+            self.assertEqual(completed["stage"], "content_agent_review_pending")
+            work_order_path = root / "work-order.json"
+            run_cli(
+                "work-pull", "--database", str(database), "--review-id", package["review_id"],
+                "--out", str(work_order_path),
+            )
+            work_order = json.loads(work_order_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                {cue_id for target in work_order["targets"] for cue_id in target["cue_ids"]},
+                {merged["document"]["cues"][0]["id"]},
+            )
 
     def test_merge_rejects_cues_from_different_semantic_blocks(self):
         package = json.loads(FIXTURE.read_text(encoding="utf-8"))

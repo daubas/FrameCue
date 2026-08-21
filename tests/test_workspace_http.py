@@ -2,6 +2,7 @@ import copy
 import json
 import hashlib
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -106,6 +107,34 @@ class WorkspaceHTTPTests(unittest.TestCase):
             "X-FrameCue-CSRF": snapshot["csrf_token"],
             "Cookie": f"framecue_session={session_id}",
         }
+
+    def test_workspace_event_stream_sends_headers_before_waiting_for_changes(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-sse-open-") as temp:
+            root = Path(temp)
+            _, _, server, thread = self._workspace_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                _, _, snapshot = self._json_request(base, "/api/workspace/snapshot")
+                request = (
+                    "GET /api/workspace/events HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{server.server_address[1]}\r\n"
+                    f"Cookie: framecue_session={snapshot['session_id']}\r\n"
+                    f"Last-Event-ID: {snapshot['snapshot_version']}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                with socket.create_connection(server.server_address, timeout=1) as client:
+                    client.settimeout(0.5)
+                    client.sendall(request)
+                    try:
+                        response_start = client.recv(4096)
+                    except socket.timeout:
+                        response_start = b""
+                self.assertTrue(response_start.startswith(b"HTTP/1.0 200"), response_start)
+                self.assertIn(b"Content-Type: text/event-stream", response_start)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
 
     def _agent_token(self, database, package, *permissions, label="agent"):
         result = run_cli(
@@ -632,7 +661,13 @@ class WorkspaceHTTPTests(unittest.TestCase):
                     },
                 )
                 with urllib.request.urlopen(events, timeout=5) as response:
-                    event_body = response.read().decode("utf-8")
+                    event_lines = []
+                    while True:
+                        line = response.readline()
+                        if not line or line == b"\n":
+                            break
+                        event_lines.append(line)
+                    event_body = b"".join(event_lines).decode("utf-8")
                     self.assertTrue(response.headers["Content-Type"].startswith("text/event-stream"))
                 self.assertIn("event: snapshot", event_body)
                 self.assertIn("data: {\"version\":", event_body)
