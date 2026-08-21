@@ -9,6 +9,7 @@
   export let assetUrl = (path) => path;
   export let onStageMode = () => {};
   export let onPlaybackCue = () => {};
+  export let onPlaybackTime = () => {};
 
   let cueAudio;
   let sourceVideoElement;
@@ -129,6 +130,7 @@
   function handleSourceTimeUpdate() {
     if (!sourceVideoElement) return;
     const currentMs = sourceVideoElement.currentTime * 1000;
+    onPlaybackTime(currentMs, Number.isFinite(sourceVideoElement.duration) ? sourceVideoElement.duration * 1000 : 0);
     if (cuePlaybackActive && cuePlaybackEnded(currentMs, cuePlaybackEndMs)) {
       cuePlaybackActive = false;
       sourceVideoElement.pause();
@@ -155,6 +157,7 @@
       }
       playerReady = true;
       playerError = "";
+      onPlaybackTime(cue?.start_ms || 0, Number(event.data.duration) * 1000);
       return;
     }
     if (event.data.type === "hyperframes:error") {
@@ -167,6 +170,7 @@
       playerPlaying = Boolean(event.data.playing);
       const time = Number(event.data.time);
       if (Number.isFinite(time) && packageData?.cues?.length) {
+        onPlaybackTime(time * 1000);
         onPlaybackCue(packageData.cues[cueIndexAtTime(packageData.cues, time * 1000)]?.id);
       }
     }
@@ -215,7 +219,7 @@
           preload="metadata"
           controls
           playsinline
-          on:loadedmetadata={() => alignSourceVideo(true)}
+          on:loadedmetadata={() => { alignSourceVideo(true); handleSourceTimeUpdate(); }}
           on:play={() => { pauseCueAudio(); playerPlaying = true; }}
           on:pause={() => playerPlaying = false}
           on:ended={() => { cuePlaybackActive = false; playerPlaying = false; }}

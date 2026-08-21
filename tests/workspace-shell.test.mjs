@@ -26,5 +26,9 @@ test("Workspace v2 has its own reverse-approval shell while static pages keep Ap
   assert.match(shell, /接手 lead/);
   assert.match(shell, /issue\.authors\?\.includes\(snapshot\.display_name/);
   assert.match(shell, /等待 .*lead/i);
+  assert.match(shell, /aria-label="影片字幕時間軸"/);
+  assert.match(shell, /onPlaybackTime/);
+  assert.match(shell, /timing_state/);
+  assert.match(shell, /來源時間.*配音未對齊/);
   assert.doesNotMatch(shell, /已審|reviewed_cues|完成百分比/);
 });

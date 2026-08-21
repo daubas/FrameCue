@@ -1,6 +1,7 @@
 <script>
   import { onMount } from "svelte";
   import MediaStage from "./components/MediaStage.svelte";
+  import { formatTime } from "./lib/review.js";
   import {
     completeWorkspaceRound,
     loadWorkspaceSnapshot,
@@ -16,6 +17,8 @@
   let editText = "";
   let editor;
   let stageMode = snapshot.document.source_package?.media?.video ? "video" : "still";
+  let playbackMs = snapshot.document.cues[0]?.source_start_ms || 0;
+  let mediaDurationMs = 0;
   let connected = true;
   let syncing = false;
   let localDirty = false;
@@ -56,6 +59,13 @@
     blocks: snapshot.document.blocks || [],
     scenes: sourcePackage.scenes || []
   };
+  $: timelineEndMs = Math.max(mediaDurationMs, ...stageCues.map((cue) => cue.end_ms), 1);
+  $: playheadPercent = Math.min(100, Math.max(0, playbackMs / timelineEndMs * 100));
+  $: selectedTimingLabel = selectedCue?.output_start_ms != null && selectedCue?.output_end_ms != null
+    ? "配音時間已對齊"
+    : selectedCue?.timing_state === "provisional"
+      ? "來源時間 · 暫定切分 · 配音未對齊"
+      : "來源時間 · 配音未對齊";
   $: issueCount = new Set((snapshot.issues || []).map((issue) => issue.range_id || issue.flag_id)).size;
   $: selectedOwnIssues = selectedCue ? (snapshot.issues || []).filter((issue) =>
     issue.cue_ids?.includes(selectedCue.id) && issue.authors?.includes(snapshot.display_name)
@@ -220,6 +230,7 @@
     if (cueId === selectedCueId) return;
     await leaveEditor();
     selectedCueId = cueId;
+    playbackMs = cues.find((cue) => cue.id === cueId)?.source_start_ms || 0;
     await post({ kind: "presence", selected_cue_id: cueId });
   }
 
@@ -379,14 +390,44 @@
       {assetUrl}
       onStageMode={(mode) => { stageMode = mode; }}
       onPlaybackCue={(cueId) => { if (cues.some((cue) => cue.id === cueId)) selectCue(cueId); }}
+      onPlaybackTime={(currentMs, durationMs = 0) => {
+        playbackMs = currentMs;
+        if (durationMs > 0) mediaDurationMs = durationMs;
+      }}
     />
 
     <section class="cue-workspace" aria-label="字幕工作區">
+      <section class="cue-timeline" aria-label="影片字幕時間軸">
+        <div class="timeline-heading">
+          <strong>字幕時間軸</strong>
+          <span>{formatTime(playbackMs)} / {formatTime(timelineEndMs)}</span>
+        </div>
+        <div class="timeline-track">
+          {#each stageCues as cue}
+            <button
+              type="button"
+              class:active={cue.id === selectedCue?.id}
+              class:needs-change={(snapshot.issues || []).some((issue) => issue.cue_ids?.includes(cue.id))}
+              style={`left:${cue.start_ms / timelineEndMs * 100}%;width:${Math.max(.25, (cue.end_ms - cue.start_ms) / timelineEndMs * 100)}%`}
+              aria-label={`${cue.id} ${formatTime(cue.start_ms)} 至 ${formatTime(cue.end_ms)}`}
+              title={`${cue.id} · ${formatTime(cue.start_ms)}–${formatTime(cue.end_ms)}`}
+              on:click={() => selectCue(cue.id)}
+            ></button>
+          {/each}
+          <span class="playhead" style={`left:${playheadPercent}%`}></span>
+        </div>
+        <div class="timeline-status">
+          <span>{selectedTimingLabel}</span>
+          <span>{sourcePackage.media?.video ? "影片時間軸" : "目前套件未附影片 · 依 Cue 來源時間顯示"}</span>
+        </div>
+      </section>
+
       <div class="cue-list" aria-label="字幕清單">
         {#each cues as cue, index}
           <button class:active={cue.id === selectedCue?.id} class:needs-change={(snapshot.issues || []).some((issue) => issue.cue_ids?.includes(cue.id))} class:locked={snapshot.locks.some((lock) => lock.cue_id === cue.id && lock.session_id !== snapshot.session_id)} type="button" on:click={() => selectCue(cue.id)}>
             <small>{index + 1}</small>
             <span>{cue.display_text}</span>
+            <small class="cue-time">{formatTime(cue.source_start_ms)}–{formatTime(cue.source_end_ms)}</small>
             {#if snapshot.participants.some((participant) => participant.selected_cue_id === cue.id && participant.session_id !== snapshot.session_id)}
               <small>{snapshot.participants.filter((participant) => participant.selected_cue_id === cue.id && participant.session_id !== snapshot.session_id).map((participant) => participant.display_name).join(", ")}</small>
             {/if}
@@ -437,13 +478,22 @@
   .workspace-message { color: #ffc6be; }
   .workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(420px, 560px); height: calc(100vh - 64px); }
   .workspace-grid :global(.media-stage) { min-width: 0; }
-  .cue-workspace { display: grid; grid-template-columns: minmax(145px, .7fr) minmax(240px, 1.3fr); min-width: 0; min-height: 0; background: #1b201d; }
+  .cue-workspace { display: grid; grid-template-columns: minmax(145px, .7fr) minmax(240px, 1.3fr); grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; background: #1b201d; }
+  .cue-timeline { grid-column: 1 / -1; padding: 10px 12px 9px; border-left: 1px solid #3b443d; border-bottom: 1px solid #3b443d; }
+  .timeline-heading, .timeline-status { display: flex; justify-content: space-between; gap: 10px; color: #aeb9ad; font-size: 11px; }
+  .timeline-heading strong { color: #eef2ec; font-size: 12px; }
+  .timeline-track { position: relative; height: 22px; margin: 7px 0 5px; overflow: hidden; border-radius: 4px; background: #101311; }
+  .timeline-track button { position: absolute; top: 4px; height: 14px; min-width: 2px; padding: 0; border: 1px solid #607061; border-radius: 2px; background: #39443b; }
+  .timeline-track button.active { z-index: 2; border-color: #d7efcd; background: #6b9068; }
+  .timeline-track button.needs-change { background: #975d4c; }
+  .timeline-track .playhead { position: absolute; z-index: 3; top: 0; bottom: 0; width: 2px; transform: translateX(-1px); background: #f3d26d; pointer-events: none; }
   .cue-list { min-height: 0; overflow: auto; border-left: 1px solid #3b443d; border-right: 1px solid #3b443d; }
   .cue-list button { display: grid; width: 100%; min-height: 64px; grid-template-columns: 28px 1fr; align-items: start; gap: 6px; padding: 10px; border: 0; border-bottom: 1px solid #323a34; border-radius: 0; background: transparent; text-align: left; }
   .cue-list button.active { background: #394f40; }
   .cue-list button.needs-change { box-shadow: inset 3px 0 #cf765e; }
   .cue-list button.locked { opacity: .68; }
   .cue-list small { color: #9da99d; }
+  .cue-list .cue-time { grid-column: 2; font-size: 10px; }
   .cue-list span { overflow-wrap: anywhere; color: #eef2ec; line-height: 1.4; }
   .cue-editor { min-width: 0; overflow: auto; padding: 16px; }
   .editor-title, .cue-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
