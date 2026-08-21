@@ -1,7 +1,7 @@
 # FrameCue v2 Refactor - Implementation Note
 
-Status: v2 static runtime complete at `v2.6.0`; Subtitle Workspace content-review milestone implemented, acceptance pending
-Last updated: 2026-08-20
+Status: v2 static runtime complete at `v2.6.0`; Inline Cue Subtitle Workspace milestone implemented and locally validated; release acceptance pending
+Last updated: 2026-08-21
 Owner: FrameCue
 Related handoff: `AgenticDub/docs/architecture/framecue-v2-agenticdub-handoff.md`
 
@@ -26,7 +26,7 @@ returns a checksum-bound Candidate with audio/alignment/timing evidence.
 The implemented milestone now provides:
 
 - a SQLite-backed complete Subtitle Document v2 draft with compare-and-swap
-  edit, split, same-Block merge, and needs-modification operations;
+  edit, Cue split/merge, Block split/merge, and category-plus-note Agent marking;
 - reverse approval that creates an immutable Content Revision directly for a
   clean round, or one frozen content-correction Work Order for edited and
   flagged ranges;
@@ -44,6 +44,94 @@ exception review, portable Workspace export/import and recovery, and final UAT
 remain pending. No production workflow has cut over to this Workspace. The
 current contract and rollout order live in
 [`subtitle-workspace-agenticdub-refactor-plan.md`](subtitle-workspace-agenticdub-refactor-plan.md).
+
+## 2026-08-21 — Inline Cue Subtitle Workspace milestone contract (approved)
+
+This is the implemented contract for the current Subtitle Workspace UI pass.
+It applies to subtitle `content_review`; static v2,
+redraw, boundary, Markdown, and HyperFrames workflows keep their existing
+workflow-specific media surfaces.
+
+### Primary surface
+
+- Every Cue is one visible row/card and the row is the only primary editing
+  surface. The reviewer edits `display_text` inline in that row; there is no
+  persistent separate editor column for Subtitle Workspace content review.
+- The row owns the direct interactions: plain `Enter` at a valid interior caret
+  splits the Cue and focuses the new right Cue; `Ctrl/Cmd+Enter` inserts a
+  newline inside the same Cue; `Backspace`/`Delete` merges at a Cue boundary;
+  and `M` toggles the quick Agent mark. IME-composition Enter is ignored, and a
+  split may not create an empty edge. The row's `更多操作` menu is the shared
+  fallback for Cue and Block structural operations; disabled actions explain
+  the stage, lock, adjacency, or invariant reason.
+- Semantic Blocks remain low-interference grouping: a subtle rail/container and
+  header around Cue rows showing Block ID, Cue count, timing state, and review
+  state. Block is not a second review mode or a competing editor. Cue merge may
+  cross one adjacent Block boundary; the separate Block merge keeps every Cue
+  row, while Block split creates a boundary before the selected non-first Cue
+  without splitting or deleting Cues. The left rail is the primary Block
+  interaction: `−` at an internal Cue boundary splits there, while `+` on an
+  existing Block boundary merges the adjacent Blocks. UI labels Blocks by
+  document order (`Block 01`, `Block 02`) while retaining opaque IDs in data;
+  rail handles stay hidden until their hit area is hovered or focused.
+- Each Cue row keeps one compact metadata line for Cue number, source time,
+  Block ID, and the real Agent-mark state.
+- While a row is being edited, playback follow/playhead-follow pauses. The
+  reviewer can resume or seek deliberately after the edit; editing must not
+  move the active row underneath the caret.
+
+### Agent marking and approval
+
+- This milestone attaches the existing `needs modification` flag to the Cue
+  row. The explicit control records a category plus an optional note; `M` is
+  the quick `other`-category toggle. A marked row visibly reads
+  `待 Agent 修改`. The backend has no per-Cue Agent processing-status contract,
+  so the UI does not claim that a Cue is queued or processing.
+- A closed-by-default `交給 Agent` disclosure shares the compact `正在編輯`
+  bar. Expanding it reveals category, optional note, mark/update, and cancel;
+  marked state remains visible in the closed summary. `更多操作` is the second
+  closed disclosure on that same line, and opening either closes the other.
+- Mark-first remains the flow: FrameCue batches the marked ranges and direct
+  edits when the lead completes the round. It does not invoke an Agent for each
+  keystroke or each mark. The UI reuses the existing Work Order v2 operations
+  and states; it does not add a new Agent execution capability.
+- Reverse approval is unchanged: only marked or directly edited exceptions are
+  sent for correction; unmarked Cues are approved when the round completes.
+
+### Media and global controls
+
+- In an ordinary video Subtitle Workspace, the video is the Cue context. Do not
+  show a Cue still/video toggle or a second Cue image surface; clicking a row
+  seeks the video and the paused frame is its visual context.
+- No-video packages and special still/redraw/boundary/HyperFrames workflows
+  retain the media/still modes required by those workflows.
+- Playback remains in the media surface; complete-round and sync/reviewer state
+  remain global. Search/replace and technical metadata stay outside the Cue row
+  and are not expanded in this milestone.
+- The compressed overview timeline is hidden during `content_review`, where
+  timing is read-only and duplicates video/Cue timestamps. It remains available
+  for later audiovisual stages where source/output timing differences matter.
+
+### Explicitly deferred from this milestone
+
+- speculative immediate Agent execution per Cue mark;
+- per-Cue Agent processing-status backend/UI and a full Work Order composer in
+  the browser; and
+- server-owned Undo/Redo (native text undo before synchronization remains
+  available).
+
+### Done when
+
+The implementation is complete only when every Cue is edited in-place as one
+row/card, plain Enter splits and focuses the right Cue, Ctrl/Cmd+Enter keeps a
+newline in the same Cue, Cue/Block merge and Block split preserve their stated
+boundaries, mark/fallback actions work in the row, Block grouping stays
+secondary, follow-play pauses during editing, ordinary video has no Cue
+still/video toggle, existing special media modes still work, Agent handoff is
+represented by the category-plus-note `待 Agent 修改` marker and batched at
+round completion, global controls remain available, and reverse approval still
+accepts unmarked content. The deferred items above must remain absent from this
+milestone.
 
 ## Success Criteria
 
@@ -76,7 +164,7 @@ Observed review data supports a deliberately small action model. In a 487-cue ed
 | Owner | Responsibilities |
 |---|---|
 | FrameCue | Versioned package/result schemas, static viewer, immutable review revisions, Workspace draft/collaboration state, Work Orders and Candidate decisions, media review, approval, export, validation, and migration tooling |
-| AgenticDub | STT, translation, glossary, punctuation policy, cue split/merge, semantic blocks, `speech_text`, pronunciation-risk generation, TTS, TTS/STT audit, and applying approved results |
+| AgenticDub | STT, translation, glossary, punctuation policy, pipeline-side Cue/Block generation and re-realization, `speech_text`, pronunciation-risk generation, TTS, TTS/STT audit, and applying approved results |
 | Global FrameCue skill | Invoke the pinned FrameCue CLI to build, serve, validate, and collect packages; record implementation feedback |
 | HyperFrames project | Composition, project media, narration audio, and project-specific player configuration |
 
@@ -125,6 +213,15 @@ The result snapshot repeats the package identity, records final approval state, 
 - Editing or replacing a Cue invalidates its parent block approval. The CLI repeats the invariant check when collecting an approved result.
 - Cues review display wording and visual segmentation; cue timing remains read-only in FrameCue v2.
 - Editing a block invalidates that block's approval and final package approval. Any cues derived from the old block are stale and must be regenerated in a new revision.
+- During `content_review`, an adjacent cross-Block merge is allowed as one atomic
+  operation: both affected Semantic Blocks are merged/recomposed and their
+  Cue/Block/`speech_text` invariants, checksums, and lineage are validated and
+  recorded together.
+- Block merge is a distinct operation that joins adjacent Blocks while retaining
+  all Cue rows. Block split creates two Blocks before the selected non-first Cue
+  while retaining every Cue and its order.
+- After voice alignment, a cross-Block merge invalidates scoped voice evidence
+  or remains gated by the current stage; stale evidence is never reused.
 - Cue review state is browser-draft workflow state, not a new result-contract approval type. The formal result remains block approval followed by final package approval.
 - The reviewer works Cue-first. Once every child Cue has been reviewed and the content invariant passes, FrameCue approves the parent block automatically.
 - Packages without blocks use cues as the review source directly.
@@ -168,7 +265,10 @@ All workflows use the same four areas:
 
 1. **Top toolbar**: package selector, progress, final approval, and export.
 2. **Media Stage**: still image, redraw comparison, boundary context, or HyperFrames playback.
-3. **Review Workbench**: Cue-first list and editor. Semantic-block meaning and speech text stay in collapsible context; Risk and All are filters, not competing review modes.
+3. **Review Workbench**: Cue-first list and editor. Subtitle Workspace content
+   review follows the Inline Cue milestone contract below: one inline-editable
+   Cue row/card is the primary surface, with compact interactive Block grouping
+   around it. Risk and All are filters, not competing review modes.
 4. **Details**: collapsible provenance, trace, policy, and advanced metadata.
 
 Controls that require an upstream LLM or pipeline rerun must include an inline explanation marker. Explanations must remain visible without covering the media stage.
@@ -301,6 +401,9 @@ Each implementation phase must leave the smallest runnable check that proves its
 - Hosted accounts, remote multi-tenant persistence, or comments. Subtitle
   Workspace collaboration uses short-lived local sessions and SQLite state.
 - A general nonlinear editor or timeline editor.
+- For the current Inline Cue Subtitle Workspace milestone: speculative
+  per-mark Agent execution, a full browser Work Order composer, and
+  server-owned Undo/Redo.
 - Supporting arbitrary plugin-defined workflows in v2.
 - Automatic v1 compatibility inside the v2 viewer.
 
@@ -312,7 +415,7 @@ Each implementation phase must leave the smallest runnable check that proves its
 | Browser drafts become inaccessible after path/origin changes | Export or retire drafts before migration; isolate new drafts by identity and checksum |
 | Svelte refactor reproduces current UI coupling | Keep state transitions explicit and test round trips before adding media adapters |
 | Generated bundles become new source forks | Treat `dist` and review directories as immutable build artifacts |
-| Block and cue edits conflict | Keep semantic ownership in blocks and regenerate projections as a new revision |
+| Block and Cue edits conflict | Keep semantic ownership in Blocks; atomically recompose adjacent cross-Block merges and validate projections, checksums, and lineage |
 
 ## Decision and Feedback Log
 
@@ -359,3 +462,53 @@ Each implementation phase must leave the smallest runnable check that proves its
 - Added Shift-based contiguous Cue-range selection for subtitle-family review. The workbench shows an STL-style time track with combined source, display, and speech context before a reviewer marks the range for `resegment`.
 - The batch action writes the existing `resegment` action and one shared instruction to every selected Cue. It does not edit timing, merge Cues, or change the package/result schema; AgenticDub creates a new immutable revision for the actual segmentation work.
 - Replaced native-title `!` markers with click/focus-accessible help popovers. The same component is used for display text, speech text, follow-up action, range instruction, and search/replace help.
+
+### 2026-08-21 - Block-aware Subtitle Workspace interaction (approved)
+
+- Keep review Cue-first while making Block grouping visible as a compact,
+  interactive Block container/rail/header around dense editable Cue cards. Block
+  headers tag Block ID, Cue count, timing state, and review state.
+- Make plain `Enter` at an interior caret split and focus the new right Cue;
+  `Ctrl/Cmd+Enter` inserts a same-Cue newline; `Backspace` at Cue start merges
+  the previous adjacent Cue; `Delete` at Cue end merges the next adjacent Cue;
+  and `M` toggles the quick Agent mark. Ignore IME composition Enter and reject
+  splits that would create an empty edge. Accessible contextual controls remain
+  fallback; disabled actions explain why.
+- During `content_review`, permit adjacent cross-Block merge as an atomic
+  merge/recomposition of both Semantic Blocks with Cue/Block/`speech_text`
+  invariants, checksums, and lineage. After voice alignment, invalidate scoped
+  voice evidence or stay gated per stage.
+- Preserve both parent Blocks' extension/provenance payloads inside the merged
+  lineage and record parent/result IDs plus before/after projection checksums in
+  the direct-change audit. Never let a left-Block copy silently erase right-Block
+  metadata.
+- Ignore IME composition key events, disable merges when either affected Cue is
+  locked by another reviewer, and require a valid interior caret before split.
+- Do not add arbitrary Cue reorder or drag in this pass.
+- Add separate Block merge and Block split operations: merge retains Cue rows,
+  and split inserts a Block boundary before the selected non-first Cue. Focused
+  Python checks cover projection, lineage, audit hashes, stale/stage rejection,
+  reference preservation, and completion targets; the Node shell check covers
+  the implemented keyboard, Cue metadata, Agent fields, and Block controls.
+
+### 2026-08-21 — Inline Cue row and Agent marking contract (approved)
+
+- The next Subtitle Workspace pass makes each Cue one visible row/card and the
+  only primary editing surface. Inline text editing, split, adjacent merge,
+  needs-modification marking, and the accessible `⋯` fallback live on that row;
+  there is no persistent separate editor column.
+- Block remains a low-interference grouping rail/header. The ordinary video
+  workspace uses the video as Cue context and removes the Cue still/video
+  toggle; no-video and special media workflows retain their still/media modes.
+- The existing needs-modification marker attaches to the marked Cue or
+  contiguous range as a category plus optional note and is visibly labelled
+  `待 Agent 修改`. Mark-first/batch-at-complete-round and reverse approval are
+  unchanged, and the UI reuses existing Work Order v2 capabilities. The current
+  backend has no per-Cue processing-status contract; instant execution and a
+  processing-status UI remain deferred with the full Work Order composer.
+- Editing pauses follow-play. The global toolbar keeps playback,
+  search/replace, complete-round, and sync/reviewer controls.
+- This milestone explicitly defers speculative immediate Agent execution,
+  per-Cue Agent processing-status backend/UI, a full browser Work Order composer,
+  and server-owned Undo/Redo. The preceding contract's done-when checklist is
+  the acceptance test for this pass.

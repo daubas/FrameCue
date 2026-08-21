@@ -6,6 +6,7 @@
   export let cue;
   export let cueDraft;
   export let stageMode = "still";
+  export let subtitleOnlyVideo = false;
   export let assetUrl = (path) => path;
   export let onStageMode = () => {};
   export let onPlaybackCue = () => {};
@@ -34,13 +35,14 @@
   $: workflowKind = packageData?.workflow?.kind || "subtitle";
   $: cueNumber = Math.max(0, packageData?.cues?.findIndex((item) => item.id === cue?.id) + 1);
   $: markdownKind = cue?.markdown?.kind === "heading" ? "標題" : cue?.markdown?.kind === "list" ? "清單" : "段落";
+  $: subtitleVideoOnly = subtitleOnlyVideo && sourceVideo && !redraw && !boundary && !hyperframes && !carousel && !markdown;
   $: availableModes = [
-    "still",
+    ...(subtitleVideoOnly ? [] : ["still"]),
     ...(redraw ? ["redraw"] : []),
     ...(boundary ? ["boundary"] : []),
     ...(sourceVideo || hyperframes ? ["video"] : [])
   ];
-  $: if (!availableModes.includes(stageMode)) onStageMode("still");
+  $: if (!availableModes.includes(stageMode)) onStageMode(availableModes[0] || "still");
   $: playerSrc = hyperframes ? `${assetUrl(hyperframes.entry)}${hyperframes.config ? `?config=${encodeURIComponent(hyperframes.config)}` : ""}` : "";
   $: if (playerSrc) playerOrigin = new URL(playerSrc, window.location.href).origin;
   $: if (stageMode === "video" && playerReady && cue) {
@@ -200,13 +202,15 @@
       <span class="eyebrow">{carousel ? "圖卡審閱" : markdown ? "Markdown 審閱" : "媒體畫面"}</span>
       <strong>{cue?.id || "沒有 Cue"}</strong>
     </div>
-    <div class="mode-strip" aria-label="畫面模式">
-      {#each availableModes as mode}
-        <button class:active={stageMode === mode} type="button" on:click={() => setMode(mode)}>
-          {mode === "still" ? "Cue 畫面" : mode === "redraw" ? "重繪比較" : mode === "boundary" ? "切點比較" : "影片"}
-        </button>
-      {/each}
-    </div>
+    {#if availableModes.length > 1}
+      <div class="mode-strip" role="group" aria-label="畫面模式">
+        {#each availableModes as mode}
+          <button class:active={stageMode === mode} type="button" on:click={() => setMode(mode)}>
+            {mode === "still" ? "Cue 畫面" : mode === "redraw" ? "重繪比較" : mode === "boundary" ? "切點比較" : "影片"}
+          </button>
+        {/each}
+      </div>
+    {/if}
   </div>
 
   <div class="stage-canvas">

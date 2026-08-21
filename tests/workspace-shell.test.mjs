@@ -32,3 +32,77 @@ test("Workspace v2 has its own reverse-approval shell while static pages keep Ap
   assert.match(shell, /來源時間.*配音未對齊/);
   assert.doesNotMatch(shell, /已審|reviewed_cues|完成百分比/);
 });
+
+test("Workspace exposes Block-aware, reasoned structural controls and keyboard fallbacks", () => {
+  const shell = readFileSync(new URL("../src/SubtitleWorkspace.svelte", import.meta.url), "utf8");
+  const mediaStage = readFileSync(new URL("../src/components/MediaStage.svelte", import.meta.url), "utf8");
+
+  assert.match(shell, /class="block-group"/);
+  assert.match(shell, /Block \{String\(groupIndex \+ 1\)\.padStart/);
+  assert.match(shell, /Cue · 時長/);
+  assert.match(shell, /blockTimingState/);
+  assert.match(shell, /blockReviewState/);
+  assert.match(shell, /<summary>更多操作<\/summary>/);
+  assert.match(shell, /跨區塊：合併字幕與區塊/);
+  assert.match(shell, /同區塊：與\$\{direction\}合併/);
+  assert.match(shell, /previousMergeReason/);
+  assert.match(shell, /nextMergeReason/);
+  assert.match(shell, /class="action-reason"/);
+  assert.match(shell, /event\.key === "Enter" && \(event\.metaKey \|\| event\.ctrlKey\)/);
+  assert.match(shell, /event\.key === "Backspace" && event\.target\.selectionStart === 0/);
+  assert.match(shell, /event\.key === "Delete" && event\.target\.selectionStart === event\.target\.value\.length/);
+  assert.match(shell, /event\.key\.toLowerCase\(\) === "m"/);
+  assert.match(shell, /const mShortcutAllowed = \(!interactive \|\| event\.target\?\.closest\?\.\("\.cue-row-select"\)\)\s*&& !event\.target\?\.closest\?\.\("details"\)/);
+  assert.match(shell, /if \(mShortcutAllowed && event\.key\.toLowerCase\(\) === "m" && canEdit\)/);
+  assert.match(shell, /event\.isComposing \|\| event\.keyCode === 229/);
+  assert.match(shell, /正在修改相鄰 Cue/);
+  assert.match(shell, /splitAvailabilityReason/);
+  assert.match(shell, /splitAvailabilityReason\(selectedCue, editReason, caretStart, caretEnd, editText\)/);
+  assert.match(shell, /framecue:toggle-playback/);
+  assert.match(shell, /\["ArrowUp", "ArrowDown"\]/);
+  assert.match(shell, /class="cue-inline-editor"/);
+  assert.match(shell, /class="cue-row-select"/);
+  assert.doesNotMatch(shell, /class="cue-editor"/);
+  assert.match(shell, /function followPlaybackCue/);
+  assert.match(shell, /document\.activeElement === editor \|\| heldCueIds\.length \|\| localDirty/);
+  assert.match(mediaStage, /export let subtitleOnlyVideo = false/);
+  assert.match(mediaStage, /subtitleVideoOnly/);
+  assert.match(mediaStage, /\{#if availableModes\.length > 1\}/);
+  assert.doesNotMatch(shell, /draggable|dragstart|dragover/);
+});
+
+test("Workspace keeps Cue, Block, and Agent interactions visibly distinct", () => {
+  const shell = readFileSync(new URL("../src/SubtitleWorkspace.svelte", import.meta.url), "utf8");
+
+  assert.match(shell, /event\.key === "Enter" && !event\.metaKey && !event\.ctrlKey/);
+  assert.match(shell, /insertCueLineBreak/);
+  assert.match(shell, /finally \{\s*busy = false;\s*\}\s*if \(focusSplitChild\)/);
+  assert.match(shell, /event\.key === "Enter" && \(event\.metaKey \|\| event\.ctrlKey\)/);
+  assert.match(shell, /從游標切成兩句/);
+  assert.match(shell, /class="cue-meta"/);
+  assert.match(shell, /Block \{String\(blockNumberById\.get\(cue\.block_id\)/);
+  assert.match(shell, /待 Agent 修改/);
+  assert.match(shell, /交給 Agent/);
+  assert.match(shell, /class="cue-editing-bar"/);
+  assert.match(shell, /class="agent-inline"/);
+  assert.doesNotMatch(shell, /<details class="agent-inline" open/);
+  assert.match(shell, /class="block-rail-handle merge"/);
+  assert.match(shell, /class="block-rail-handle split"/);
+  assert.match(shell, /\+<span>合併上方 Block<\/span>/);
+  assert.match(shell, /−<span>從這裡切開 Block<\/span>/);
+  assert.match(shell, /mergeBlockBoundary/);
+  assert.match(shell, /splitBlockBoundary/);
+  assert.match(shell, /blockNumberById/);
+  assert.match(shell, /snapshot\.stage !== "content_review"/);
+  assert.match(shell, /class:content-review/);
+  assert.match(shell, /\.block-rail-handle \{[^}]*opacity: 0/);
+  assert.match(shell, /\.cue-actions \{ position: absolute/);
+  assert.doesNotMatch(shell, /class="agent-request"|<summary>Block 操作<\/summary>/);
+  assert.match(shell, /name="agent-category"/);
+  assert.match(shell, /name="agent-note"/);
+  assert.match(shell, /async function saveAgentRequest\(\)[\s\S]*?await leaveEditor\(\);[\s\S]*?kind: "flag"/);
+  assert.match(shell, /修改工作單已建立，等待 Agent 接手/);
+  assert.match(shell, /aria-describedby=\{previousBlockMergeReason/);
+  assert.match(shell, /kind: "block_merge"/);
+  assert.match(shell, /kind: "block_split"/);
+});

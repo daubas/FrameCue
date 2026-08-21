@@ -979,6 +979,82 @@ def recompute_draft_blocks(document):
         block["speech_text"] = " ".join(cue["speech_text"] for cue in block_cues)
 
 
+_DRAFT_BLOCK_CORE_FIELDS = {
+    "id", "cue_ids", "start_ms", "end_ms", "budget_ms",
+    "source_text", "target_text", "speech_text", "lineage",
+}
+
+
+def draft_block_children(document, block):
+    block_id = ensure_id(block.get("id", ""), "workspace draft Block id")
+    cue_ids = block.get("cue_ids")
+    if (
+        not isinstance(cue_ids, list)
+        or not cue_ids
+        or not all(isinstance(cue_id, str) and cue_id for cue_id in cue_ids)
+        or len(set(cue_ids)) != len(cue_ids)
+    ):
+        raise FrameCueError(f"workspace draft Block Cues are invalid: {block_id}")
+    cue_by_id = {cue.get("id"): cue for cue in document["cues"] if isinstance(cue, dict)}
+    if len(cue_by_id) != len(document["cues"]):
+        raise FrameCueError("workspace draft cues are invalid")
+    try:
+        cues = [cue_by_id[cue_id] for cue_id in cue_ids]
+    except KeyError as error:
+        raise FrameCueError(f"workspace draft Block references an unknown Cue: {error.args[0]}") from error
+    positions = [document["cues"].index(cue) for cue in cues]
+    if (
+        positions != list(range(positions[0], positions[0] + len(positions)))
+        or any(cue.get("block_id") != block_id for cue in cues)
+    ):
+        raise FrameCueError(f"workspace draft Block Cues are not a contiguous projection: {block_id}")
+    return cues
+
+
+def draft_block_parent(block):
+    return {
+        "id": block["id"],
+        "lineage": copy.deepcopy(block.get("lineage")),
+        "extensions": {
+            key: copy.deepcopy(value) for key, value in block.items()
+            if key not in _DRAFT_BLOCK_CORE_FIELDS
+        },
+    }
+
+
+def draft_block_from_cues(cues, lineage):
+    if not cues:
+        raise FrameCueError("workspace draft Block must contain Cues")
+    starts = [as_ms(cue.get("source_start_ms"), f"workspace draft Cue source_start_ms: {cue.get('id')}") for cue in cues]
+    ends = [as_ms(cue.get("source_end_ms"), f"workspace draft Cue source_end_ms: {cue.get('id')}") for cue in cues]
+    source_text = [as_text(cue.get("source_text"), f"workspace draft Cue source_text: {cue.get('id')}") for cue in cues]
+    display_text = [as_text(cue.get("display_text"), f"workspace draft Cue display_text: {cue.get('id')}") for cue in cues]
+    speech_text = [as_text(cue.get("speech_text"), f"workspace draft Cue speech_text: {cue.get('id')}") for cue in cues]
+    start, end = min(starts), max(ends)
+    return {
+        "id": opaque_id("block"),
+        "cue_ids": [cue["id"] for cue in cues],
+        "start_ms": start,
+        "end_ms": end,
+        "budget_ms": end - start,
+        "source_text": " ".join(value for value in source_text if value),
+        "target_text": " ".join(display_text),
+        "speech_text": " ".join(speech_text),
+        "lineage": copy.deepcopy(lineage),
+    }
+
+
+def draft_projection_checksum(document, cue_ids, blocks):
+    projection = {
+        "cues": [
+            copy.deepcopy(cue) for cue in document["cues"]
+            if cue.get("id") in set(cue_ids)
+        ],
+        "blocks": copy.deepcopy(blocks),
+    }
+    return hashlib.sha256(canonical_json(projection).encode("utf-8")).hexdigest()
+
+
 def draft_row(connection, workspace):
     row = connection.execute(
         """SELECT draft_version, document_json, issues_json, direct_changes_json
@@ -1118,23 +1194,51 @@ def apply_draft_merge(document, operation):
     adjacent_cue_id = ensure_id(operation.get("adjacent_cue_id", ""), "draft merge adjacent_cue_id")
     if cue_id == adjacent_cue_id:
         raise FrameCueError("draft merge requires two different Cues")
-    cue_by_id = {cue.get("id"): cue for cue in document["cues"] if isinstance(cue, dict)}
-    if cue_id not in cue_by_id or adjacent_cue_id not in cue_by_id:
+    cue_indexes = {
+        cue.get("id"): index for index, cue in enumerate(document["cues"])
+        if isinstance(cue, dict)
+    }
+    if cue_id not in cue_indexes or adjacent_cue_id not in cue_indexes:
         raise FrameCueError("workspace draft merge Cue was not found")
-    first = cue_by_id[cue_id]
-    second = cue_by_id[adjacent_cue_id]
-    if first.get("block_id") != second.get("block_id"):
-        raise FrameCueError("draft merge Cues must share one Semantic Block")
-    block = next((row for row in document["blocks"] if row.get("id") == first.get("block_id")), None)
-    if block is None or not isinstance(block.get("cue_ids"), list):
+    first_index, second_index = cue_indexes[cue_id], cue_indexes[adjacent_cue_id]
+    if abs(first_index - second_index) != 1:
+        raise FrameCueError("draft merge Cues must be adjacent in source order")
+    left_index, right_index = sorted((first_index, second_index))
+    left, right = document["cues"][left_index], document["cues"][right_index]
+    left_block_id, right_block_id = left.get("block_id"), right.get("block_id")
+    block_indexes = {
+        block.get("id"): index for index, block in enumerate(document["blocks"])
+        if isinstance(block, dict)
+    }
+    if left_block_id not in block_indexes or right_block_id not in block_indexes:
         raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
-    first_index = block["cue_ids"].index(cue_id) if cue_id in block["cue_ids"] else -1
-    second_index = block["cue_ids"].index(adjacent_cue_id) if adjacent_cue_id in block["cue_ids"] else -1
-    if first_index < 0 or second_index < 0 or abs(first_index - second_index) != 1:
-        raise FrameCueError("draft merge Cues must be adjacent in their Semantic Block")
-    left_id, right_id = (cue_id, adjacent_cue_id) if first_index < second_index else (adjacent_cue_id, cue_id)
-    left = cue_by_id[left_id]
-    right = cue_by_id[right_id]
+    left_block = document["blocks"][block_indexes[left_block_id]]
+    right_block = document["blocks"][block_indexes[right_block_id]]
+    if not isinstance(left_block.get("cue_ids"), list) or not isinstance(right_block.get("cue_ids"), list):
+        raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
+    left_block_cue_index = left_block["cue_ids"].index(left["id"]) if left["id"] in left_block["cue_ids"] else -1
+    right_block_cue_index = right_block["cue_ids"].index(right["id"]) if right["id"] in right_block["cue_ids"] else -1
+    if left_block_cue_index < 0 or right_block_cue_index < 0:
+        raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
+    if left_block_id == right_block_id:
+        if right_block_cue_index != left_block_cue_index + 1:
+            raise FrameCueError("draft merge Cues must be adjacent in their Semantic Block")
+    elif (
+        block_indexes[right_block_id] != block_indexes[left_block_id] + 1
+        or left_block_cue_index != len(left_block["cue_ids"]) - 1
+        or right_block_cue_index != 0
+    ):
+        raise FrameCueError("draft merge Cues must cross adjacent Semantic Block boundaries")
+    parent_blocks = [left_block] if left_block_id == right_block_id else [left_block, right_block]
+    affected_cue_ids = {
+        cue_id for block in parent_blocks for cue_id in block["cue_ids"]
+    }
+    before_projection = {
+        "cues": copy.deepcopy([
+            cue for cue in document["cues"] if cue.get("id") in affected_cue_ids
+        ]),
+        "blocks": copy.deepcopy(parent_blocks),
+    }
     origins = []
     for cue in (left, right):
         for origin in cue.get("origin_cue_ids", [cue["id"]]):
@@ -1156,19 +1260,172 @@ def apply_draft_merge(document, operation):
         "display_text": " ".join((left["display_text"], right["display_text"])),
         "speech_text": " ".join((left["speech_text"], right["speech_text"])),
         "speech_linked": bool(left.get("speech_linked")) and bool(right.get("speech_linked")),
-        "block_id": block["id"],
+        "block_id": left_block_id,
         "origin_cue_ids": origins,
-        "lineage": {"operation": "merge", "parent_cue_ids": [left_id, right_id]},
+        "lineage": {"operation": "merge", "parent_cue_ids": [left["id"], right["id"]]},
     }
-    cue_indexes = [index for index, cue in enumerate(document["cues"]) if cue.get("id") in {left_id, right_id}]
-    insert_at = min(cue_indexes)
-    document["cues"] = [cue for cue in document["cues"] if cue.get("id") not in {left_id, right_id}]
-    document["cues"].insert(insert_at, merged)
-    block_index = min(first_index, second_index)
-    block["cue_ids"][block_index:block_index + 2] = [merged["id"]]
+    document["cues"][left_index:right_index + 1] = [merged]
+    if left_block_id == right_block_id:
+        left_block["cue_ids"][left_block_cue_index:right_block_cue_index + 1] = [merged["id"]]
+    else:
+        merged_block = {
+            key: copy.deepcopy(value) for key, value in left_block.items()
+            if key in {
+                "id", "cue_ids", "start_ms", "end_ms", "budget_ms",
+                "source_text", "target_text", "speech_text",
+            }
+        }
+        merged_block_id = opaque_id("block")
+        merged_block.update({
+            "id": merged_block_id,
+            "cue_ids": left_block["cue_ids"][:left_block_cue_index] + [merged["id"]] + right_block["cue_ids"][right_block_cue_index + 1:],
+            "lineage": {
+                "operation": "merge",
+                "parent_block_ids": [left_block_id, right_block_id],
+                "parent_blocks": [{
+                    "id": block["id"],
+                    "lineage": copy.deepcopy(block.get("lineage")),
+                    "extensions": {
+                        key: copy.deepcopy(value) for key, value in block.items()
+                        if key not in {
+                            "id", "cue_ids", "start_ms", "end_ms", "budget_ms",
+                            "source_text", "target_text", "speech_text", "lineage",
+                        }
+                    },
+                } for block in (left_block, right_block)],
+            },
+        })
+        for cue in document["cues"]:
+            if cue.get("block_id") in {left_block_id, right_block_id}:
+                cue["block_id"] = merged_block_id
+        merged["block_id"] = merged_block_id
+        merged_block_cues = {
+            cue["id"]: cue for cue in document["cues"] if isinstance(cue, dict)
+        }
+        block_cues = [merged_block_cues[value] for value in merged_block["cue_ids"]]
+        start = min(cue["source_start_ms"] for cue in block_cues)
+        end = max(cue["source_end_ms"] for cue in block_cues)
+        merged_block.update({
+            "start_ms": start,
+            "end_ms": end,
+            "budget_ms": end - start,
+            "source_text": " ".join(
+                value for cue in block_cues for value in [cue.get("source_text", "")] if value
+            ),
+        })
+        left_block_index, right_block_index = block_indexes[left_block_id], block_indexes[right_block_id]
+        document["blocks"][left_block_index:right_block_index + 1] = [merged_block]
     recompute_draft_blocks(document)
     refresh_document_checksum(document)
-    return {"kind": "merge", "cue_ids": [merged["id"]]}
+    result_block = next(block for block in document["blocks"] if block["id"] == merged["block_id"])
+    result_cue_ids = set(result_block["cue_ids"])
+    return {
+        "kind": "merge",
+        "cue_ids": [merged["id"]],
+        "parent_cue_ids": [left["id"], right["id"]],
+        "parent_block_ids": [block["id"] for block in parent_blocks],
+        "result_block_ids": [result_block["id"]],
+        "before_checksum": hashlib.sha256(canonical_json(before_projection).encode("utf-8")).hexdigest(),
+        "after_checksum": hashlib.sha256(canonical_json({
+            "cues": [cue for cue in document["cues"] if cue.get("id") in result_cue_ids],
+            "blocks": [result_block],
+        }).encode("utf-8")).hexdigest(),
+    }
+
+
+def apply_draft_block_merge(document, operation):
+    left_block_id = ensure_id(operation.get("block_id", ""), "draft block merge block_id")
+    right_block_id = ensure_id(operation.get("adjacent_block_id", ""), "draft block merge adjacent_block_id")
+    if left_block_id == right_block_id:
+        raise FrameCueError("draft block merge requires two different Blocks")
+    block_indexes = {
+        block.get("id"): index for index, block in enumerate(document["blocks"])
+        if isinstance(block, dict)
+    }
+    if left_block_id not in block_indexes or right_block_id not in block_indexes:
+        raise FrameCueError("workspace draft block merge Block was not found")
+    if block_indexes[right_block_id] != block_indexes[left_block_id] + 1:
+        raise FrameCueError("draft block merge Blocks must be adjacent in document order")
+    left_block = document["blocks"][block_indexes[left_block_id]]
+    right_block = document["blocks"][block_indexes[right_block_id]]
+    left_cues = draft_block_children(document, left_block)
+    right_cues = draft_block_children(document, right_block)
+    if document["cues"].index(right_cues[0]) != document["cues"].index(left_cues[-1]) + 1:
+        raise FrameCueError("draft block merge Blocks must be adjacent in source order")
+    parent_blocks = [left_block, right_block]
+    affected_cue_ids = [cue["id"] for cue in left_cues + right_cues]
+    before_checksum = draft_projection_checksum(document, affected_cue_ids, parent_blocks)
+    merged_block = draft_block_from_cues(left_cues + right_cues, {
+        "operation": "block_merge",
+        "parent_block_ids": [left_block_id, right_block_id],
+        "parent_blocks": [draft_block_parent(block) for block in parent_blocks],
+    })
+    for cue in left_cues + right_cues:
+        cue["block_id"] = merged_block["id"]
+    left_index, right_index = block_indexes[left_block_id], block_indexes[right_block_id]
+    document["blocks"][left_index:right_index + 1] = [merged_block]
+    recompute_draft_blocks(document)
+    refresh_document_checksum(document)
+    return {
+        "kind": "block_merge",
+        "scope": "block",
+        "cue_ids": affected_cue_ids,
+        "parent_cue_ids": affected_cue_ids,
+        "result_cue_ids": affected_cue_ids,
+        "parent_block_ids": [left_block_id, right_block_id],
+        "result_block_ids": [merged_block["id"]],
+        "before_checksum": before_checksum,
+        "after_checksum": draft_projection_checksum(document, affected_cue_ids, [merged_block]),
+    }
+
+
+def apply_draft_block_split(document, operation):
+    block_id = ensure_id(operation.get("block_id", ""), "draft block split block_id")
+    cue_id = ensure_id(operation.get("cue_id", ""), "draft block split cue_id")
+    block_index = next((index for index, block in enumerate(document["blocks"]) if block.get("id") == block_id), None)
+    if block_index is None:
+        raise FrameCueError(f"workspace draft block split Block was not found: {block_id}")
+    parent_block = document["blocks"][block_index]
+    parent_cues = draft_block_children(document, parent_block)
+    cue_ids = [cue["id"] for cue in parent_cues]
+    if cue_id not in cue_ids:
+        raise FrameCueError(f"workspace draft block split Cue was not found: {cue_id}")
+    split_index = cue_ids.index(cue_id)
+    if split_index == 0:
+        raise FrameCueError("draft block split Cue must not be the first Cue in its Block")
+    before_checksum = draft_projection_checksum(document, cue_ids, [parent_block])
+    parent_lineage = draft_block_parent(parent_block)
+    left_block = draft_block_from_cues(parent_cues[:split_index], {
+        "operation": "block_split",
+        "parent_block_ids": [block_id],
+        "parent_blocks": [copy.deepcopy(parent_lineage)],
+        "split_at_cue_id": cue_id,
+    })
+    right_block = draft_block_from_cues(parent_cues[split_index:], {
+        "operation": "block_split",
+        "parent_block_ids": [block_id],
+        "parent_blocks": [copy.deepcopy(parent_lineage)],
+        "split_at_cue_id": cue_id,
+    })
+    for cue in parent_cues[:split_index]:
+        cue["block_id"] = left_block["id"]
+    for cue in parent_cues[split_index:]:
+        cue["block_id"] = right_block["id"]
+    document["blocks"][block_index:block_index + 1] = [left_block, right_block]
+    recompute_draft_blocks(document)
+    refresh_document_checksum(document)
+    return {
+        "kind": "block_split",
+        "scope": "block",
+        "cue_ids": cue_ids,
+        "parent_cue_ids": cue_ids,
+        "result_cue_ids": cue_ids,
+        "parent_block_ids": [block_id],
+        "result_block_ids": [left_block["id"], right_block["id"]],
+        "split_at_cue_id": cue_id,
+        "before_checksum": before_checksum,
+        "after_checksum": draft_projection_checksum(document, cue_ids, [left_block, right_block]),
+    }
 
 
 def apply_draft_flag(document, issues, operation):
@@ -1244,7 +1501,7 @@ def apply_draft_operation(database, review_id, operation):
     if type(expected_version) is not int or expected_version < 0:
         raise FrameCueError("draft operation draft_version is invalid")
     kind = operation.get("kind")
-    if kind not in {"edit", "split", "merge", "flag"}:
+    if kind not in {"edit", "split", "merge", "block_merge", "block_split", "flag"}:
         raise FrameCueError("draft operation kind is invalid")
     connection = open_workspace_database(database)
     try:
@@ -1264,6 +1521,10 @@ def apply_draft_operation(database, review_id, operation):
                 change = apply_draft_split(draft["document"], operation)
             elif kind == "merge":
                 change = apply_draft_merge(draft["document"], operation)
+            elif kind == "block_merge":
+                change = apply_draft_block_merge(draft["document"], operation)
+            elif kind == "block_split":
+                change = apply_draft_block_split(draft["document"], operation)
             else:
                 apply_draft_flag(draft["document"], draft["issues"], operation)
                 change = None
@@ -1489,7 +1750,7 @@ def completed_draft_summary(connection, workspace, draft_version):
     }
 
 
-def workspace_work_order_target(document, cue_ids, range_id, allowed_operations, allowed_fields, categories=(), notes=(), direct_edit=False):
+def workspace_work_order_target(document, cue_ids, range_id, allowed_operations, allowed_fields, categories=(), notes=(), direct_edit=False, direct_changes=()):
     cue_by_id = {cue["id"]: cue for cue in document["cues"]}
     try:
         cues = [cue_by_id[cue_id] for cue_id in cue_ids]
@@ -1501,6 +1762,11 @@ def workspace_work_order_target(document, cue_ids, range_id, allowed_operations,
             block_ids.append(cue["block_id"])
     blocks = [block for block in document["blocks"] if block["id"] in block_ids]
     projection = {"cues": cues, "blocks": blocks}
+    context = {"direct_edit": direct_edit, "categories": list(categories), "notes": list(notes)}
+    if direct_changes:
+        context["direct_changes"] = copy.deepcopy(list(direct_changes))
+        # `allowed_operations` stays Cue-scoped for the existing Candidate v2 consumer.
+        context["allowed_operation_scope"] = "cue"
     return {
         "range_id": range_id,
         "cue_ids": cue_ids,
@@ -1511,7 +1777,7 @@ def workspace_work_order_target(document, cue_ids, range_id, allowed_operations,
         "allowed_operations": allowed_operations,
         "allowed_fields": allowed_fields,
         "before_checksum": hashlib.sha256(canonical_json(projection).encode("utf-8")).hexdigest(),
-        "context": {"direct_edit": direct_edit, "categories": list(categories), "notes": list(notes)},
+        "context": context,
     }
 
 
@@ -1519,11 +1785,14 @@ def correction_work_order_targets(document, direct_changes, issues):
     cue_order = [cue["id"] for cue in document["cues"]]
     ranges = []
     for change in direct_changes:
-        ranges.append({"cue_ids": change["cue_ids"], "range_id": "", "direct_edit": True, "categories": [], "notes": []})
+        ranges.append({
+            "cue_ids": change["cue_ids"], "range_id": "", "direct_edit": True,
+            "categories": [], "notes": [], "direct_changes": [change],
+        })
     for issue in issues:
         ranges.append({
             "cue_ids": issue["cue_ids"], "range_id": issue["range_id"], "direct_edit": False,
-            "categories": [issue["category"]], "notes": issue["notes"],
+            "categories": [issue["category"]], "notes": issue["notes"], "direct_changes": [],
         })
     merged = []
     for value in ranges:
@@ -1535,13 +1804,14 @@ def correction_work_order_targets(document, direct_changes, issues):
             value["direct_edit"] = value["direct_edit"] or row["direct_edit"]
             for key in ("categories", "notes"):
                 value[key] = list(dict.fromkeys(row[key] + value[key]))
+            value["direct_changes"] = row["direct_changes"] + value["direct_changes"]
         merged.append(value)
     return [
         workspace_work_order_target(
             document, value["cue_ids"], value["range_id"] or opaque_id("range"),
             ["edit", "split", "merge"],
             ["display_text", "speech_text", "block.target_text", "block.speech_text"],
-            value["categories"], value["notes"], value["direct_edit"],
+            value["categories"], value["notes"], value["direct_edit"], value["direct_changes"],
         )
         for value in merged
     ]
@@ -2759,12 +3029,24 @@ def make_workspace_server(database, bundle_dir, port=0):
                     f"workspace draft version is stale: expected {snapshot['draft_version']}, got {draft_version}"
                 )
 
-        def operation_cue_ids(self, operation):
+        def operation_cue_ids(self, operation, document):
             kind = operation.get("kind")
             if kind in {"edit", "split"}:
                 values = [operation.get("cue_id")]
             elif kind == "merge":
                 values = [operation.get("cue_id"), operation.get("adjacent_cue_id")]
+            elif kind == "block_merge":
+                block_ids = [operation.get("block_id"), operation.get("adjacent_block_id")]
+                values = [
+                    cue.get("id") for cue in document.get("cues", [])
+                    if isinstance(cue, dict) and cue.get("block_id") in block_ids
+                ]
+            elif kind == "block_split":
+                block_id = operation.get("block_id")
+                values = [
+                    cue.get("id") for cue in document.get("cues", [])
+                    if isinstance(cue, dict) and cue.get("block_id") == block_id
+                ]
             elif kind == "flag":
                 values = operation.get("cue_ids")
                 if values is None:
@@ -2812,7 +3094,7 @@ def make_workspace_server(database, bundle_dir, port=0):
                     raise FrameCueError("workspace lead operation is invalid")
                 collaboration.transfer_lead(session, expected_lead_session_id, new_lead_session_id)
                 return self.current_snapshot(session)
-            affected_cue_ids = self.operation_cue_ids(operation)
+            affected_cue_ids = self.operation_cue_ids(operation, snapshot["document"])
             collaboration.assert_unlocked(session, affected_cue_ids)
             apply_draft_operation(database, review_id, operation)
             collaboration.unlock(session, affected_cue_ids)
