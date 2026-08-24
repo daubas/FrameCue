@@ -407,6 +407,40 @@ Each implementation phase must leave the smallest runnable check that proves its
 - Supporting arbitrary plugin-defined workflows in v2.
 - Automatic v1 compatibility inside the v2 viewer.
 
+### Review-time Agent suggestions (2026-08-24)
+
+`交給 Agent` now evolves from a saved flag into an asynchronous suggestion
+request. FrameCue owns the queued job, draft/checksum binding, reviewer-visible
+status, and explicit apply/ignore decision. It still does not call an LLM or
+allow an agent to overwrite subtitle truth.
+
+AgenticDub owns the worker and invokes the installed Codex CLI as an ephemeral,
+read-only structured-output subprocess. The worker uses scoped FrameCue HTTP
+claim/submit/fail endpoints rather than SQLite. A returned suggestion is bound
+to its frozen Cue context; a changed draft makes it stale instead of applying
+against newer text.
+
+The Cue row is the complete interaction surface on desktop, phone, and iPad:
+queued/processing/ready/stale/failed status, before/after text, and accessible
+apply/ignore controls appear inline. No separate Agent panel, direct database
+access, persistent Codex session, automatic apply, or new UI dependency is
+introduced in this milestone.
+
+Implemented result: the suggestion lifecycle uses the existing agent bearer
+permissions, five-minute lease, draft CAS, and SSE invalidation. Cancel/reflag
+keeps historical rows for audit while exposing only the newest unresolved job
+per Cue/category. Phone review actions remain available even though direct text
+and structural editing stay read-only. Full Node/Python/build validation and a
+disposable real-Codex end-to-end run passed.
+
+Peter production review exposed a preservation gap: a completed suggestion is
+stored separately from the draft until the reviewer applies it, so a Work Order
+backup preserves applied text but not a ready proposal. A later merge changed
+the proposal's frozen Block context and silently presented it as stale.
+Structural draft operations now fail with HTTP 409 when they would stale a
+currently ready suggestion; queued and processing work remains non-blocking.
+Direct human text edits still take precedence and may stale an older proposal.
+
 ## Main Risks
 
 | Risk | Control |
@@ -512,3 +546,130 @@ Each implementation phase must leave the smallest runnable check that proves its
   per-Cue Agent processing-status backend/UI, a full browser Work Order composer,
   and server-owned Undo/Redo. The preceding contract's done-when checklist is
   the acceptance test for this pass.
+
+### 2026-08-21 — Structural edit interaction context
+
+- Cue／Block 結構操作必須保留操作前的使用者脈絡：結果 Cue、字幕清單中的
+  視覺位置，以及 textarea／邊界控制的鍵盤焦點。
+- 根因是合併上一句刪除右側 Cue 時，SSE `reload()` 可能先把不存在的選取
+  退回 Cue 1；POST 完成後又把這個暫時 fallback 當成正式結果。結果 Cue
+  現在只由操作前選取與回應 lineage 決定，本地 transaction 期間收到的 SSE
+  會在結果穩定後再 reconcile。
+- 共用結構操作流程會在重繪後校正 Cue list／page scroll 並以
+  `preventScroll` 恢復焦點；Cue split／merge 與 Block split／merge 不再各自
+  呈現不同的跳動行為。
+- 回歸驗證包含 450ms 延遲 POST＋SSE、Cue merge、Enter split 與 Block
+  merge；Node 35/35、Python 64/64、production build 與 diff check 均通過。
+  測試只使用 Boris Workspace 拷貝，未讀寫 Peter 的 package 或審查資料。
+
+### 2026-08-21 — Global Cue keyboard navigation
+
+- `ArrowUp`／`ArrowDown` 是 Workspace 瀏覽模式的全域 Cue 導覽，不受 button、
+  summary、select 或其他非字幕編輯元素焦點限制；IME 組字事件仍直接略過。
+- 導覽沿用既有 save／unlock／presence／lock 流程，完成後以原生 smooth
+  scroll 將新 Cue 放到字幕清單中央，並以 `preventScroll` 把焦點交給新 Cue
+  選取列。滑鼠點選與影片播放跟隨不強制置中。
+- 字幕 textarea 只在明確進入修稿模式後存在；修稿中的上下鍵保留原生游標
+  行為，不再觸發全域 Cue 導覽。
+
+### 2026-08-21 — Separate Cue browse and subtitle edit modes
+
+- 單擊 Cue 只選取；雙擊字幕才進入該 Cue 的行內修稿模式並取得既有鎖。
+  選取狀態仍保留「交給 Agent」與「更多操作」，不需要先進入修稿。
+- 瀏覽模式的 `ArrowUp`／`ArrowDown` 會切換 Cue、平滑置中並把焦點留在 Cue
+  選取列。修稿模式則保留 textarea 的原生上下鍵游標移動。
+- 在 collapsed caret 位於文字開頭時按 `ArrowLeft`，會先經既有
+  save／unlock／presence／lock 流程，再進入上一 Cue 的文字結尾；位於文字
+  結尾時按 `ArrowRight`，會進入下一 Cue 的文字開頭。IME 組字不攔截。
+- `Escape` 結束修稿但保留選取；點選其他 Cue 會先儲存目前文字，再退出修稿
+  並選取新 Cue。
+- Node 35/35、Python 64/64、production build 與 diff check 通過。隔離 Boris
+  Workspace 副本的 Chrome 實測確認單擊、雙擊、上下導覽、左右跨句、Esc，
+  以及修改後點選下一 Cue 的儲存流程；Peter 資料未被操作。
+
+### 2026-08-21 — Rapid navigation and selected-Cue menu stability
+
+- 快速連按 `ArrowUp`／`ArrowDown` 時，每次按鍵先同步累積本地導覽目標，讓
+  畫面立即選到使用者實際要求的 Cue；save／unlock／presence 仍以單一路徑
+  序列化追上最新目標，只在穩定後做一次 smooth center。
+- 原本 `selectCue()` 在更新選取前先等待 save／unlock，導致同一瞬間的所有
+  keydown 都從舊索引算出相同下一句。未完成的舊選取也會在使用者點開
+  `交給 Agent`／`更多操作` 後重建選中列，使選單看似無法點擊。
+- 點選 Cue 或進入修稿會取消尚未提交的鍵盤導覽目標；若使用者已把焦點放進
+  選中 Cue 的行內控制，最後置中不會搶走焦點。
+- 隔離 Boris Workspace Chrome 回歸：同步 5 次 `ArrowDown` 前進 5 Cues、
+  清單中心誤差 0px；快速導覽後 `交給 Agent` 與 `更多操作` 都能維持展開。
+  Node 35/35、Python 64/64、production build 與 diff check 通過；Peter 未操作。
+
+### 2026-08-21 — Persisted Agent instruction visibility
+
+- `交給 Agent` 儲存後，選中 Cue 的操作列會持續顯示「已記錄給 Agent」以及
+  伺服器 snapshot 回傳的問題分類與備註；不必重新展開 details 才能確認。
+- details summary 同步改為 `✓ 已記錄`。完整內容保留在可見摘要與 title；過長
+  備註在緊湊列中以 ellipsis 顯示，但資料本身不截斷。
+- 顯示只以 `selectedOwnIssues` 的 authoritative Review Flag 為準，不另外建立
+  local success state。重載後仍存在即代表資料庫已記錄；取消標記後摘要消失並
+  回到 `交給 Agent`。
+- 隔離 Boris Workspace Chrome 實測完成「翻譯錯誤＋備註」儲存、整頁重載與
+  取消；Node 35/35、Python 64/64、production build 與 diff check 通過。
+  Peter 未操作。
+
+### 2026-08-24 — Whole-Cue deletion and truthful Agent delivery state
+
+- Review Flag 與 Suggestion Job 現在是兩個明確狀態。既有 flag 若沒有 job，UI
+  顯示「尚未送出給 Agent」，不再用「已記錄」暗示 worker 已接手；只有
+  queued／processing／ready job 才顯示已送出狀態。
+- 桌面與 iPad 的選中 Cue 在「更多操作」提供「刪除 Cue」，瀏覽模式亦可用
+  `Shift+Delete`（macOS 相容 `Shift+Backspace`）。確認後以 draft-version CAS
+  刪除整列；同 Block 尚有 Cue 時重算 Block，否則移除空 Block。最後一個 Cue
+  禁止刪除，手機結構編輯仍維持唯讀。
+- 刪除會移除 issue 中的舊 Cue reference，保留 `deleted_cue` 與 surviving
+  correction anchor 在 direct-change audit；既有 Suggestion Job 因 Cue 消失而
+  安全顯示 stale。完成本輪仍能建立 `content_correction_review` Work Order。
+- Peter 的舊 `c0326` flag 經正式 Workspace API 補送，worker 已回傳 ready
+  proposal，未自動套用。Node 40/40、Python 75/75、production build、
+  py_compile 與 diff check 全部通過。
+
+### 2026-08-24 — Reopen a pending content round
+
+- 完成 Peter 內容輪次後才發現四組上游重複翻譯；既有 stage
+  `content_agent_review_pending` 正確拒絕直接 draft edit，但規格所述的
+  「完成後新發現的人工作業開新 round」缺少實作入口。
+- 新增 `workspace-reopen` CLI。它只接受尚未 claim 的 pending
+  `content_correction_review`，以單一 transaction 將 Work Order 標為
+  `cancelled`、清除 draft freeze 並回到 `content_review`；processing、已有
+  Candidate 或其他 stage 均 fail closed。
+- Peter `req-0001` 已透過此入口取消，draft v100 的人工修改完整保留，後續修正
+  皆走既有版本鎖定 Workspace API。聚焦回歸驗證 reopen 後仍可繼續 edit，且
+  舊修改不遺失。
+
+### 2026-08-24 — Agent prompt stays inside its Cue
+
+- 展開 `Agent 設定` 時，提示輸入區不再以 absolute positioning 浮在字幕上；
+  它改為 Cue 操作列中的全寬 normal-flow row，並將後續 Cue 往下推。
+- 既有欄位、送出行為與收合狀態不變。桌面與 390px 手機 viewport 實測均未與
+  當前字幕或下一個 Cue 重疊；Node 41/41 與 production build 通過。
+
+### 2026-08-24 — Suggestion worker lifecycle
+
+- Workspace server 與 AgenticDub suggestion worker 是兩個獨立程序；只恢復
+  `workspace-serve` 時，Suggestion Job 會如實停在 queued，且 attempt count
+  維持 0。啟動／交付 HITL Workspace 時必須同時檢查兩個程序。
+- Peter Cue 235 的原 job 沒有 lease、沒有執行失敗，根因是 worker 不在線。
+  恢復限定單一 Workspace 的 scoped worker 後，原 job 經一次 claim 進入 ready；
+  沒有建立重複 job，也沒有自動套用建議。
+- 後續 job 在後端已完成、畫面卻仍停在排隊中，確認是連續 SSE 事件造成多個
+  snapshot reload 並行；較舊 response 可能較晚抵達並覆蓋新狀態。reload 現在
+  依 `snapshot_version` 拒絕倒退，無須手動重整才能看見 ready。Node 42/42 與
+  production build 通過。
+
+### 2026-08-24 — Human edits are authoritative at round completion
+
+- Reverse approval 的完成條件改以仍存在的 Review Flag 為準。已儲存的人工 edit、
+  split、merge、delete 與 Block 結構調整保留 direct-change audit，但不再被送回
+  Agent 當 correction target。
+- 沒有 flag 的人工修稿直接封存為 `content` revision 並建立
+  `realize_voice_timeline`；仍有 flag 時只包含 flagged ranges。新增人工 edit-only
+  回歸並更新既有 completion／reopen／delete 契約；Python 78/78 通過。
+- Peter draft v268 的 224 筆手改已依此封存為 checksum
+  `2fc647bf…7746`，Workspace 進入 `voice_realization_pending`。

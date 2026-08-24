@@ -137,6 +137,31 @@ export function submitWorkspaceOperation(workspace, operation, options = {}) {
   }, options);
 }
 
+export function resolveStructuralCueId(cues, operation, selectedBefore) {
+  const byId = (cueId) => cues.find((cue) => cue.id === cueId);
+  if (operation.kind === "split") {
+    const children = cues.filter((cue) => cue.lineage?.parent_cue_ids?.includes(operation.cue_id));
+    return children[1]?.id || children[0]?.id || byId(selectedBefore)?.id || cues[0]?.id || "";
+  }
+  if (operation.kind === "merge") {
+    const parentIds = [operation.cue_id, operation.adjacent_cue_id].filter(Boolean);
+    const merged = byId(operation.cue_id) || cues.find((cue) =>
+      parentIds.every((cueId) => cue.lineage?.parent_cue_ids?.includes(cueId))
+    );
+    return merged?.id || byId(selectedBefore)?.id || cues[0]?.id || "";
+  }
+  if (operation.kind === "delete") {
+    return nearestRemainingCueId(cues, operation.selection_index);
+  }
+  return byId(selectedBefore)?.id || byId(operation.cue_id)?.id || cues[0]?.id || "";
+}
+
+export function nearestRemainingCueId(cues, deletedIndex) {
+  if (!cues.length) return "";
+  const index = Number.isInteger(deletedIndex) ? Math.min(deletedIndex, cues.length - 1) : 0;
+  return cues[Math.max(0, index)]?.id || "";
+}
+
 export function completeWorkspaceRound(workspace, options = {}) {
   return workspacePost("/api/workspace/complete", workspace, {
     draft_version: workspace.draft_version

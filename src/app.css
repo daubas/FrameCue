@@ -294,7 +294,10 @@ mark { border-radius: 3px; padding: .02em .12em; background: #aa4f45; color: #ff
   .toolbar-actions .icon-button { width: 44px; flex: 0 0 44px; }
   .stage-topline { align-items: flex-start; gap: 8px; }
   .mode-strip { flex-wrap: wrap; justify-content: flex-end; }
-  .media-stage { min-height: 450px; }
+  .media-stage { width: 100%; min-width: 0; max-width: 100vw; min-height: 450px; }
+  .stage-canvas,
+  .still-stage,
+  .source-video-stage { width: 100%; min-width: 0; max-width: calc(100vw - 28px); }
   .stage-footer { align-items: flex-start; flex-direction: column; }
   .stage-actions { justify-content: flex-start; }
   .compare-stage { grid-template-columns: 1fr; }

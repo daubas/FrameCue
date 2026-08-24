@@ -781,7 +781,7 @@ class WorkspaceHTTPTests(unittest.TestCase):
                     value={"draft_version": 1},
                     headers=alice_headers,
                 )
-                self.assertEqual(completed["stage"], "content_agent_review_pending")
+                self.assertEqual(completed["stage"], "voice_realization_pending")
             finally:
                 server.shutdown()
                 thread.join(timeout=5)

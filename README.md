@@ -88,6 +88,8 @@ The implemented content-review milestone supports:
   round;
 - immutable Content Revisions and checksum-bound content-correction Work
   Orders;
+- safe reopening of an unclaimed pending content-correction order without
+  discarding the frozen draft;
 - Content Candidate v2 validation and independent accept/reject decisions;
 - browser sessions, presence, lead transfer, Cue locks, dirty-state completion
   gates, autosave, and server-sent change notifications;

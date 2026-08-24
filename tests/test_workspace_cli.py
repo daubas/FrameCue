@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -217,6 +218,32 @@ class WorkspaceCliTests(unittest.TestCase):
         summary = json.loads(self._submit(database, self._write_candidate(root, "candidate.json", candidate)).stdout)
         self.assertEqual(summary["stage"], "audiovisual_review")
         self.assertEqual(summary["status"], "candidate_ready")
+
+    def test_work_submit_accepts_voice_candidate_for_v2_document(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database, _, work_order = self._pending_work_order(root)
+            work_order["document"]["schema"] = "framecue_subtitle_document_v2"
+            self._refresh_checksum(work_order["document"])
+            work_order["base_checksum"] = work_order["document"]["checksum"]
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "UPDATE revisions SET document_json = ? WHERE revision_id = (SELECT revision_id FROM work_orders WHERE request_id = ?)",
+                    (json.dumps(work_order["document"]), work_order["request_id"]),
+                )
+                connection.execute(
+                    "UPDATE work_orders SET base_checksum = ? WHERE request_id = ?",
+                    (work_order["base_checksum"], work_order["request_id"]),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            summary = json.loads(self._submit(
+                database, self._write_candidate(root, "candidate-v2.json", self._candidate(root, work_order))
+            ).stdout)
+            self.assertEqual(summary["status"], "candidate_ready")
 
     def test_content_completion_creates_checksum_bound_work_order(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-cli-") as temp:

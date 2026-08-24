@@ -5,7 +5,9 @@
   import {
     completeWorkspaceRound,
     loadWorkspaceSnapshot,
+    nearestRemainingCueId,
     openWorkspaceEvents,
+    resolveStructuralCueId,
     submitWorkspaceOperation
   } from "./lib/workspace.js";
 
@@ -13,6 +15,7 @@
 
   let snapshot = initialSnapshot;
   let selectedCueId = snapshot.document.cues[0]?.id || "";
+  let editingCueId = "";
   let editCueId = "";
   let editText = "";
   let editor;
@@ -36,8 +39,14 @@
   let agentCueId = "";
   let agentCategory = "other";
   let agentNote = "";
+  let agentNoteOverrides = new Map();
   let agentMenu;
   let actionsMenu;
+  let cueList;
+  let agentSuggestions;
+  let reloadQueued = false;
+  let pendingNavigationIndex = -1;
+  let navigationPromise = null;
 
   const agentCategories = [
     ["translation", "翻譯錯誤"],
@@ -47,6 +56,72 @@
     ["tone", "語氣"],
     ["other", "其他"]
   ];
+
+  const agentSuggestionStatuses = ["queued", "processing", "ready", "stale", "failed"];
+  const agentSuggestionStatusLabels = {
+    queued: "排隊中",
+    processing: "處理中",
+    ready: "可套用",
+    stale: "已過期",
+    failed: "失敗"
+  };
+
+  function normalizeAgentSuggestion(row) {
+    const proposal = row?.proposal && typeof row.proposal === "object" ? row.proposal : {};
+    const rawStatus = String(row?.status || "queued").toLowerCase();
+    const status = {
+      pending: "queued",
+      candidate_ready: "ready",
+      ready_for_review: "ready",
+      suggestion_ready: "ready",
+      suggestion_stale: "stale",
+      suggestion_failed: "failed",
+      error: "failed"
+    }[rawStatus] || rawStatus;
+    const cueIds = Array.isArray(row?.cue_ids)
+      ? row.cue_ids.filter((cueId) => typeof cueId === "string" && cueId)
+      : [row?.cue_id || proposal.cue_id].filter((cueId) => typeof cueId === "string" && cueId);
+    return {
+      ...row,
+      job_id: row?.job_id || row?.id || "",
+      cue_ids: cueIds,
+      status,
+      before: row?.before ?? row?.before_text ?? proposal.before ?? "",
+      after: row?.after ?? row?.after_text ?? proposal.text ?? row?.proposed_text ?? "",
+      explanation: row?.explanation ?? proposal.explanation ?? row?.note ?? "",
+      error: typeof row?.error === "object"
+        ? row.error?.message || row.error?.detail || ""
+        : row?.error ?? row?.last_error ?? row?.message ?? ""
+    };
+  }
+
+  function normalizeAgentSuggestions(rows) {
+    return (Array.isArray(rows) ? rows : [])
+      .map(normalizeAgentSuggestion)
+      .filter((suggestion) => suggestion.job_id && suggestion.cue_ids.length
+        && agentSuggestionStatuses.includes(suggestion.status));
+  }
+
+  function agentSuggestionStatusLabel(status) {
+    return agentSuggestionStatusLabels[status] || "排隊中";
+  }
+
+  function cueAgentSuggestions(cueId) {
+    return agentSuggestions.filter((suggestion) => suggestion.cue_ids.includes(cueId));
+  }
+
+  function selectedAgentJob(cueId, category) {
+    return cueAgentSuggestions(cueId)
+      .filter((suggestion) => suggestion.category === category
+        && ["queued", "processing", "ready"].includes(suggestion.status))
+      .at(-1) || null;
+  }
+
+  function syncAgentSuggestions(next) {
+    if (Array.isArray(next?.suggestions)) agentSuggestions = normalizeAgentSuggestions(next.suggestions);
+  }
+
+  agentSuggestions = normalizeAgentSuggestions(snapshot.suggestions);
 
   $: cues = snapshot.document.cues || [];
   $: blocks = snapshot.document.blocks || [];
@@ -75,6 +150,7 @@
     return groups;
   })();
   $: selectedCue = cues.find((cue) => cue.id === selectedCueId) || cues[0] || null;
+  $: if (editingCueId && !cues.some((cue) => cue.id === editingCueId)) editingCueId = "";
   $: if (selectedCue && selectedCue.id !== editCueId) {
     editCueId = selectedCue.id;
     editText = selectedCue.display_text ?? selectedCue.text ?? "";
@@ -117,29 +193,33 @@
     issue.cue_ids?.includes(selectedCue.id)
   ) : [];
   $: selectedHasIssue = selectedOwnIssues.length > 0;
+  $: activeSelectedAgentJob = selectedAgentJob(selectedCue?.id, agentCategory);
   $: if (selectedCue && selectedCue.id !== agentCueId) {
     agentCueId = selectedCue.id;
-    agentCategory = selectedOwnIssues[0]?.category || "other";
-    agentNote = selectedOwnIssues.flatMap((issue) => issue.notes || [])[0] || "";
+    const nextCategory = selectedOwnIssues[0]?.category || "other";
+    agentCategory = nextCategory;
+    agentNote = latestAgentNote(selectedCue.id, nextCategory);
   }
   $: agentPending = snapshot.stage.endsWith("_pending");
   $: selectedLock = snapshot.locks.find((lock) => lock.cue_id === selectedCue?.id) || null;
   $: lockedByOther = Boolean(selectedLock && selectedLock.session_id !== snapshot.session_id);
   $: isLead = snapshot.lead_session_id === snapshot.session_id;
   $: leadName = snapshot.participants.find((participant) => participant.session_id === snapshot.lead_session_id)?.display_name || "lead";
-  $: editReason = snapshot.stage !== "content_review"
+  $: reviewActionReason = snapshot.stage !== "content_review"
     ? "目前不是內容審查階段，字幕結構已唯讀。"
     : !connected
       ? "目前離線，請重新同步後再修改。"
       : busy || completing
         ? "上一個操作仍在處理中。"
-        : phone
-          ? "手機版僅供唯讀檢視。"
-          : lockedByOther
-            ? "這句 Cue 正由其他審稿者修改。"
-            : "";
+        : lockedByOther
+          ? "這句 Cue 正由其他審稿者修改。"
+          : "";
+  $: canReview = !reviewActionReason;
+  $: editReason = reviewActionReason || (phone ? "手機版僅供唯讀檢視。" : "");
   $: canEdit = !editReason;
-  $: canType = canEdit && heldCueIds.includes(selectedCue?.id);
+  $: canType = canEdit && editingCueId === selectedCue?.id && heldCueIds.includes(selectedCue?.id);
+  $: canDecideAgentSuggestion = connected && !busy && !completing && !lockedByOther
+    && snapshot.stage === "content_review";
   $: canComplete = canEdit && isLead && !localDirty && !snapshot.participants.some((participant) => participant.dirty) && !snapshot.locks.length;
   $: selectedCueIndex = cues.findIndex((cue) => cue.id === selectedCue?.id);
   $: previousMergeCue = selectedCueIndex > 0 ? cues[selectedCueIndex - 1] : null;
@@ -147,7 +227,12 @@
   $: splitReason = splitAvailabilityReason(selectedCue, editReason, caretStart, caretEnd, editText);
   $: previousMergeReason = mergeReason(previousMergeCue, selectedCue, editReason, blocks);
   $: nextMergeReason = mergeReason(selectedCue, nextMergeCue, editReason, blocks);
-  $: flagReason = !selectedCue ? "沒有可標記的 Cue。" : editReason;
+  $: flagReason = !selectedCue ? "沒有可標記的 Cue。" : reviewActionReason;
+  $: deleteReason = !selectedCue
+    ? "沒有可刪除的 Cue。"
+    : cues.length <= 1
+      ? "Workspace 至少要保留一個 Cue。"
+      : editReason;
   $: selectedBlockIndex = blocks.findIndex((block) => block.id === selectedCue?.block_id);
   $: selectedBlock = selectedBlockIndex >= 0 ? blocks[selectedBlockIndex] : null;
   $: previousBlock = selectedBlockIndex > 0 ? blocks[selectedBlockIndex - 1] : null;
@@ -171,6 +256,33 @@
 
   function cueIssues(cueId) {
     return (snapshot.issues || []).filter((issue) => issue.cue_ids?.includes(cueId));
+  }
+
+  function latestAgentNote(cueId, category) {
+    const key = `${cueId}:${category}`;
+    if (agentNoteOverrides.has(key)) return agentNoteOverrides.get(key);
+    const jobs = agentSuggestions.filter((suggestion) =>
+      suggestion.cue_ids.includes(cueId) && suggestion.category === category
+    );
+    if (jobs.length) return jobs.at(-1).note || "";
+    const notes = (snapshot.issues || [])
+      .filter((issue) => issue.cue_ids?.includes(cueId)
+        && issue.authors?.includes(snapshot.display_name)
+        && issue.category === category)
+      .flatMap((issue) => Array.isArray(issue.notes) ? issue.notes : []);
+    return notes.at(-1) || "";
+  }
+
+  function syncAgentCategoryNote() {
+    agentNote = latestAgentNote(selectedCue?.id, agentCategory);
+  }
+
+  function agentIssueSummary(issue, noteOverride) {
+    const category = agentCategories.find(([value]) => value === issue.category)?.[1] || issue.category;
+    const note = noteOverride === undefined
+      ? latestAgentNote(selectedCue?.id, issue.category)
+      : noteOverride;
+    return note ? `${category} · ${note}` : category;
   }
 
   function blockLockReason(blockRows) {
@@ -257,6 +369,7 @@
   function mergeSnapshot(changed) {
     if (!changed?.document || changed.snapshot_version < snapshot.snapshot_version) return;
     snapshot = { ...snapshot, ...changed, schema: snapshot.schema, csrf_token: snapshot.csrf_token };
+    syncAgentSuggestions(changed);
   }
 
   async function post(operation) {
@@ -266,10 +379,16 @@
   }
 
   async function reload() {
+    if (busy) {
+      reloadQueued = true;
+      return;
+    }
     try {
       const next = await loadWorkspaceSnapshot({ baseHref: window.location.href });
       if (!next) throw new Error("Workspace 已停止提供資料。");
+      if (next.snapshot_version < snapshot.snapshot_version) return;
       snapshot = next;
+      syncAgentSuggestions(next);
       if (!next.document.cues.some((cue) => cue.id === selectedCueId)) {
         selectedCueId = next.document.cues[0]?.id || "";
       }
@@ -279,8 +398,18 @@
     }
   }
 
+  async function flushQueuedReload() {
+    if (!reloadQueued) return;
+    reloadQueued = false;
+    await reload();
+  }
+
   async function submit(operation) {
-    if (!canEdit) return null;
+    const allowed = ["flag"].includes(operation?.kind) ? canReview
+      : ["suggestion_apply", "suggestion_ignore"].includes(operation?.kind)
+        ? canDecideAgentSuggestion
+        : canEdit;
+    if (!allowed) return null;
     syncing = true;
     message = "";
     try {
@@ -391,40 +520,113 @@
     }
   }
 
-  async function selectCue(cueId) {
+  async function selectCue(cueId, { center = false } = {}) {
+    pendingNavigationIndex = -1;
     if (cueId === selectedCueId) return;
     await leaveEditor();
+    editingCueId = "";
     selectedCueId = cueId;
     playbackMs = cues.find((cue) => cue.id === cueId)?.source_start_ms || 0;
     await post({ kind: "presence", selected_cue_id: cueId });
+    if (center) await centerBrowseCue(cueId);
+  }
+
+  async function centerBrowseCue(cueId) {
+    await tick();
+    const row = [...(cueList?.querySelectorAll(".cue-row") || [])]
+      .find((item) => item.dataset.cueId === cueId);
+    row?.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (!document.activeElement?.closest?.(".cue-inline-editor")) {
+      row?.querySelector(".cue-row-select")?.focus({ preventScroll: true });
+    }
+  }
+
+  function flushCueNavigation() {
+    if (navigationPromise) return navigationPromise;
+    navigationPromise = (async () => {
+      try {
+        await tick();
+        await leaveEditor();
+        while (pendingNavigationIndex >= 0) {
+          const targetIndex = pendingNavigationIndex;
+          const cueId = cues[targetIndex]?.id;
+          if (!cueId) break;
+          await post({ kind: "presence", selected_cue_id: cueId });
+          if (targetIndex !== pendingNavigationIndex) continue;
+          pendingNavigationIndex = -1;
+          if (!editingCueId && selectedCueId === cueId) await centerBrowseCue(cueId);
+        }
+      } catch (cause) {
+        pendingNavigationIndex = -1;
+        message = cause?.message || "無法切換字幕";
+        await reload();
+      } finally {
+        navigationPromise = null;
+        if (pendingNavigationIndex >= 0) flushCueNavigation();
+      }
+    })();
+    return navigationPromise;
+  }
+
+  async function enterEditMode(cueId, caret = "end") {
+    pendingNavigationIndex = -1;
+    if (!canEdit) {
+      message = editReason;
+      return;
+    }
+    if (cueId !== selectedCueId) await selectCue(cueId);
+    editingCueId = cueId;
+    await tick();
+    const row = [...(cueList?.querySelectorAll(".cue-row") || [])]
+      .find((item) => item.dataset.cueId === cueId);
+    row?.scrollIntoView({ behavior: "smooth", block: "center" });
+    editor?.focus({ preventScroll: true });
+    if (editor) {
+      const offset = caret === "start" ? 0 : editor.value.length;
+      editor.setSelectionRange(offset, offset);
+      updateCaret(editor);
+    }
+  }
+
+  async function exitEditMode() {
+    if (!editingCueId) return;
+    const cueId = editingCueId;
+    await leaveEditor();
+    editingCueId = "";
+    await tick();
+    const row = [...(cueList?.querySelectorAll(".cue-row") || [])]
+      .find((item) => item.dataset.cueId === cueId);
+    row?.querySelector(".cue-row-select")?.focus({ preventScroll: true });
   }
 
   function followPlaybackCue(cueId) {
-    if (document.activeElement === editor || heldCueIds.length || localDirty) return;
+    if (editingCueId || document.activeElement === editor || heldCueIds.length || localDirty) return;
     if (cues.some((cue) => cue.id === cueId)) selectCue(cueId);
   }
 
   async function structuralOperation(operation, cueIds) {
     if (!canEdit) return;
+    let result = null;
+    const selectedBefore = selectedCueId;
+    const focused = document.activeElement;
+    const anchorRow = focused?.closest?.(".cue-row")
+      || focused?.closest?.(".block-group")?.querySelector(".cue-row")
+      || editor?.closest?.(".cue-row");
+    const anchorCueId = anchorRow?.dataset.cueId || selectedBefore;
+    const anchorTop = anchorRow?.getBoundingClientRect().top;
+    const scrollsInList = cueList && cueList.scrollHeight > cueList.clientHeight + 1;
+    const restoreEditor = editingCueId === selectedBefore
+      && (focused === editor || Boolean(focused?.closest?.(".cue-inline-editor")));
     await leaveEditor();
     busy = true;
     message = "";
-    let focusSplitChild = false;
     try {
       await lockCues(cueIds);
       const changed = await post(operation);
+      result = changed;
       heldCueIds = [];
-      const splitChildren = operation.kind === "split"
-        ? changed.document.cues.filter((cue) => cue.lineage?.parent_cue_ids?.includes(operation.cue_id))
-        : [];
-      selectedCueId = splitChildren[1]?.id
-        || changed.document.cues.find((cue) => cue.id === selectedCueId)?.id
-        || changed.document.cues.find((cue) => operation.cue_id === cue.id)?.id
-        || changed.document.cues.find((cue) => operation.cue_id && cue.lineage?.parent_cue_ids?.includes(operation.cue_id))?.id
-        || changed.document.cues[0]?.id
-        || "";
+      selectedCueId = resolveStructuralCueId(changed.document.cues, operation, selectedBefore);
       await post({ kind: "presence", selected_cue_id: selectedCueId });
-      focusSplitChild = operation.kind === "split";
     } catch (cause) {
       message = cause?.message || "字幕結構修改失敗";
       try { await unlockCues(); } catch { /* server may have already released transformed Cue IDs */ }
@@ -432,10 +634,22 @@
     } finally {
       busy = false;
     }
-    if (focusSplitChild) {
-      await tick();
-      editor?.focus();
+    editingCueId = restoreEditor ? selectedCueId : "";
+    await flushQueuedReload();
+    await tick();
+    const resultAnchorId = snapshot.document.cues.some((cue) => cue.id === anchorCueId)
+      ? anchorCueId
+      : selectedCueId;
+    const resultRow = [...(cueList?.querySelectorAll(".cue-row") || [])]
+      .find((row) => row.dataset.cueId === resultAnchorId);
+    if (Number.isFinite(anchorTop) && resultRow) {
+      const delta = resultRow.getBoundingClientRect().top - anchorTop;
+      if (scrollsInList) cueList.scrollTop += delta;
+      else window.scrollBy(0, delta);
     }
+    const focusTarget = restoreEditor ? editor : resultRow?.querySelector(".cue-row-select");
+    focusTarget?.focus({ preventScroll: true });
+    return result;
   }
 
   async function splitCue() {
@@ -465,6 +679,23 @@
 
   function mergeNextCue() {
     return mergeCues(selectedCue, nextMergeCue, nextMergeReason);
+  }
+
+  async function deleteCue() {
+    if (deleteReason || !selectedCue) {
+      if (deleteReason) message = deleteReason;
+      return;
+    }
+    const cueId = selectedCue.id;
+    const selectionIndex = selectedCueIndex;
+    if (!window.confirm(`刪除整個 Cue #${selectionIndex + 1}？這會移除這句字幕文字。`)) return;
+    const changed = await structuralOperation(
+      { kind: "delete", cue_id: cueId, selection_index: selectionIndex },
+      [cueId]
+    );
+    if (!changed) return;
+    selectedCueId = nearestRemainingCueId(snapshot.document.cues, selectionIndex);
+    message = "已刪除整個 Cue";
   }
 
   function mergeBlocks(left, right, reason) {
@@ -550,6 +781,7 @@
     } finally {
       busy = false;
     }
+    await flushQueuedReload();
   }
 
   async function toggleSelectedIssue() {
@@ -559,7 +791,8 @@
     }
     await leaveEditor();
     if (!selectedOwnIssues.length) {
-      await submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" });
+      const saved = await submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" });
+      if (saved) queueLocalAgentSuggestion(selectedCue, "other", "");
       return;
     }
     for (const issue of selectedOwnIssues) {
@@ -570,6 +803,48 @@
         author: snapshot.display_name || "reviewer",
         enabled: false
       });
+    }
+  }
+
+  function queueLocalAgentSuggestion(cue, category, note) {
+    if (!cue || agentSuggestions.some((suggestion) =>
+      suggestion.cue_ids.includes(cue.id) && !suggestion.job_id.startsWith("local-")
+    )) return;
+    agentSuggestions = [
+      ...agentSuggestions.filter((suggestion) =>
+        !(suggestion.job_id.startsWith("local-") && suggestion.cue_ids.includes(cue.id))
+      ),
+      normalizeAgentSuggestion({
+        job_id: `local-${cue.id}`,
+        status: "queued",
+        cue_ids: [cue.id],
+        category,
+        note,
+        before: cue.display_text ?? cue.text ?? ""
+      })
+    ];
+  }
+
+  async function decideAgentSuggestion(suggestion, decision) {
+    if (!suggestion || suggestion.status !== "ready" || !["apply", "ignore"].includes(decision)) return;
+    if (!canDecideAgentSuggestion) {
+      message = reviewActionReason || "目前階段無法決定 Agent 建議。";
+      return;
+    }
+    syncing = true;
+    message = "";
+    try {
+      await post({
+        kind: `suggestion_${decision}`,
+        job_id: suggestion.job_id
+      });
+      agentSuggestions = agentSuggestions.filter((item) => item.job_id !== suggestion.job_id);
+      message = decision === "apply" ? "已套用 Agent 建議" : "已忽略 Agent 建議";
+    } catch (cause) {
+      message = cause?.message || "Agent 建議同步失敗";
+      await reload();
+    } finally {
+      syncing = false;
     }
   }
 
@@ -588,13 +863,23 @@
         enabled: false
       });
     }
-    await submit({
+    const saved = await submit({
       kind: "flag",
       cue_ids: [selectedCue.id],
       categories: [agentCategory],
       author: snapshot.display_name || "reviewer",
       note: agentNote.trim()
     });
+    if (saved) {
+      const nextOverrides = new Map(agentNoteOverrides);
+      for (const issue of selectedOwnIssues) {
+        if (issue.category !== agentCategory) nextOverrides.delete(`${selectedCue.id}:${issue.category}`);
+      }
+      nextOverrides.set(`${selectedCue.id}:${agentCategory}`, agentNote.trim());
+      agentNoteOverrides = nextOverrides;
+      queueLocalAgentSuggestion(selectedCue, agentCategory, agentNote.trim());
+      message = `已記錄給 Agent：${agentIssueSummary({ category: agentCategory }, agentNote.trim())}`;
+    }
   }
 
   async function clearAgentRequest() {
@@ -609,6 +894,13 @@
         enabled: false
       });
     }
+    const nextOverrides = new Map(agentNoteOverrides);
+    for (const issue of selectedOwnIssues) nextOverrides.delete(`${selectedCue.id}:${issue.category}`);
+    agentNoteOverrides = nextOverrides;
+    agentSuggestions = agentSuggestions.filter((suggestion) =>
+      !(suggestion.job_id.startsWith("local-") && suggestion.cue_ids.includes(selectedCue?.id))
+    );
+    message = "已取消交給 Agent 的記錄";
   }
 
   function insertCueLineBreak(target) {
@@ -622,9 +914,12 @@
 
   function handleKeys(event) {
     if (event.isComposing || event.keyCode === 229) return;
-    const editing = event.target === editor;
+    const editing = event.target === editor && editingCueId === selectedCueId;
     const interactive = ["INPUT", "TEXTAREA", "SELECT", "BUTTON", "SUMMARY"].includes(event.target?.tagName);
     const mShortcutAllowed = (!interactive || event.target?.closest?.(".cue-row-select"))
+      && !event.target?.closest?.("details");
+    const deleteShortcutAllowed = !editingCueId
+      && (!interactive || event.target?.closest?.(".cue-row-select"))
       && !event.target?.closest?.("details");
     if (editing) updateCaret(event.target);
     const enterSplitReason = editing
@@ -634,16 +929,31 @@
       event.preventDefault();
       window.dispatchEvent(new Event("framecue:toggle-playback"));
     }
-    if (!interactive && ["ArrowUp", "ArrowDown"].includes(event.key) && selectedCueIndex >= 0) {
-      const nextIndex = Math.min(cues.length - 1, Math.max(0, selectedCueIndex + (event.key === "ArrowUp" ? -1 : 1)));
-      if (nextIndex !== selectedCueIndex) {
+    const cueNavigationAllowed = !interactive || Boolean(event.target?.closest?.(".cue-row-select"));
+    if (!editingCueId && cueNavigationAllowed && ["ArrowUp", "ArrowDown"].includes(event.key) && selectedCueIndex >= 0) {
+      const navigationIndex = pendingNavigationIndex >= 0 ? pendingNavigationIndex : selectedCueIndex;
+      const nextIndex = Math.min(cues.length - 1, Math.max(0, navigationIndex + (event.key === "ArrowUp" ? -1 : 1)));
+      if (nextIndex !== navigationIndex) {
         event.preventDefault();
-        selectCue(cues[nextIndex].id);
+        pendingNavigationIndex = nextIndex;
+        selectedCueId = cues[nextIndex].id;
+        editingCueId = "";
+        playbackMs = cues[nextIndex].source_start_ms || 0;
+        flushCueNavigation();
       }
     }
-    if (mShortcutAllowed && event.key.toLowerCase() === "m" && canEdit) {
+    if (mShortcutAllowed && event.key.toLowerCase() === "m" && canReview) {
       event.preventDefault();
       toggleSelectedIssue();
+    }
+    if (deleteShortcutAllowed && event.shiftKey && ["Delete", "Backspace"].includes(event.key) && canEdit) {
+      event.preventDefault();
+      deleteCue();
+    }
+    if (editing && event.key === "Escape") {
+      event.preventDefault();
+      exitEditMode();
+      return;
     }
     if (editing && event.key === "Enter" && !canType) {
       event.preventDefault();
@@ -660,6 +970,16 @@
     }
     if (editing && !event.metaKey && !event.ctrlKey && !event.altKey
       && event.target.selectionStart === event.target.selectionEnd) {
+      if (event.key === "ArrowLeft" && event.target.selectionStart === 0 && previousMergeCue) {
+        event.preventDefault();
+        enterEditMode(previousMergeCue.id, "end");
+        return;
+      }
+      if (event.key === "ArrowRight" && event.target.selectionStart === event.target.value.length && nextMergeCue) {
+        event.preventDefault();
+        enterEditMode(nextMergeCue.id, "start");
+        return;
+      }
       if (event.key === "Backspace" && event.target.selectionStart === 0 && !previousMergeReason) {
         event.preventDefault();
         mergePreviousCue();
@@ -772,7 +1092,7 @@
         </section>
       {/if}
 
-      <div class="cue-list" role="region" aria-label="字幕清單">
+      <div class="cue-list" bind:this={cueList} role="region" aria-label="字幕清單">
         {#each cueGroups as group, groupIndex}
           <section class="block-group" class:active={group.cues.some((cue) => cue.id === selectedCue?.id)} aria-label={`Semantic Block ${group.block?.id || "未歸屬"}`}>
             {#if groupIndex > 0 && !blockMergeReason(cueGroups[groupIndex - 1]?.block, group.block, editReason)}
@@ -790,6 +1110,7 @@
               {#each group.cues as cue, cueIndex}
                 <article
                   class="cue-row"
+                  data-cue-id={cue.id}
                   class:active={cue.id === selectedCue?.id}
                   class:needs-change={(snapshot.issues || []).some((issue) => issue.cue_ids?.includes(cue.id))}
                   class:locked={snapshot.locks.some((lock) => lock.cue_id === cue.id && lock.session_id !== snapshot.session_id)}
@@ -804,19 +1125,23 @@
                     class="cue-row-select"
                     type="button"
                     aria-label={`選擇 Cue ${group.first_index + cueIndex + 1}：${cue.display_text}`}
-                    on:click={() => cue.id === selectedCue?.id ? editor?.focus() : selectCue(cue.id)}
+                    on:click={() => cue.id !== selectedCue?.id && selectCue(cue.id)}
+                    on:dblclick={() => enterEditMode(cue.id)}
                   >
                     <span class="cue-meta">
                       <small>#{group.first_index + cueIndex + 1}</small>
                       <small>{formatTime(cue.source_start_ms)}–{formatTime(cue.source_end_ms)}</small>
                       <small>Block {String(blockNumberById.get(cue.block_id) || "?").padStart(2, "0")}</small>
                       {#if cueIssues(cue.id).length}<small class="cue-state needs-change">待 Agent 修改</small>{/if}
+                      {#each cueAgentSuggestions(cue.id) as suggestion}
+                        <small class={`cue-state agent-status ${suggestion.status}`} aria-label={`Agent 建議：${agentSuggestionStatusLabel(suggestion.status)}`}>{agentSuggestionStatusLabel(suggestion.status)}</small>
+                      {/each}
                       {#if snapshot.locks.some((lock) => lock.cue_id === cue.id && lock.session_id !== snapshot.session_id)}<small class="cue-state locked">他人編輯中</small>{/if}
                       {#if snapshot.participants.some((participant) => participant.selected_cue_id === cue.id && participant.session_id !== snapshot.session_id)}
                         <small class="cue-presence">{snapshot.participants.filter((participant) => participant.selected_cue_id === cue.id && participant.session_id !== snapshot.session_id).map((participant) => participant.display_name).join(", ")}</small>
                       {/if}
                     </span>
-                    {#if cue.id !== selectedCue?.id}
+                    {#if editingCueId !== cue.id}
                       <span class="cue-text">{cue.display_text}</span>
                     {/if}
                   </button>
@@ -824,41 +1149,83 @@
                   {#if cue.id === selectedCue?.id}
                     <div class="cue-inline-editor">
                       <div class="cue-editing-bar">
-                        <strong>正在編輯</strong>
+                        <strong>{editingCueId === cue.id ? "正在編輯" : "已選取 · 雙擊字幕修稿"}</strong>
                         <details class="agent-inline" bind:this={agentMenu} on:toggle={() => closeOtherMenu(agentMenu, actionsMenu)}>
-                          <summary>{selectedIssues.length ? "✓ 待 Agent 修改" : "交給 Agent"}</summary>
+                          <summary>{activeSelectedAgentJob ? `Agent · ${agentSuggestionStatusLabel(activeSelectedAgentJob.status)}` : selectedOwnIssues.length ? "Agent · 尚未送出" : selectedIssues.length ? "他人已標記" : "Agent 設定"}</summary>
                           <div class="agent-controls">
                             <label><span class="sr-only">Agent 問題類型</span>
-                              <select name="agent-category" bind:value={agentCategory} disabled={Boolean(flagReason)} aria-label="Agent 問題類型">
+                              <select name="agent-category" bind:value={agentCategory} on:change={syncAgentCategoryNote} disabled={Boolean(flagReason)} aria-label="Agent 問題類型">
                                 {#each agentCategories as category}<option value={category[0]}>{category[1]}</option>{/each}
                               </select>
                             </label>
                             <label class="agent-note"><span class="sr-only">給 Agent 的補充說明</span>
                               <input name="agent-note" bind:value={agentNote} disabled={Boolean(flagReason)} placeholder="給 Agent 的補充說明（選填）" />
                             </label>
-                            <button type="button" disabled={Boolean(flagReason)} on:click={saveAgentRequest}>{selectedHasIssue ? "更新提示" : "交給 Agent"}</button>
+                            <button type="button" disabled={Boolean(flagReason)} on:click={saveAgentRequest}>{activeSelectedAgentJob ? "更新提示" : "送出給 Agent"}</button>
                             {#if selectedHasIssue}<button type="button" class="quiet" on:click={clearAgentRequest}>取消標記</button>{/if}
                           </div>
                         </details>
+                        {#if selectedOwnIssues.length}
+                          <span class="agent-recorded" aria-live="polite" title={selectedOwnIssues.map((issue) => agentIssueSummary(issue)).join("；")}>
+                            <strong>{activeSelectedAgentJob ? "已送出給 Agent" : "尚未送出給 Agent"}</strong>
+                            <span>{selectedOwnIssues.map((issue) => agentIssueSummary(issue)).join("；")}</span>
+                          </span>
+                        {/if}
                       </div>
-                      <label>
-                        <span class="sr-only">Cue {group.first_index + cueIndex + 1} 中文字幕</span>
-                        <textarea
-                          bind:this={editor}
-                          bind:value={editText}
-                          readonly={!canType}
-                          on:focus={focusEditor}
-                          on:input={() => { updateCaret(); handleInput(); }}
-                          on:select={() => updateCaret()}
-                          on:click={() => updateCaret()}
-                          on:keyup={() => updateCaret()}
-                          on:blur={leaveEditor}
-                        ></textarea>
-                      </label>
+                      {#if cueAgentSuggestions(cue.id).length}
+                        <section class="agent-suggestions" aria-label="Agent 建議狀態">
+                          {#each cueAgentSuggestions(cue.id) as suggestion}
+                            <article class="agent-suggestion" class:ready={suggestion.status === "ready"} data-job-id={suggestion.job_id}>
+                              <div class="agent-suggestion-heading">
+                                <strong>Agent 建議</strong>
+                                <span class={`agent-status ${suggestion.status}`} role="status" aria-live="polite">{agentSuggestionStatusLabel(suggestion.status)}</span>
+                              </div>
+                              {#if suggestion.category}<small class="agent-suggestion-category">{agentCategories.find(([value]) => value === suggestion.category)?.[1] || suggestion.category}</small>{/if}
+                              {#if suggestion.status === "ready"}
+                                <div class="agent-diff" aria-label="Agent 建議差異">
+                                  <div>
+                                    <strong>修改前</strong>
+                                    <p>{suggestion.before || cue.display_text || "（無文字）"}</p>
+                                  </div>
+                                  <div>
+                                    <strong>修改後</strong>
+                                    <p>{suggestion.after || "（沒有替換文字）"}</p>
+                                  </div>
+                                </div>
+                                {#if suggestion.explanation}<p class="agent-suggestion-note">{suggestion.explanation}</p>{/if}
+                                <div class="agent-suggestion-actions" role="group" aria-label="Agent 建議操作">
+                                  <button type="button" disabled={!canDecideAgentSuggestion} aria-label="套用 Agent 建議" on:click={() => decideAgentSuggestion(suggestion, "apply")}>套用</button>
+                                  <button type="button" class="quiet" disabled={!canDecideAgentSuggestion} aria-label="忽略 Agent 建議" on:click={() => decideAgentSuggestion(suggestion, "ignore")}>忽略</button>
+                                </div>
+                              {:else if suggestion.status === "stale"}
+                                <p class="agent-suggestion-error">這個建議已過期，請重新標記。</p>
+                              {:else if suggestion.status === "failed"}
+                                <p class="agent-suggestion-error" role="alert">{suggestion.error || "Agent 處理失敗，請重新標記。"}</p>
+                              {/if}
+                            </article>
+                          {/each}
+                        </section>
+                      {/if}
+                      {#if editingCueId === cue.id}
+                        <label>
+                          <span class="sr-only">Cue {group.first_index + cueIndex + 1} 中文字幕</span>
+                          <textarea
+                            bind:this={editor}
+                            bind:value={editText}
+                            readonly={!canType}
+                            on:focus={focusEditor}
+                            on:input={() => { updateCaret(); handleInput(); }}
+                            on:select={() => updateCaret()}
+                            on:click={() => updateCaret()}
+                            on:keyup={() => updateCaret()}
+                            on:blur={leaveEditor}
+                          ></textarea>
+                        </label>
+                      {/if}
                       <details class="cue-actions" bind:this={actionsMenu} on:toggle={() => closeOtherMenu(actionsMenu, agentMenu)}>
                         <summary>更多操作</summary>
                         <div class="cue-actions-panel">
-                          <p class="shortcut-help">Space 播放/暫停 · ↑/↓ 換句 · Enter 切成兩句 · Ctrl/Cmd+Enter 同 Cue 換行 · 文字起點 Backspace 合併上一句 · 文字結尾 Delete 合併下一句 · M 快速標記</p>
+                          <p class="shortcut-help">瀏覽：↑/↓ 換句 · Shift+Delete 刪除整句 · 雙擊字幕修稿 · 修稿：←/→ 在首尾跨句 · Esc 結束修稿 · Enter 切成兩句 · Ctrl/Cmd+Enter 同 Cue 換行 · Backspace/Delete 首尾合併 · M 快速標記</p>
                           <div class="action-grid" role="group" aria-label="Cue 操作">
                           <div class="action-control">
                             <button type="button" disabled={Boolean(splitReason)} aria-describedby={splitReason ? "split-reason" : undefined} title={splitReason || "從目前游標切開 Cue"} on:click={splitCue}>從游標切成兩句</button>
@@ -877,6 +1244,10 @@
                               {selectedHasIssue ? "取消需修改（M）" : "標記需修改（M）"}
                             </button>
                             {#if flagReason}<small id="flag-reason" class="action-reason">{flagReason}</small>{/if}
+                          </div>
+                          <div class="action-control">
+                            <button type="button" class="cue-delete" disabled={Boolean(deleteReason)} aria-describedby={deleteReason ? "delete-reason" : undefined} title={deleteReason || "刪除整個 Cue（Shift+Delete）"} on:click={deleteCue}>刪除 Cue（Shift+Delete）</button>
+                            {#if deleteReason}<small id="delete-reason" class="action-reason">{deleteReason}</small>{/if}
                           </div>
                           </div>
                           <strong class="action-section">Block</strong>
@@ -909,7 +1280,7 @@
 </main>
 
 <style>
-  .workspace-shell { min-height: 100vh; background: #151817; color: #eff2ec; }
+  .workspace-shell { min-height: 100vh; overflow-x: hidden; background: #151817; color: #eff2ec; }
   .workspace-toolbar { position: sticky; top: 0; z-index: 12; display: grid; grid-template-columns: minmax(180px, 1fr) auto minmax(140px, 1fr); align-items: center; gap: 16px; min-height: 64px; padding: 10px 18px; border-bottom: 1px solid #3b443d; background: #1b201d; }
   .workspace-toolbar > div:first-child { display: flex; min-width: 0; align-items: baseline; gap: 9px; }
   .workspace-toolbar strong { font-size: 18px; }
@@ -963,15 +1334,39 @@
   .cue-inline-editor { position: relative; padding: 0 10px 12px; }
   .cue-inline-editor label { display: block; }
   .cue-inline-editor textarea { width: 100%; min-height: 78px; box-sizing: border-box; }
-  .cue-editing-bar { position: relative; display: flex; align-items: center; gap: 9px; min-height: 26px; margin-bottom: 7px; padding-right: 86px; }
+  .cue-editing-bar { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 9px; min-height: 26px; margin-bottom: 7px; padding-right: 86px; }
   .cue-editing-bar strong { margin-right: 2px; color: #dbe7d6; font-size: 11px; }
   .agent-inline { flex: 0 0 auto; }
+  .agent-inline[open] { flex: 1 0 100%; order: 2; }
   .agent-inline summary { width: max-content; cursor: pointer; color: #e8d096; font-size: 11px; font-weight: 700; }
-  .agent-controls { position: absolute; z-index: 8; top: calc(100% + 5px); left: 0; right: -86px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px; border: 1px solid #536254; border-radius: 5px; background: #202820; box-shadow: 0 8px 20px #0b0e0cbb; }
+  .agent-recorded { display: flex; min-width: 0; align-items: center; gap: 5px; color: #d8e6d4; font-size: 11px; }
+  .agent-recorded > strong { flex: 0 0 auto; color: #a9d39f; }
+  .agent-recorded > span { overflow: hidden; color: #c6d0c3; text-overflow: ellipsis; white-space: nowrap; }
+  .agent-suggestions { display: grid; min-width: 0; gap: 8px; margin: 0 0 9px; }
+  .agent-suggestion { min-width: 0; padding: 9px; border: 1px solid #536254; border-radius: 6px; background: #202820; }
+  .agent-suggestion.ready { border-color: #76976f; }
+  .agent-suggestion-heading { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 10px; }
+  .agent-suggestion-heading strong { color: #dbe7d6; font-size: 12px; }
+  .agent-status { width: max-content; padding: 2px 5px; border-radius: 4px; background: #39443b; color: #dbe7d6; font-size: 10px; line-height: 1.3; }
+  .agent-status.processing { background: #4a4431; color: #f0d58e; }
+  .agent-status.ready { background: #304c32; color: #cde8c6; }
+  .agent-status.stale, .agent-status.failed { background: #4c322f; color: #ffd1c7; }
+  .agent-suggestion-category { display: block; margin-top: 5px; color: #aeb9ad; font-size: 10px; }
+  .agent-diff { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+  .agent-diff > div { min-width: 0; padding: 7px; border: 1px solid #3f4b41; border-radius: 4px; background: #171c19; }
+  .agent-diff strong { color: #b7d3ae; font-size: 10px; }
+  .agent-diff p, .agent-suggestion-note, .agent-suggestion-error { margin: 4px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; color: #eef2ec; font-size: 12px; line-height: 1.4; }
+  .agent-suggestion-note { color: #c6d0c3; }
+  .agent-suggestion-error { color: #ffc6be; }
+  .agent-suggestion-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+  .agent-suggestion-actions button { min-width: 100px; min-height: 44px; padding: 7px 12px; }
+  .agent-suggestion-actions .quiet { border-color: #4a554b; background: transparent; color: #b9c4b7; }
+  .agent-controls { position: static; display: flex; width: 100%; box-sizing: border-box; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 5px; padding: 8px; border: 1px solid #536254; border-radius: 5px; background: #202820; box-shadow: 0 8px 20px #0b0e0cbb; }
   .agent-controls .agent-note { flex: 1 1 180px; }
   .cue-editing-bar select, .cue-editing-bar input { width: 100%; box-sizing: border-box; min-height: 29px; }
   .cue-editing-bar button { padding: 5px 8px; font-size: 11px; }
   .cue-editing-bar .quiet { border-color: #4a554b; background: transparent; color: #b9c4b7; }
+  .cue-delete { margin-top: 2px; border-color: #75463f; background: transparent; color: #ffc6be; }
   .cue-actions { position: absolute; z-index: 7; top: 5px; right: 10px; margin: 0; }
   .cue-actions summary { width: max-content; cursor: pointer; color: #d4ddd1; font-size: 12px; font-weight: 700; }
   .cue-actions-panel { position: absolute; top: calc(100% + 5px); right: 0; width: min(500px, calc(100vw - 48px)); padding: 8px; border: 1px solid #536254; border-radius: 5px; background: #202820; box-shadow: 0 8px 20px #0b0e0cbb; }
@@ -991,8 +1386,30 @@
     .cue-workspace { min-height: 44vh; }
   }
   @media (max-width: 600px) {
-    .workspace-toolbar { position: static; }
-    .workspace-counts { gap: 8px; overflow-x: auto; justify-content: flex-start; }
+    .workspace-toolbar { position: static; display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
+    .workspace-toolbar > div:first-child { flex: 1 1 100%; flex-wrap: wrap; }
+    .workspace-counts { order: 3; flex: 1 1 100%; width: 100%; gap: 8px; overflow-x: auto; justify-content: flex-start; }
+    .complete { flex: 1 1 100%; width: 100%; justify-self: stretch; }
+    .workspace-grid :global(.media-stage),
+    .workspace-grid :global(.stage-canvas),
+    .workspace-grid :global(.still-stage),
+    .workspace-grid :global(.source-video-stage) { width: 100%; min-width: 0; max-width: 100%; }
     .cue-list { max-height: 38vh; border-left: 0; }
+    .cue-editing-bar { align-items: flex-start; flex-wrap: wrap; padding-right: 0; }
+    .agent-inline { width: 100%; }
+    .agent-controls { right: 0; }
+    .agent-recorded { flex-basis: 100%; }
+    .agent-diff { grid-template-columns: 1fr; }
+    .agent-suggestion-actions { flex-direction: column; }
+    .agent-suggestion-actions button { width: 100%; }
+    .cue-actions-panel { width: min(500px, calc(100vw - 24px)); max-width: calc(100vw - 24px); }
+  }
+  @media (max-width: 600px), (pointer: coarse) {
+    .agent-inline summary,
+    .agent-controls select,
+    .agent-controls input,
+    .agent-controls button,
+    .cue-delete { min-height: 44px; }
+    .agent-inline summary { display: flex; align-items: center; }
   }
 </style>

@@ -1333,6 +1333,52 @@ def apply_draft_merge(document, operation):
     }
 
 
+def apply_draft_delete(document, operation):
+    cue_id = ensure_id(operation.get("cue_id", ""), "draft delete cue_id")
+    cue_index = next(
+        (index for index, cue in enumerate(document["cues"]) if cue.get("id") == cue_id),
+        None,
+    )
+    if cue_index is None:
+        raise FrameCueError(f"workspace draft cue not found: {cue_id}")
+    if len(document["cues"]) == 1:
+        raise FrameCueError("workspace draft must keep at least one Cue")
+    cue = document["cues"][cue_index]
+    block_index = next(
+        (index for index, block in enumerate(document["blocks"]) if block.get("id") == cue.get("block_id")),
+        None,
+    )
+    if block_index is None:
+        raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
+    block = document["blocks"][block_index]
+    if cue_id not in block.get("cue_ids", []):
+        raise FrameCueError(f"workspace draft Cue Block is invalid: {cue_id}")
+
+    deleted_cue = copy.deepcopy(cue)
+    parent_block_id = block["id"]
+    document["cues"].pop(cue_index)
+    block["cue_ids"].remove(cue_id)
+    if not block["cue_ids"]:
+        document["blocks"].pop(block_index)
+    recompute_draft_blocks(document)
+    refresh_document_checksum(document)
+
+    remaining_block_ids = set(block.get("cue_ids", []))
+    anchor = next(
+        (row for row in document["cues"] if row.get("id") in remaining_block_ids),
+        document["cues"][min(cue_index, len(document["cues"]) - 1)],
+    )
+    return {
+        "kind": "delete",
+        "scope": "cue",
+        "cue_ids": [anchor["id"]],
+        "parent_cue_ids": [cue_id],
+        "parent_block_ids": [parent_block_id],
+        "result_block_ids": [block["id"]] if block.get("cue_ids") else [],
+        "deleted_cue": deleted_cue,
+    }
+
+
 def apply_draft_block_merge(document, operation):
     left_block_id = ensure_id(operation.get("block_id", ""), "draft block merge block_id")
     right_block_id = ensure_id(operation.get("adjacent_block_id", ""), "draft block merge adjacent_block_id")
@@ -1450,7 +1496,7 @@ def apply_draft_flag(document, issues, operation):
     if type(enabled) is not bool:
         raise FrameCueError("draft flag enabled must be a boolean")
     author = as_text(operation.get("author", "local"), "draft flag author")
-    note = as_text(operation.get("note", ""), "draft flag note")
+    note = as_text(operation.get("note", ""), "draft flag note").strip()
     if not author:
         raise FrameCueError("draft flag author must not be empty")
     if not isinstance(issues, list):
@@ -1480,8 +1526,27 @@ def apply_draft_flag(document, issues, operation):
             raise FrameCueError("workspace draft issue is invalid")
         if author not in issue["authors"]:
             issue["authors"].append(author)
-        if note and note not in issue["notes"]:
-            issue["notes"].append(note)
+        if note:
+            if note not in issue["notes"]:
+                issue["notes"].append(note)
+        elif not issue["notes"] or issue["notes"][-1] != "":
+            issue["notes"].append("")
+    active_categories = [
+        category for category in sorted(set(categories))
+        if any(
+            isinstance(row, dict)
+            and row.get("cue_ids") == cue_ids
+            and row.get("category") == category
+            for row in issues
+        )
+    ]
+    return {
+        "cue_ids": cue_ids,
+        "categories": sorted(set(categories)),
+        "active_categories": active_categories,
+        "enabled": enabled,
+        "note": note,
+    }
 
 
 def replace_draft_cue_references(rows, replaced_cue_ids, replacement_cue_ids):
@@ -1494,6 +1559,218 @@ def replace_draft_cue_references(rows, replaced_cue_ids, replacement_cue_ids):
         row["cue_ids"] = rewritten
 
 
+def suggestion_job_context(document, cue_id):
+    cue = next((row for row in document["cues"] if row.get("id") == cue_id), None)
+    if cue is None:
+        raise FrameCueError(f"suggestion job Cue was not found: {cue_id}")
+    block = next((row for row in document["blocks"] if row.get("id") == cue.get("block_id")), None)
+    return {"cue": copy.deepcopy(cue), "block": copy.deepcopy(block)}
+
+
+def suggestion_job_frozen_context(row):
+    try:
+        context = json.loads(row["context_json"])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise FrameCueError(f"suggestion job context is invalid: {row['job_id']}") from error
+    if not isinstance(context, dict):
+        raise FrameCueError(f"suggestion job context is invalid: {row['job_id']}")
+    return context
+
+
+def ignore_active_suggestion_jobs(connection, review_id, cue_id, category, updated_at):
+    connection.execute(
+        """UPDATE suggestion_jobs
+           SET status = 'ignored', lease_owner_token_id = NULL, lease_expires_at = NULL, updated_at = ?
+           WHERE review_id = ? AND cue_ids_json = ? AND category = ?
+             AND status IN ('queued', 'processing', 'suggestion_ready')""",
+        (updated_at, review_id, canonical_json([cue_id]), category),
+    )
+
+
+def ignore_flag_suggestion_jobs(connection, review_id, flag):
+    updated_at = utc_now()
+    for cue_id in flag["cue_ids"]:
+        for category in flag["categories"]:
+            if category not in flag["active_categories"]:
+                ignore_active_suggestion_jobs(connection, review_id, cue_id, category, updated_at)
+
+
+def enqueue_suggestion_jobs(connection, review_id, flag, document, draft_version, checksum):
+    if not flag["enabled"]:
+        return []
+    created_at = utc_now()
+    job_ids = []
+    for cue_id in flag["cue_ids"]:
+        for category in flag["categories"]:
+            context_json = canonical_json(suggestion_job_context(document, cue_id))
+            active_jobs = connection.execute(
+                """SELECT * FROM suggestion_jobs
+                   WHERE review_id = ? AND cue_ids_json = ? AND category = ?
+                     AND status IN ('queued', 'processing', 'suggestion_ready')""",
+                (review_id, canonical_json([cue_id]), category),
+            ).fetchall()
+            if any(
+                canonical_json(suggestion_job_frozen_context(job)) == context_json
+                and job["note"].strip() == flag["note"]
+                for job in active_jobs
+            ):
+                continue
+            ignore_active_suggestion_jobs(connection, review_id, cue_id, category, created_at)
+            job_id = opaque_id("suggestion")
+            connection.execute(
+                """INSERT INTO suggestion_jobs
+                   (job_id, review_id, cue_ids_json, category, note, context_json, base_draft_version,
+                    base_checksum, status, proposal_json, error_json, lease_owner_token_id,
+                    lease_expires_at, attempt_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', NULL, NULL, NULL, NULL, 0, ?, ?)""",
+                (
+                    job_id, review_id, canonical_json([cue_id]), category, flag["note"],
+                    context_json, draft_version,
+                    checksum, created_at, created_at,
+                ),
+            )
+            job_ids.append(job_id)
+    return job_ids
+
+
+def suggestion_job_cue_ids(row):
+    try:
+        cue_ids = json.loads(row["cue_ids_json"])
+    except json.JSONDecodeError as error:
+        raise FrameCueError(f"suggestion job is invalid JSON: {row['job_id']}") from error
+    if (
+        not isinstance(cue_ids, list)
+        or len(cue_ids) != 1
+        or not all(isinstance(cue_id, str) and ID_PATTERN.fullmatch(cue_id) for cue_id in cue_ids)
+    ):
+        raise FrameCueError(f"suggestion job Cue IDs are invalid: {row['job_id']}")
+    return cue_ids
+
+
+def suggestion_job_value(row, draft=None, include_context=False):
+    cue_ids = suggestion_job_cue_ids(row)
+    try:
+        proposal = json.loads(row["proposal_json"]) if row["proposal_json"] is not None else None
+        error = json.loads(row["error_json"]) if row["error_json"] is not None else None
+    except json.JSONDecodeError as exc:
+        raise FrameCueError(f"suggestion job is invalid JSON: {row['job_id']}") from exc
+    if proposal is not None and not isinstance(proposal, dict):
+        raise FrameCueError(f"suggestion job proposal is invalid: {row['job_id']}")
+    if error is not None and not isinstance(error, dict):
+        raise FrameCueError(f"suggestion job error is invalid: {row['job_id']}")
+    if include_context:
+        context = suggestion_job_frozen_context(row)
+    status = row["status"]
+    if (
+        status in {"queued", "processing", "suggestion_ready"}
+        and draft is not None
+        and not suggestion_job_matches_current_context(row, draft["document"])
+    ):
+        status = "stale"
+    elif status == "suggestion_ready":
+        status = "ready"
+    value = {
+        "job_id": row["job_id"],
+        "status": status,
+        "cue_ids": cue_ids,
+        "category": row["category"],
+        "note": row["note"],
+        "base_draft_version": row["base_draft_version"],
+        "base_checksum": row["base_checksum"],
+        "proposal": proposal,
+        "error": error,
+        "lease_owner_token_id": row["lease_owner_token_id"],
+        "lease_expires_at": row["lease_expires_at"],
+        "attempt_count": row["attempt_count"],
+    }
+    if include_context:
+        value["context"] = context
+    return value
+
+
+def suggestion_jobs(connection, review_id, draft=None):
+    rows = connection.execute(
+        "SELECT * FROM suggestion_jobs WHERE review_id = ? ORDER BY rowid",
+        (review_id,),
+    ).fetchall()
+    latest = {}
+    for row in rows:
+        latest[(row["cue_ids_json"], row["category"])] = row
+    rows = [row for row in latest.values() if row["status"] not in {"applied", "ignored"}]
+    if not rows:
+        return []
+    if draft is None:
+        draft = draft_row(connection, workspace_row(connection, review_id))
+    return [suggestion_job_value(row, draft) for row in rows]
+
+
+def suggestion_job_matches_current_context(job, document):
+    cue_id = suggestion_job_cue_ids(job)[0]
+    if not any(cue.get("id") == cue_id for cue in document["cues"]):
+        return False
+    return canonical_json(suggestion_job_frozen_context(job)) == canonical_json(
+        suggestion_job_context(document, cue_id)
+    )
+
+
+def validate_suggestion_proposal(value, job, document):
+    if not isinstance(value, dict) or set(value) != {"kind", "cue_id", "text", "explanation"}:
+        raise FrameCueError("suggestion proposal is invalid")
+    if value["kind"] != "replace_text":
+        raise FrameCueError("suggestion proposal kind is invalid")
+    cue_id = ensure_id(value["cue_id"], "suggestion proposal cue_id")
+    if cue_id not in suggestion_job_cue_ids(job):
+        raise FrameCueError("suggestion proposal Cue is not authorized")
+    if not any(cue.get("id") == cue_id for cue in document["cues"]):
+        raise FrameCueError("suggestion proposal Cue was not found")
+    text = as_text(value["text"], "suggestion proposal text").strip()
+    explanation = as_text(value["explanation"], "suggestion proposal explanation").strip()
+    if not text:
+        raise FrameCueError("suggestion proposal text must not be empty")
+    if len(text) > 10000:
+        raise FrameCueError("suggestion proposal text is too long")
+    if not explanation:
+        raise FrameCueError("suggestion proposal explanation must not be empty")
+    if len(explanation) > 2000:
+        raise FrameCueError("suggestion proposal explanation is too long")
+    return {"kind": "replace_text", "cue_id": cue_id, "text": text, "explanation": explanation}
+
+
+def decide_suggestion_job(connection, review_id, draft, operation, apply):
+    job_id = ensure_id(operation.get("job_id", ""), "suggestion job_id")
+    job = connection.execute(
+        "SELECT * FROM suggestion_jobs WHERE job_id = ? AND review_id = ?", (job_id, review_id)
+    ).fetchone()
+    if job is None:
+        raise FrameCueError(f"suggestion job was not found: {job_id}")
+    if job["status"] != "suggestion_ready":
+        raise FrameCueError(f"suggestion job is not ready: {job_id}")
+    if apply:
+        if not suggestion_job_matches_current_context(job, draft["document"]):
+            raise FrameCueError("suggestion job base draft is stale")
+        try:
+            proposal_value = json.loads(job["proposal_json"])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise FrameCueError(f"suggestion job proposal is invalid: {job_id}") from error
+        proposal = validate_suggestion_proposal(proposal_value, job, draft["document"])
+        change = apply_draft_edit(draft["document"], {
+            "cue_id": proposal["cue_id"],
+            "display_text": proposal["text"],
+        })
+        status = "applied"
+    else:
+        change = None
+        status = "ignored"
+    if connection.execute(
+        """UPDATE suggestion_jobs SET status = ?, lease_owner_token_id = NULL,
+               lease_expires_at = NULL, updated_at = ?
+           WHERE job_id = ? AND status = 'suggestion_ready'""",
+        (status, utc_now(), job_id),
+    ).rowcount != 1:
+        raise FrameCueError("suggestion job status changed")
+    return change
+
+
 def apply_draft_operation(database, review_id, operation):
     if not isinstance(operation, dict):
         raise FrameCueError("draft operation must be an object")
@@ -1501,7 +1778,10 @@ def apply_draft_operation(database, review_id, operation):
     if type(expected_version) is not int or expected_version < 0:
         raise FrameCueError("draft operation draft_version is invalid")
     kind = operation.get("kind")
-    if kind not in {"edit", "split", "merge", "block_merge", "block_split", "flag"}:
+    if kind not in {
+        "edit", "split", "merge", "delete", "block_merge", "block_split", "flag",
+        "suggestion_apply", "suggestion_ignore",
+    }:
         raise FrameCueError("draft operation kind is invalid")
     connection = open_workspace_database(database)
     try:
@@ -1515,42 +1795,79 @@ def apply_draft_operation(database, review_id, operation):
                 raise FrameCueError(
                     f"workspace draft version is stale: expected {draft['draft_version']}, got {expected_version}"
                 )
+            ready_suggestions = [
+                row for row in connection.execute(
+                    "SELECT * FROM suggestion_jobs WHERE review_id = ? AND status = 'suggestion_ready'",
+                    (review_id,),
+                ).fetchall()
+                if suggestion_job_matches_current_context(row, draft["document"])
+            ]
+            flag = None
+            draft_changed = True
             if kind == "edit":
                 change = apply_draft_edit(draft["document"], operation)
             elif kind == "split":
                 change = apply_draft_split(draft["document"], operation)
             elif kind == "merge":
                 change = apply_draft_merge(draft["document"], operation)
+            elif kind == "delete":
+                change = apply_draft_delete(draft["document"], operation)
             elif kind == "block_merge":
                 change = apply_draft_block_merge(draft["document"], operation)
             elif kind == "block_split":
                 change = apply_draft_block_split(draft["document"], operation)
-            else:
-                apply_draft_flag(draft["document"], draft["issues"], operation)
+            elif kind == "flag":
+                flag = apply_draft_flag(draft["document"], draft["issues"], operation)
                 change = None
+            else:
+                change = decide_suggestion_job(
+                    connection, review_id, draft, operation, kind == "suggestion_apply"
+                )
+                draft_changed = kind == "suggestion_apply"
+            if kind in {"split", "merge", "delete", "block_merge", "block_split"} and any(
+                not suggestion_job_matches_current_context(row, draft["document"])
+                for row in ready_suggestions
+            ):
+                raise FrameCueError("resolve ready Agent suggestions before changing their Cue or Block")
             if kind in {"split", "merge"}:
                 replaced = {operation["cue_id"]}
                 if kind == "merge":
                     replaced.add(operation["adjacent_cue_id"])
                 replace_draft_cue_references(draft["direct_changes"], replaced, change["cue_ids"])
                 replace_draft_cue_references(draft["issues"], replaced, change["cue_ids"])
+            elif kind == "delete":
+                replaced = {operation["cue_id"]}
+                replace_draft_cue_references(draft["direct_changes"], replaced, change["cue_ids"])
+                for issue in list(draft["issues"]):
+                    issue["cue_ids"] = [cue_id for cue_id in issue["cue_ids"] if cue_id not in replaced]
+                    if not issue["cue_ids"]:
+                        draft["issues"].remove(issue)
             if change is not None:
                 draft["direct_changes"].append(change)
-            next_version = expected_version + 1
-            if connection.execute(
-                """UPDATE workspace_drafts
-                   SET draft_version = ?, document_json = ?, issues_json = ?, direct_changes_json = ?
-                   WHERE review_id = ? AND draft_version = ?""",
-                (
-                    next_version,
-                    canonical_json(draft["document"]),
-                    canonical_json(draft["issues"]),
-                    canonical_json(draft["direct_changes"]),
-                    review_id,
-                    expected_version,
-                ),
-            ).rowcount != 1:
-                raise FrameCueError(f"workspace draft version is stale: {review_id}")
+            next_version = expected_version + 1 if draft_changed else expected_version
+            if draft_changed:
+                if connection.execute(
+                    """UPDATE workspace_drafts
+                       SET draft_version = ?, document_json = ?, issues_json = ?, direct_changes_json = ?
+                       WHERE review_id = ? AND draft_version = ?""",
+                    (
+                        next_version,
+                        canonical_json(draft["document"]),
+                        canonical_json(draft["issues"]),
+                        canonical_json(draft["direct_changes"]),
+                        review_id,
+                        expected_version,
+                    ),
+                ).rowcount != 1:
+                    raise FrameCueError(f"workspace draft version is stale: {review_id}")
+                if flag is not None:
+                    if flag["enabled"]:
+                        enqueue_suggestion_jobs(
+                            connection, review_id, flag, draft["document"], next_version,
+                            draft["document"]["checksum"],
+                        )
+                    else:
+                        ignore_flag_suggestion_jobs(connection, review_id, flag)
             connection.commit()
         except sqlite3.Error as error:
             connection.rollback()
@@ -1627,6 +1944,26 @@ def open_workspace_database(database):
                 revoked_at TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS suggestion_jobs (
+                job_id TEXT PRIMARY KEY,
+                review_id TEXT NOT NULL REFERENCES workspaces(review_id),
+                cue_ids_json TEXT NOT NULL,
+                category TEXT NOT NULL,
+                note TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                base_draft_version INTEGER NOT NULL,
+                base_checksum TEXT NOT NULL,
+                status TEXT NOT NULL,
+                proposal_json TEXT,
+                error_json TEXT,
+                lease_owner_token_id TEXT REFERENCES agent_tokens(token_id),
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS suggestion_jobs_review_status
+                ON suggestion_jobs(review_id, status);
         """)
         work_orders_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_orders'"
@@ -1669,6 +2006,13 @@ def open_workspace_database(database):
         ):
             if name not in work_order_columns:
                 connection.execute(f"ALTER TABLE work_orders ADD COLUMN {name} {declaration}")
+        suggestion_job_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(suggestion_jobs)")
+        }
+        if "context_json" not in suggestion_job_columns:
+            connection.execute(
+                "ALTER TABLE suggestion_jobs ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}'"
+            )
         connection.commit()
         return connection
     except (OSError, sqlite3.Error) as error:
@@ -1834,7 +2178,7 @@ def complete_workspace_round(database, review_id, draft_version):
                 raise FrameCueError(
                     f"workspace draft version is stale: expected {draft['draft_version']}, got {draft_version}"
                 )
-            needs_correction = bool(draft["direct_changes"] or draft["issues"])
+            needs_correction = bool(draft["issues"])
             document = copy.deepcopy(draft["document"])
             document["revision_kind"] = "draft_snapshot" if needs_correction else "content"
             refresh_document_checksum(document)
@@ -1848,7 +2192,7 @@ def complete_workspace_round(database, review_id, draft_version):
             ).fetchone()["value"]
             request_id = f"req-{next_order:04d}"
             if needs_correction:
-                targets = correction_work_order_targets(document, draft["direct_changes"], draft["issues"])
+                targets = correction_work_order_targets(document, [], draft["issues"])
                 operation = "content_correction_review"
                 stage = "content_agent_review_pending"
                 required_outputs = ["document", "change_proposals"]
@@ -1921,6 +2265,52 @@ def complete_workspace_round(database, review_id, draft_version):
         "draft_version": draft_version,
         "revision": document["revision"],
         "checksum": document["checksum"],
+    }
+
+
+def reopen_workspace_round(database, review_id):
+    connection = open_workspace_database(database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = workspace_row(connection, review_id)
+            if workspace["stage"] != "content_agent_review_pending":
+                raise FrameCueError(f"workspace has no pending content round to reopen: {review_id}")
+            order = connection.execute(
+                "SELECT * FROM work_orders WHERE review_id = ? ORDER BY work_order_id DESC LIMIT 1",
+                (review_id,),
+            ).fetchone()
+            if order is None or order["operation"] != "content_correction_review" or order["status"] != "pending":
+                raise FrameCueError(f"workspace content work order is not safely reopenable: {review_id}")
+            draft = draft_row(connection, workspace)
+            connection.execute(
+                """UPDATE work_orders
+                   SET status = 'cancelled', lease_owner_token_id = NULL, lease_expires_at = NULL
+                   WHERE work_order_id = ? AND status = 'pending'""",
+                (order["work_order_id"],),
+            )
+            connection.execute(
+                "UPDATE workspace_drafts SET frozen_revision_id = NULL WHERE review_id = ?",
+                (review_id,),
+            )
+            connection.execute(
+                "UPDATE workspaces SET stage = 'content_review' WHERE review_id = ?",
+                (review_id,),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    return {
+        "workspace_id": review_id,
+        "stage": "content_review",
+        "draft_version": draft["draft_version"],
+        "cancelled_request_id": order["request_id"],
     }
 
 
@@ -2221,6 +2611,10 @@ def command_workspace_complete(args):
     ))
 
 
+def command_workspace_reopen(args):
+    print(json.dumps(reopen_workspace_round(args.database, args.review_id), ensure_ascii=False))
+
+
 def complete_content_revision(database, review_id, result):
     connection = open_workspace_database(database)
     try:
@@ -2339,6 +2733,7 @@ def workspace_snapshot(database, review_id, csrf_token):
     try:
         workspace = workspace_row(connection, review_id)
         draft = draft_row(connection, workspace)
+        values = suggestion_jobs(connection, review_id, draft)
         connection.commit()
     except sqlite3.Error as error:
         connection.rollback()
@@ -2354,6 +2749,7 @@ def workspace_snapshot(database, review_id, csrf_token):
         "document": draft["document"],
         "issues": draft["issues"],
         "direct_edit_count": len(draft["direct_changes"]),
+        "suggestions": values,
     }
 
 
@@ -2541,6 +2937,12 @@ def expire_agent_leases(connection, now):
            SET status = 'pending', lease_owner_token_id = NULL, lease_expires_at = NULL
            WHERE status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
         (now,),
+    )
+    connection.execute(
+        """UPDATE suggestion_jobs
+           SET status = 'queued', lease_owner_token_id = NULL, lease_expires_at = NULL, updated_at = ?
+           WHERE status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
+        (now, now),
     )
 
 
@@ -2999,6 +3401,247 @@ def make_workspace_server(database, bundle_dir, port=0):
                 "attempt_count": row["attempt_count"],
             })
 
+        def send_agent_suggestion_list(self, identity, workspace_id):
+            if workspace_id not in identity["workspace_ids"]:
+                self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                return
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, agent_utc_now())
+                values = suggestion_jobs(connection, workspace_id)
+                connection.commit()
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, {"suggestions": values})
+
+        def send_agent_suggestion_read(self, identity, job_id):
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, agent_utc_now())
+                row = connection.execute(
+                    "SELECT * FROM suggestion_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    self.send_json(404, {"error": "suggestion job was not found"})
+                    return
+                if row["review_id"] not in identity["workspace_ids"]:
+                    connection.rollback()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                value = suggestion_job_value(
+                    row, draft_row(connection, workspace_row(connection, row["review_id"])), True
+                )
+                connection.commit()
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            self.send_json(200, value)
+
+        def send_agent_suggestion_claim(self, identity, job_id):
+            now = agent_utc_now()
+            try:
+                lease_expires_at = (
+                    dt.datetime.fromisoformat(now) + dt.timedelta(seconds=300)
+                ).replace(microsecond=0).isoformat()
+            except ValueError:
+                self.send_json(500, {"error": "agent clock is invalid"})
+                return
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, now)
+                row = connection.execute(
+                    "SELECT * FROM suggestion_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if row is None:
+                    connection.rollback()
+                    self.send_json(404, {"error": "suggestion job was not found"})
+                    return
+                if row["review_id"] not in identity["workspace_ids"]:
+                    connection.rollback()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                draft = draft_row(connection, workspace_row(connection, row["review_id"]))
+                if not suggestion_job_matches_current_context(row, draft["document"]):
+                    connection.rollback()
+                    self.send_json(409, {"error": "suggestion job base draft is stale"})
+                    return
+                if row["status"] == "queued":
+                    connection.execute(
+                        """UPDATE suggestion_jobs
+                           SET status = 'processing', lease_owner_token_id = ?, lease_expires_at = ?,
+                               attempt_count = attempt_count + 1, updated_at = ?
+                           WHERE job_id = ? AND status = 'queued'""",
+                        (identity["token_id"], lease_expires_at, now, job_id),
+                    )
+                elif row["status"] == "processing" and row["lease_owner_token_id"] == identity["token_id"]:
+                    connection.execute(
+                        "UPDATE suggestion_jobs SET lease_expires_at = ?, updated_at = ? WHERE job_id = ?",
+                        (lease_expires_at, now, job_id),
+                    )
+                else:
+                    connection.rollback()
+                    self.send_json(409, {"error": "suggestion job is already claimed or unavailable"})
+                    return
+                claimed = connection.execute(
+                    "SELECT * FROM suggestion_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                connection.commit()
+                value = suggestion_job_value(claimed, draft)
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            with collaboration.condition:
+                collaboration.changed()
+            self.send_json(200, value)
+
+        def send_agent_suggestion_submit(self, identity, job_id, value):
+            if set(value) != {"proposal"}:
+                self.send_json(409, {"error": "suggestion submission must contain only proposal"})
+                return
+            now = agent_utc_now()
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, now)
+                job = connection.execute(
+                    "SELECT * FROM suggestion_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if job is None:
+                    connection.rollback()
+                    self.send_json(404, {"error": "suggestion job was not found"})
+                    return
+                if job["review_id"] not in identity["workspace_ids"]:
+                    connection.rollback()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                if (
+                    job["status"] != "processing"
+                    or job["lease_owner_token_id"] != identity["token_id"]
+                    or job["lease_expires_at"] is None
+                    or job["lease_expires_at"] <= now
+                ):
+                    connection.rollback()
+                    self.send_json(409, {"error": "suggestion job lease is not owned by this agent"})
+                    return
+                workspace = workspace_row(connection, job["review_id"])
+                draft = draft_row(connection, workspace)
+                if (
+                    workspace["stage"] != "content_review"
+                    or not suggestion_job_matches_current_context(job, draft["document"])
+                ):
+                    connection.rollback()
+                    self.send_json(409, {"error": "suggestion job base draft is stale"})
+                    return
+                proposal = validate_suggestion_proposal(value["proposal"], job, draft["document"])
+                if connection.execute(
+                    """UPDATE suggestion_jobs
+                       SET status = 'suggestion_ready', proposal_json = ?, error_json = NULL,
+                           lease_owner_token_id = NULL, lease_expires_at = NULL, updated_at = ?
+                       WHERE job_id = ? AND status = 'processing' AND lease_owner_token_id = ?""",
+                    (canonical_json(proposal), now, job_id, identity["token_id"]),
+                ).rowcount != 1:
+                    raise FrameCueError("suggestion job lease changed")
+                connection.commit()
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            with collaboration.condition:
+                collaboration.changed()
+            self.send_json(200, {"job_id": job_id, "status": "ready", "proposal": proposal})
+
+        def send_agent_suggestion_fail(self, identity, job_id, value):
+            category = value.get("category")
+            message = value.get("message")
+            retryable = value.get("retryable")
+            if (
+                not isinstance(category, str) or not 1 <= len(category.strip()) <= 64
+                or not isinstance(message, str) or not 1 <= len(message.strip()) <= 2000
+                or type(retryable) is not bool
+            ):
+                self.send_json(409, {"error": "agent failure must include a valid category, message, and retryable flag"})
+                return
+            error_value = {"category": category.strip(), "message": message.strip(), "retryable": retryable}
+            now = agent_utc_now()
+            connection = open_workspace_database(database)
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not self.agent_is_active(connection, identity):
+                    connection.rollback()
+                    self.send_json(401, {"error": "agent bearer token is invalid"})
+                    return
+                expire_agent_leases(connection, now)
+                job = connection.execute(
+                    "SELECT * FROM suggestion_jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if job is None:
+                    connection.rollback()
+                    self.send_json(404, {"error": "suggestion job was not found"})
+                    return
+                if job["review_id"] not in identity["workspace_ids"]:
+                    connection.rollback()
+                    self.send_json(403, {"error": "agent token is not allowed for this workspace"})
+                    return
+                if (
+                    job["status"] != "processing"
+                    or job["lease_owner_token_id"] != identity["token_id"]
+                    or job["lease_expires_at"] is None
+                    or job["lease_expires_at"] <= now
+                ):
+                    connection.rollback()
+                    self.send_json(409, {"error": "suggestion job lease is not owned by this agent"})
+                    return
+                if connection.execute(
+                    """UPDATE suggestion_jobs
+                       SET status = 'failed', error_json = ?, lease_owner_token_id = NULL,
+                           lease_expires_at = NULL, updated_at = ?
+                       WHERE job_id = ? AND status = 'processing' AND lease_owner_token_id = ?""",
+                    (canonical_json(error_value), now, job_id, identity["token_id"]),
+                ).rowcount != 1:
+                    raise FrameCueError("suggestion job lease changed")
+                connection.commit()
+            except (sqlite3.Error, FrameCueError) as error:
+                connection.rollback()
+                self.send_json(409, {"error": str(error)})
+                return
+            finally:
+                connection.close()
+            with collaboration.condition:
+                collaboration.changed()
+            self.send_json(200, {"job_id": job_id, "status": "failed", "error": error_value})
+
         def require_session(self):
             session = collaboration.session(self.request_session_id())
             if session is None:
@@ -3029,9 +3672,10 @@ def make_workspace_server(database, bundle_dir, port=0):
                     f"workspace draft version is stale: expected {snapshot['draft_version']}, got {draft_version}"
                 )
 
-        def operation_cue_ids(self, operation, document):
+        def operation_cue_ids(self, operation, snapshot):
+            document = snapshot["document"]
             kind = operation.get("kind")
-            if kind in {"edit", "split"}:
+            if kind in {"edit", "split", "delete"}:
                 values = [operation.get("cue_id")]
             elif kind == "merge":
                 values = [operation.get("cue_id"), operation.get("adjacent_cue_id")]
@@ -3051,6 +3695,12 @@ def make_workspace_server(database, bundle_dir, port=0):
                 values = operation.get("cue_ids")
                 if values is None:
                     values = [operation.get("cue_id")]
+            elif kind == "suggestion_apply":
+                job_id = ensure_id(operation.get("job_id", ""), "suggestion job_id")
+                suggestion = next(
+                    (row for row in snapshot["suggestions"] if row["job_id"] == job_id), None
+                )
+                values = suggestion["cue_ids"] if suggestion is not None else []
             else:
                 values = []
             return [value for value in values if isinstance(value, str)] if isinstance(values, list) else []
@@ -3094,7 +3744,7 @@ def make_workspace_server(database, bundle_dir, port=0):
                     raise FrameCueError("workspace lead operation is invalid")
                 collaboration.transfer_lead(session, expected_lead_session_id, new_lead_session_id)
                 return self.current_snapshot(session)
-            affected_cue_ids = self.operation_cue_ids(operation, snapshot["document"])
+            affected_cue_ids = self.operation_cue_ids(operation, snapshot)
             collaboration.assert_unlocked(session, affected_cue_ids)
             apply_draft_operation(database, review_id, operation)
             collaboration.unlock(session, affected_cue_ids)
@@ -3204,6 +3854,22 @@ def make_workspace_server(database, bundle_dir, port=0):
         def do_GET(self):
             parsed_request = urlsplit(self.path)
             path = parsed_request.path
+            if path == "/api/agent/suggestions":
+                identity = self.require_agent("list")
+                if identity is None:
+                    return
+                workspace_ids = parse_qs(parsed_request.query).get("workspace_id", [])
+                if len(workspace_ids) != 1 or not workspace_ids[0]:
+                    self.send_json(400, {"error": "workspace_id is required"})
+                    return
+                self.send_agent_suggestion_list(identity, workspace_ids[0])
+                return
+            agent_suggestion_read = re.fullmatch(r"/api/agent/suggestions/([^/]+)", path)
+            if agent_suggestion_read:
+                identity = self.require_agent("read")
+                if identity is not None:
+                    self.send_agent_suggestion_read(identity, unquote(agent_suggestion_read.group(1)))
+                return
             if path == "/api/agent/work-orders":
                 identity = self.require_agent("list")
                 if identity is None:
@@ -3245,12 +3911,15 @@ def make_workspace_server(database, bundle_dir, port=0):
             connection = open_workspace_database(database)
             try:
                 workspace = workspace_row(connection, review_id)
+                values = suggestion_jobs(connection, review_id)
+                connection.commit()
             finally:
                 connection.close()
             self.send_json(200, {
                 "mode": "server",
                 "workspace_id": review_id,
                 "stage": workspace["stage"],
+                "suggestions": values,
                 "content_complete_endpoint": "/api/content-complete",
                 "csrf_token": csrf_token,
                 "endpoint": "/api/content-complete",
@@ -3259,6 +3928,30 @@ def make_workspace_server(database, bundle_dir, port=0):
 
         def do_POST(self):
             path = urlsplit(self.path).path
+            agent_suggestion_claim = re.fullmatch(r"/api/agent/suggestions/([^/]+)/claim", path)
+            if agent_suggestion_claim:
+                identity = self.require_agent("claim")
+                if identity is not None:
+                    self.send_agent_suggestion_claim(identity, unquote(agent_suggestion_claim.group(1)))
+                return
+            agent_suggestion_submit = re.fullmatch(r"/api/agent/suggestions/([^/]+)/submit", path)
+            if agent_suggestion_submit:
+                identity = self.require_agent("submit")
+                if identity is None:
+                    return
+                value = self.read_workspace_json()
+                if value is not None:
+                    self.send_agent_suggestion_submit(identity, unquote(agent_suggestion_submit.group(1)), value)
+                return
+            agent_suggestion_fail = re.fullmatch(r"/api/agent/suggestions/([^/]+)/fail", path)
+            if agent_suggestion_fail:
+                identity = self.require_agent("fail")
+                if identity is None:
+                    return
+                value = self.read_workspace_json()
+                if value is not None:
+                    self.send_agent_suggestion_fail(identity, unquote(agent_suggestion_fail.group(1)), value)
+                return
             agent_claim = re.fullmatch(r"/api/agent/work-orders/([^/]+)/claim", path)
             if agent_claim:
                 identity = self.require_agent("claim")
@@ -3405,6 +4098,12 @@ def command_agent_token_revoke(args):
                SET status = 'pending', lease_owner_token_id = NULL, lease_expires_at = NULL
                WHERE status = 'processing' AND lease_owner_token_id = ?""",
             (args.token_id,),
+        )
+        connection.execute(
+            """UPDATE suggestion_jobs
+               SET status = 'queued', lease_owner_token_id = NULL, lease_expires_at = NULL, updated_at = ?
+               WHERE status = 'processing' AND lease_owner_token_id = ?""",
+            (revoked_at, args.token_id),
         )
         connection.commit()
     except sqlite3.Error as error:
@@ -3948,7 +4647,10 @@ def command_work_submit(args):
             document = candidate.get("document")
             if not isinstance(document, dict):
                 raise FrameCueError("candidate document must be an object")
-            if document.get("schema") != SUBTITLE_DOCUMENT_SCHEMA:
+            if (
+                document.get("schema") not in {SUBTITLE_DOCUMENT_SCHEMA, SUBTITLE_DOCUMENT_V2_SCHEMA}
+                or document.get("schema") != base_document.get("schema")
+            ):
                 raise FrameCueError("candidate document schema is invalid")
             if document.get("revision_kind") != "voice_aligned":
                 raise FrameCueError("candidate document revision_kind is invalid")
@@ -4308,6 +5010,14 @@ def parser():
     workspace_complete.add_argument("--review-id", required=True)
     workspace_complete.add_argument("--draft-version", type=int, required=True)
     workspace_complete.set_defaults(func=command_workspace_complete)
+
+    workspace_reopen = commands.add_parser(
+        "workspace-reopen",
+        help="cancel one pending content-correction order and reopen its frozen draft",
+    )
+    workspace_reopen.add_argument("--database", required=True)
+    workspace_reopen.add_argument("--review-id", required=True)
+    workspace_reopen.set_defaults(func=command_workspace_reopen)
 
     content_complete = commands.add_parser("content-complete", help="save an approved content revision and create its pending work order")
     content_complete.add_argument("--database", required=True)
