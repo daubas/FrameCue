@@ -1902,6 +1902,7 @@ def open_workspace_database(database):
                 review_id TEXT PRIMARY KEY,
                 stage TEXT NOT NULL,
                 current_revision_id INTEGER,
+                bundle_path TEXT,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS revisions (
@@ -1967,6 +1968,11 @@ def open_workspace_database(database):
             CREATE INDEX IF NOT EXISTS suggestion_jobs_review_status
                 ON suggestion_jobs(review_id, status);
         """)
+        workspace_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(workspaces)")
+        }
+        if "bundle_path" not in workspace_columns:
+            connection.execute("ALTER TABLE workspaces ADD COLUMN bundle_path TEXT")
         work_orders_sql = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'work_orders'"
         ).fetchone()["sql"]
@@ -2547,7 +2553,8 @@ def command_collect(args):
 
 
 def command_workspace_import(args):
-    package, _ = bundle_summary(args.package)
+    package_path = Path(args.package).expanduser().resolve()
+    package, _ = bundle_summary(package_path)
     document = subtitle_document(package, args.timing_profile)
     connection = open_workspace_database(args.database)
     try:
@@ -2560,8 +2567,10 @@ def command_workspace_import(args):
                 raise FrameCueError(f"workspace already exists: {package['review_id']}")
             created_at = utc_now()
             connection.execute(
-                "INSERT INTO workspaces (review_id, stage, current_revision_id, created_at) VALUES (?, ?, NULL, ?)",
-                (package["review_id"], "content_review", created_at),
+                """INSERT INTO workspaces
+                   (review_id, stage, current_revision_id, bundle_path, created_at)
+                   VALUES (?, ?, NULL, ?, ?)""",
+                (package["review_id"], "content_review", str(package_path.parent), created_at),
             )
             cursor = connection.execute(
                 """INSERT INTO revisions
@@ -3021,30 +3030,95 @@ def agent_work_order_metadata(row):
     }
 
 
-def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
-    directory = Path(bundle_dir).expanduser().resolve()
+def make_workspace_server(database, bundle_dir=None, port=0, audiovisual_addon=None):
+    fallback_directory = Path(bundle_dir).expanduser().resolve() if bundle_dir else None
     database_path = Path(database).expanduser().absolute()
     addon_path = Path(audiovisual_addon).expanduser().resolve() if audiovisual_addon else None
     if addon_path is not None and (not addon_path.is_file() or addon_path.suffix != ".js"):
         raise FrameCueError("audiovisual addon must be an existing JavaScript file")
     addon_version = hashlib.sha256(addon_path.read_bytes()).hexdigest()[:12] if addon_path else ""
     for candidate in (database_path, Path(f"{database_path}-wal"), Path(f"{database_path}-shm")):
-        if candidate.is_relative_to(directory) or candidate.resolve().is_relative_to(directory):
+        if fallback_directory and (
+            candidate.is_relative_to(fallback_directory)
+            or candidate.resolve().is_relative_to(fallback_directory)
+        ):
             raise FrameCueError("workspace database files must not be inside the served bundle tree")
-    package, _ = bundle_summary(directory / "review_package.json")
-    review_id = package["review_id"]
     connection = open_workspace_database(database)
     try:
-        workspace_row(connection, review_id)
+        rows = connection.execute(
+            "SELECT review_id, bundle_path FROM workspaces ORDER BY created_at, review_id"
+        ).fetchall()
+        if not rows:
+            raise FrameCueError("workspace database has no imported Workspace")
+        fallback_review_id = ""
+        if fallback_directory:
+            package, _ = bundle_summary(fallback_directory / "review_package.json")
+            fallback_review_id = package["review_id"]
+            workspace_row(connection, fallback_review_id)
+            connection.execute(
+                "UPDATE workspaces SET bundle_path = ? WHERE review_id = ? AND bundle_path IS NULL",
+                (str(fallback_directory), fallback_review_id),
+            )
+            connection.commit()
     finally:
         connection.close()
     csrf_token = secrets.token_urlsafe(32)
-    collaboration = WorkspaceCollaboration()
+    collaborations = {}
+
+    def collaboration_for(review_id):
+        return collaborations.setdefault(review_id, WorkspaceCollaboration())
 
     class WorkspaceHandler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             self._range_length = None
-            super().__init__(*args, directory=str(directory), **kwargs)
+            self._review_id = None
+            super().__init__(*args, directory=str(fallback_directory or DIST_DIR), **kwargs)
+
+        def review_id(self):
+            if self._review_id is not None:
+                return self._review_id
+            values = parse_qs(urlsplit(self.path).query).get("review_id", [])
+            connection = open_workspace_database(database)
+            try:
+                if len(values) > 1 or (values and not values[0]):
+                    raise FrameCueError("review_id is invalid")
+                if values:
+                    review_id = ensure_id(values[0], "review_id")
+                    workspace_row(connection, review_id)
+                elif fallback_review_id:
+                    review_id = fallback_review_id
+                else:
+                    row = connection.execute(
+                        "SELECT review_id FROM workspaces ORDER BY created_at, review_id LIMIT 1"
+                    ).fetchone()
+                    if row is None:
+                        raise FrameCueError("workspace database has no imported Workspace")
+                    review_id = row["review_id"]
+            finally:
+                connection.close()
+            self._review_id = review_id
+            return review_id
+
+        def collaboration(self):
+            return collaboration_for(self.review_id())
+
+        def bundle_directory(self, review_id=None):
+            review_id = review_id or self.review_id()
+            connection = open_workspace_database(database)
+            try:
+                row = connection.execute(
+                    "SELECT bundle_path FROM workspaces WHERE review_id = ?", (review_id,)
+                ).fetchone()
+            finally:
+                connection.close()
+            if row is None:
+                raise FrameCueError(f"workspace not found: {review_id}")
+            directory = Path(row["bundle_path"]).resolve() if row["bundle_path"] else None
+            if directory is None and review_id == fallback_review_id:
+                directory = fallback_directory
+            if directory is None or not (directory / "review_package.json").is_file():
+                raise FrameCueError(f"workspace bundle is unavailable: {review_id}")
+            return directory
 
         def translate_path(self, path):
             request_path = unquote(urlsplit(path).path)
@@ -3055,6 +3129,17 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                 candidate = (DIST_DIR / request_path.lstrip("/")).resolve()
                 if candidate.is_file() and candidate.is_relative_to(viewer_assets):
                     return str(candidate)
+            workspace_asset = re.fullmatch(r"/workspaces/([^/]+)/(.*)", request_path)
+            if workspace_asset:
+                try:
+                    review_id = ensure_id(workspace_asset.group(1), "review_id")
+                    directory = self.bundle_directory(review_id)
+                    candidate = (directory / workspace_asset.group(2)).resolve()
+                    if candidate.is_file() and candidate.is_relative_to(directory):
+                        return str(candidate)
+                except FrameCueError:
+                    pass
+                return str(DIST_DIR / "__not_found__")
             return super().translate_path(path)
 
         def send_json(self, status, value, headers=()):
@@ -3567,6 +3652,7 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                 return
             finally:
                 connection.close()
+            collaboration = collaboration_for(row["review_id"])
             with collaboration.condition:
                 collaboration.changed()
             self.send_json(200, value)
@@ -3629,6 +3715,7 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                 return
             finally:
                 connection.close()
+            collaboration = collaboration_for(job["review_id"])
             with collaboration.condition:
                 collaboration.changed()
             self.send_json(200, {"job_id": job_id, "status": "ready", "proposal": proposal})
@@ -3689,31 +3776,49 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                 return
             finally:
                 connection.close()
+            collaboration = collaboration_for(job["review_id"])
             with collaboration.condition:
                 collaboration.changed()
             self.send_json(200, {"job_id": job_id, "status": "failed", "error": error_value})
 
         def require_session(self):
+            collaboration = self.collaboration()
             session = collaboration.session(self.request_session_id())
             if session is None:
                 self.send_json(403, {"error": "workspace session is not registered"})
             return session
 
         def current_snapshot(self, session):
+            review_id = self.review_id()
+            collaboration = self.collaboration()
             snapshot = workspace_snapshot(database, review_id, csrf_token)
             if addon_path is not None and snapshot["stage"] == "audiovisual_review":
                 snapshot["audiovisual_addon"] = {
-                    "entry": f"/api/workspace/audiovisual-addon.js?v={addon_version}",
+                    "entry": f"/api/workspace/audiovisual-addon.js?v={addon_version}&review_id={review_id}",
                 }
+            snapshot["workspaces"] = self.workspace_list()
+            snapshot["candidate_audio"] = {
+                block_id: f"{path}?review_id={review_id}"
+                for block_id, path in snapshot.get("candidate_audio", {}).items()
+            }
             snapshot.update(collaboration.snapshot_fields(session["session_id"]))
             return snapshot
+
+        def workspace_list(self):
+            connection = open_workspace_database(database)
+            try:
+                return [dict(row) for row in connection.execute(
+                    "SELECT review_id, stage FROM workspaces ORDER BY created_at, review_id"
+                )]
+            finally:
+                connection.close()
 
         def has_workspace_draft(self):
             connection = open_workspace_database(database)
             try:
                 return connection.execute(
                     "SELECT 1 FROM workspace_drafts WHERE review_id = ?",
-                    (review_id,),
+                    (self.review_id(),),
                 ).fetchone() is not None
             finally:
                 connection.close()
@@ -3775,6 +3880,7 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
             return cue_ids
 
         def apply_workspace_operation(self, session, operation):
+            collaboration = self.collaboration()
             snapshot = self.current_snapshot(session)
             kind = operation.get("kind")
             if kind == "presence":
@@ -3801,16 +3907,17 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                 return self.current_snapshot(session)
             affected_cue_ids = self.operation_cue_ids(operation, snapshot)
             collaboration.assert_unlocked(session, affected_cue_ids)
-            apply_draft_operation(database, review_id, operation)
+            apply_draft_operation(database, self.review_id(), operation)
             collaboration.unlock(session, affected_cue_ids)
             collaboration.changed()
             return self.current_snapshot(session)
 
         def set_presence(self, session, operation, snapshot):
             cue_ids = {cue["id"] for cue in snapshot["document"]["cues"]}
-            collaboration.set_presence(session, operation, cue_ids)
+            self.collaboration().set_presence(session, operation, cue_ids)
 
         def send_workspace_event(self):
+            collaboration = self.collaboration()
             session_id = self.request_session_id()
             with collaboration.condition:
                 session = collaboration.session(session_id)
@@ -3922,6 +4029,12 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
         def do_GET(self):
             parsed_request = urlsplit(self.path)
             path = parsed_request.path
+            if path == "/api/workspace" or path.startswith("/api/workspace/"):
+                try:
+                    self.review_id()
+                except FrameCueError as error:
+                    self.send_json(404, {"error": str(error)})
+                    return
             if path == "/api/workspace/audiovisual-addon.js" and addon_path is not None:
                 file = self.send_file(addon_path)
                 if file is not None:
@@ -3934,7 +4047,7 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
             if candidate_audio:
                 try:
                     file = self.send_file(workspace_candidate_audio(
-                        database, review_id, unquote(candidate_audio.group(1))
+                        database, self.review_id(), unquote(candidate_audio.group(1))
                     ))
                 except FrameCueError as error:
                     self.send_json(404, {"error": str(error)})
@@ -3980,7 +4093,11 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
             if path == "/api/workspace/events":
                 self.send_workspace_event()
                 return
+            if path == "/api/workspaces":
+                self.send_json(200, {"workspaces": self.workspace_list()})
+                return
             if path == "/api/workspace/snapshot":
+                collaboration = self.collaboration()
                 with collaboration.condition:
                     try:
                         session = collaboration.register_or_refresh(
@@ -3999,6 +4116,7 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                 return
             if path != "/api/workspace":
                 return super().do_GET()
+            review_id = self.review_id()
             connection = open_workspace_database(database)
             try:
                 workspace = workspace_row(connection, review_id)
@@ -4079,6 +4197,11 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
             if path not in {"/api/content-complete", "/api/workspace/operation", "/api/workspace/complete"}:
                 self.send_error(404)
                 return
+            try:
+                self.review_id()
+            except FrameCueError as error:
+                self.send_json(404, {"error": str(error)})
+                return
             value = self.read_workspace_json()
             if value is None:
                 return
@@ -4090,12 +4213,13 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                     self.send_json(409, {"error": "active Subtitle Workspace must use /api/workspace/complete"})
                     return
                 try:
-                    summary = complete_content_revision(database, review_id, value)
+                    summary = complete_content_revision(database, self.review_id(), value)
                 except FrameCueError as error:
                     self.send_json(409, {"error": str(error)})
                     return
                 self.send_json(200, summary)
                 return
+            collaboration = self.collaboration()
             with collaboration.condition:
                 session = self.require_session()
                 if session is None:
@@ -4111,7 +4235,9 @@ def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
                     if completion_error:
                         self.send_json(409, {"error": completion_error})
                         return
-                    summary = complete_workspace_round(database, review_id, value.get("draft_version"))
+                    summary = complete_workspace_round(
+                        database, self.review_id(), value.get("draft_version")
+                    )
                     collaboration.changed()
                 except FrameCueError as error:
                     self.send_json(409, {"error": str(error)})
@@ -5168,9 +5294,9 @@ def parser():
     content_complete.add_argument("--result", required=True)
     content_complete.set_defaults(func=command_content_complete)
 
-    workspace_serve = commands.add_parser("workspace-serve", help="serve one local subtitle workspace")
+    workspace_serve = commands.add_parser("workspace-serve", help="serve imported subtitle workspaces")
     workspace_serve.add_argument("--database", required=True)
-    workspace_serve.add_argument("--dir", required=True)
+    workspace_serve.add_argument("--dir", help="legacy fallback bundle for an older imported Workspace")
     workspace_serve.add_argument("--port", type=int, default=3069)
     workspace_serve.add_argument("--audiovisual-addon")
     workspace_serve.set_defaults(func=command_workspace_serve)

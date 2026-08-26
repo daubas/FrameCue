@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  cueReadingMetrics,
+  diffWords,
   completeWorkspaceRound,
   isWorkspaceSubmitted,
   loadWorkspaceConfig,
@@ -10,6 +12,27 @@ import {
   submitWorkspaceOperation,
   submitApprovedResult
 } from "../src/lib/workspace.js";
+
+test("shows changed words without losing either Agent text", () => {
+  const parts = diffWords("這句字幕錯誤", "這句字幕正確");
+  assert.equal(parts.filter((part) => part.type !== "add").map((part) => part.text).join(""), "這句字幕錯誤");
+  assert.equal(parts.filter((part) => part.type !== "remove").map((part) => part.text).join(""), "這句字幕正確");
+  assert.ok(parts.some((part) => part.type === "remove"));
+  assert.ok(parts.some((part) => part.type === "add"));
+});
+
+test("reports Cue reading metrics with explicit risk thresholds", () => {
+  assert.deepEqual(cueReadingMetrics({
+    display_text: "一二三四五六七八九十",
+    source_start_ms: 0,
+    source_end_ms: 400
+  }), {
+    characters: 10,
+    duration_ms: 400,
+    cps: 25,
+    risks: ["少於 1 秒", "超過 20 CPS"]
+  });
+});
 
 
 const packageData = {
@@ -257,6 +280,23 @@ test("loads the Workspace v2 snapshot and keeps a missing endpoint in static mod
     fetchImpl: async () => ({ ok: false, status: 404 }),
     baseHref: "https://framecue.test/reviews/index.html"
   }), null);
+});
+
+test("keeps the selected review ID on every Workspace request", async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    return { ok: true, status: 200, json: async () => workspaceSnapshot };
+  };
+  const baseHref = "https://framecue.test/?review_id=fixture-workspace";
+
+  await loadWorkspaceSnapshot({ fetchImpl, baseHref });
+  await submitWorkspaceOperation(workspaceSnapshot, { kind: "dirty", dirty: true }, { fetchImpl, baseHref });
+
+  assert.deepEqual(calls, [
+    "https://framecue.test/api/workspace/snapshot?review_id=fixture-workspace",
+    "https://framecue.test/api/workspace/operation?review_id=fixture-workspace"
+  ]);
 });
 
 test("rejects Workspace snapshots without collaboration identity", async () => {

@@ -61,6 +61,15 @@ test("Workspace v2 has its own reverse-approval shell while static pages keep Ap
   assert.doesNotMatch(shell, /已審|reviewed_cues|完成百分比/);
 });
 
+test("Workspace shell switches review IDs without starting another server", () => {
+  const shell = readFileSync(new URL("../src/SubtitleWorkspace.svelte", import.meta.url), "utf8");
+
+  assert.match(shell, /snapshot\.workspaces/);
+  assert.match(shell, /name="workspace-switcher"/);
+  assert.match(shell, /searchParams\.set\("review_id"/);
+  assert.match(shell, /\/workspaces\/\$\{encodeURIComponent\(snapshot\.workspace_id\)\}/);
+});
+
 test("Workspace exposes Block-aware, reasoned structural controls and keyboard fallbacks", () => {
   const shell = readFileSync(new URL("../src/SubtitleWorkspace.svelte", import.meta.url), "utf8");
   const mediaStage = readFileSync(new URL("../src/components/MediaStage.svelte", import.meta.url), "utf8");
@@ -176,6 +185,11 @@ test("Workspace renders non-destructive Agent suggestion states and decisions", 
   assert.match(shell, /尚未送出給 Agent/);
   assert.match(shell, /function selectedAgentJob/);
   assert.match(shell, /送出給 Agent/);
+  assert.match(shell, /diffWords\(/);
+  assert.match(shell, /<del>/);
+  assert.match(shell, /<ins>/);
+  assert.match(shell, /cueReadingMetrics\(/);
+  assert.match(shell, /CPS/);
 });
 
 test("Workspace keeps the Agent prompt in Cue flow instead of covering subtitles", () => {

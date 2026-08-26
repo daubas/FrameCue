@@ -95,7 +95,9 @@ The implemented content-review milestone supports:
   gates, autosave, and server-sent change notifications;
 - scoped agent bearer tokens and Work Order list/read/claim/submit/fail/retry.
 
-Import and serve one development Workspace:
+Import any number of packages into one database, then keep one FrameCue service
+running. The page switches content by `review_id`; a new Workspace does not need
+another port or server process.
 
 ```bash
 python3 framecue.py workspace-import \
@@ -105,9 +107,11 @@ python3 framecue.py workspace-import \
 
 python3 framecue.py workspace-serve \
   --database workspace.sqlite3 \
-  --dir review-r1 \
   --port 3069
 ```
+
+`--dir` remains only as a one-time fallback for Workspace rows imported before
+their bundle path was stored.
 
 This milestone is not production-ready. Real TTS and alignment execution,
 Voice Candidate v2, audiovisual review, portable Workspace export/import, and

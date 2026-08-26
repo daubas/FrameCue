@@ -67,6 +67,58 @@ def approved_result(package):
 
 
 class WorkspaceHTTPTests(unittest.TestCase):
+    def test_one_server_switches_between_imported_workspaces_by_review_id(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-multi-workspace-") as temp:
+            root = Path(temp)
+            database = root / "workspace.sqlite3"
+            packages = []
+            for review_id in ("review-one", "review-two"):
+                source = json.loads(FIXTURE.read_text(encoding="utf-8"))
+                source["review_id"] = review_id
+                source["scenes"][0]["image"] = str(FIXTURE.parent / "assets" / "scene.svg")
+                source_path = root / f"{review_id}.json"
+                bundle = root / review_id
+                source_path.write_text(json.dumps(source), encoding="utf-8")
+                run_cli("build", "--input", str(source_path), "--out-dir", str(bundle))
+                package = json.loads((bundle / "review_package.json").read_text(encoding="utf-8"))
+                run_cli(
+                    "workspace-import", "--database", str(database),
+                    "--package", str(bundle / "review_package.json"),
+                    "--timing-profile", "synchronous_dub",
+                )
+                packages.append(package)
+
+            server = framecue.make_workspace_server(database, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                _, _, listing = self._json_request(base, "/api/workspaces")
+                self.assertEqual(
+                    [row["review_id"] for row in listing["workspaces"]],
+                    ["review-one", "review-two"],
+                )
+                for package in packages:
+                    review_id = package["review_id"]
+                    _, _, snapshot = self._json_request(
+                        base, f"/api/workspace/snapshot?review_id={review_id}"
+                    )
+                    self.assertEqual(snapshot["workspace_id"], review_id)
+                    with urllib.request.urlopen(
+                        f"{base}/workspaces/{review_id}/review_package.json", timeout=5
+                    ) as response:
+                        served = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(served["review_id"], review_id)
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(
+                        f"{base}/api/workspace/snapshot?review_id=missing", timeout=5
+                    )
+                self.assertEqual(failure.exception.code, 404)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
     def _workspace_server(self, root):
         bundle = root / "bundle"
         database = root / "workspace.sqlite3"

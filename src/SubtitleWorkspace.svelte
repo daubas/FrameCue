@@ -4,6 +4,8 @@
   import { formatTime } from "./lib/review.js";
   import {
     completeWorkspaceRound,
+    cueReadingMetrics,
+    diffWords,
     loadWorkspaceSnapshot,
     nearestRemainingCueId,
     openWorkspaceEvents,
@@ -376,7 +378,17 @@
   }
 
   function assetUrl(path) {
-    return new URL(path || "", window.location.href).href;
+    if (!path || /^(?:[a-z]+:|\/)/i.test(path)) return new URL(path || "", window.location.href).href;
+    return new URL(
+      `/workspaces/${encodeURIComponent(snapshot.workspace_id)}/${path}`,
+      window.location.origin
+    ).href;
+  }
+
+  function switchWorkspace(event) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("review_id", event.currentTarget.value);
+    window.location.assign(url.href);
   }
 
   function mergeSnapshot(changed) {
@@ -1031,7 +1043,18 @@
   <header class="workspace-toolbar">
     <div>
       <strong>FrameCue</strong>
-      <span>{snapshot.workspace_id}</span>
+      {#if snapshot.workspaces?.length > 1}
+        <label class="workspace-switcher">
+          <span class="sr-only">切換 Workspace</span>
+          <select name="workspace-switcher" value={snapshot.workspace_id} disabled={localDirty || syncing || busy} on:change={switchWorkspace}>
+            {#each snapshot.workspaces as workspace}
+              <option value={workspace.review_id}>{workspace.review_id}</option>
+            {/each}
+          </select>
+        </label>
+      {:else}
+        <span>{snapshot.workspace_id}</span>
+      {/if}
       <span>{snapshot.participants.map((participant) => participant.display_name).join(" · ")}</span>
     </div>
     <div class="workspace-counts" role="status" aria-label="本輪摘要">
@@ -1146,6 +1169,9 @@
                       <small>#{group.first_index + cueIndex + 1}</small>
                       <small>{formatTime(cue.source_start_ms)}–{formatTime(cue.source_end_ms)}</small>
                       <small>Block {String(blockNumberById.get(cue.block_id) || "?").padStart(2, "0")}</small>
+                      <small class:risk={cueReadingMetrics(cue).risks.length} title={cueReadingMetrics(cue).risks.join(" · ")}>
+                        {cueReadingMetrics(cue).characters} 字 · {(cueReadingMetrics(cue).duration_ms / 1000).toFixed(1)} 秒 · {cueReadingMetrics(cue).cps} CPS
+                      </small>
                       {#if cueIssues(cue.id).length}<small class="cue-state needs-change">待 Agent 修改</small>{/if}
                       {#each cueAgentSuggestions(cue.id) as suggestion}
                         <small class={`cue-state agent-status ${suggestion.status}`} aria-label={`Agent 建議：${agentSuggestionStatusLabel(suggestion.status)}`}>{agentSuggestionStatusLabel(suggestion.status)}</small>
@@ -1199,11 +1225,11 @@
                                 <div class="agent-diff" aria-label="Agent 建議差異">
                                   <div>
                                     <strong>修改前</strong>
-                                    <p>{suggestion.before || cue.display_text || "（無文字）"}</p>
+                                    <p>{#each diffWords(suggestion.before || cue.display_text || "", suggestion.after || "") as part}{#if part.type === "remove"}<del>{part.text}</del>{:else if part.type === "same"}{part.text}{/if}{/each}</p>
                                   </div>
                                   <div>
                                     <strong>修改後</strong>
-                                    <p>{suggestion.after || "（沒有替換文字）"}</p>
+                                    <p>{#each diffWords(suggestion.before || cue.display_text || "", suggestion.after || "") as part}{#if part.type === "add"}<ins>{part.text}</ins>{:else if part.type === "same"}{part.text}{/if}{/each}</p>
                                   </div>
                                 </div>
                                 {#if suggestion.explanation}<p class="agent-suggestion-note">{suggestion.explanation}</p>{/if}
@@ -1339,6 +1365,7 @@
   .cue-list small { color: #9da99d; }
   .cue-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 9px; margin-bottom: 5px; }
   .cue-meta small { font-size: 10px; }
+  .cue-meta small.risk { color: #ffd08a; }
   .cue-state, .cue-presence { width: max-content; font-size: 10px; }
   .cue-state.needs-change { color: #ffd9bf; }
   .cue-state.locked { color: #e6c784; }
@@ -1370,6 +1397,8 @@
   .agent-diff > div { min-width: 0; padding: 7px; border: 1px solid #3f4b41; border-radius: 4px; background: #171c19; }
   .agent-diff strong { color: #b7d3ae; font-size: 10px; }
   .agent-diff p, .agent-suggestion-note, .agent-suggestion-error { margin: 4px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; color: #eef2ec; font-size: 12px; line-height: 1.4; }
+  .agent-diff del { background: #5a302d; color: #ffd1ca; text-decoration-thickness: 1px; }
+  .agent-diff ins { background: #294a30; color: #d3efcf; text-decoration: none; }
   .agent-suggestion-note { color: #c6d0c3; }
   .agent-suggestion-error { color: #ffc6be; }
   .agent-suggestion-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }

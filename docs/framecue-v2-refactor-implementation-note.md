@@ -673,3 +673,26 @@ Direct human text edits still take precedence and may stale an older proposal.
   回歸並更新既有 completion／reopen／delete 契約；Python 78/78 通過。
 - Peter draft v268 的 224 筆手改已依此封存為 checksum
   `2fc647bf…7746`，Workspace 進入 `voice_realization_pending`。
+
+### 2026-08-26 — One FrameCue service for all Workspaces
+
+- `workspace-import` now stores the immutable bundle directory with its
+  `review_id`. One `workspace-serve --database … --port 3069` process serves
+  every Workspace in that database; the toolbar switches the active review by
+  the `review_id` URL parameter instead of allocating another port.
+- Workspace HTTP routes resolve the active review per request. Collaboration,
+  locks, lead state, snapshots, suggestions, candidate audio, and bundled media
+  remain isolated by `review_id`. Bundle files use
+  `/workspaces/<review_id>/…`, so relative HyperFrames assets also stay scoped.
+- Existing databases gain a nullable `bundle_path` column automatically.
+  `workspace-serve --dir <bundle>` is retained only to backfill a legacy row;
+  new imports need no `--dir` when serving.
+- Cue rows now expose character count, duration, CPS, and explicit warnings at
+  `<1 s`, `>20 CPS`, or `>30` non-whitespace characters. Ready Agent
+  suggestions mark actual word-level removals and additions while preserving
+  the existing before/after decision UI.
+- Verified seams: one server listed and switched two imported review IDs,
+  returned review-scoped bundles, and failed closed for an unknown ID. Node
+  46/46, Python 85/85, and the production build pass. Updating the pinned
+  runtime skill remains a release step rather than pointing it at an untagged
+  development checkout.

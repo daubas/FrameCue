@@ -55,6 +55,12 @@ class WorkspaceCliTests(unittest.TestCase):
         server.serve_forever.assert_called_once_with()
         server.server_close.assert_called_once_with()
 
+    def test_workspace_serve_uses_imported_bundle_paths_without_dir(self):
+        args = framecue.parser().parse_args([
+            "workspace-serve", "--database", "DB", "--port", "8765"
+        ])
+        self.assertIsNone(args.dir)
+
     def _pending_work_order(self, root):
         bundle = root / "bundle"
         database = root / "workspace.sqlite3"

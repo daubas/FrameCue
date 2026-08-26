@@ -1,5 +1,63 @@
 import { makeResult } from "./review.js";
 
+function wordTokens(text) {
+  if (typeof Intl?.Segmenter === "function") {
+    return [...new Intl.Segmenter("zh-Hant", { granularity: "word" }).segment(String(text))]
+      .map(({ segment }) => segment);
+  }
+  return String(text).match(/\s+|[\p{L}\p{N}]+|[^\s]/gu) || [];
+}
+
+export function diffWords(before, after) {
+  const left = wordTokens(before);
+  const right = wordTokens(after);
+  // ponytail: Cue text is short; replace this O(n²) LCS only if long-form diffs are added.
+  const lengths = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
+  for (let i = left.length - 1; i >= 0; i -= 1) {
+    for (let j = right.length - 1; j >= 0; j -= 1) {
+      lengths[i][j] = left[i] === right[j]
+        ? lengths[i + 1][j + 1] + 1
+        : Math.max(lengths[i + 1][j], lengths[i][j + 1]);
+    }
+  }
+  const parts = [];
+  const add = (type, text) => {
+    if (parts.at(-1)?.type === type) parts.at(-1).text += text;
+    else parts.push({ type, text });
+  };
+  let i = 0;
+  let j = 0;
+  while (i < left.length || j < right.length) {
+    if (left[i] === right[j]) {
+      add("same", left[i]); i += 1; j += 1;
+    } else if (j < right.length && (i === left.length || lengths[i][j + 1] >= lengths[i + 1][j])) {
+      add("add", right[j]); j += 1;
+    } else {
+      add("remove", left[i]); i += 1;
+    }
+  }
+  return parts;
+}
+
+export function cueReadingMetrics(cue) {
+  const text = String(cue?.display_text ?? cue?.text ?? "");
+  const characters = [...text.replace(/\s/gu, "")].length;
+  const start = cue?.output_start_ms ?? cue?.source_start_ms ?? cue?.start_ms ?? 0;
+  const end = cue?.output_end_ms ?? cue?.source_end_ms ?? cue?.end_ms ?? start;
+  const duration_ms = Math.max(0, end - start);
+  const cps = duration_ms ? Number((characters * 1000 / duration_ms).toFixed(1)) : 0;
+  return {
+    characters,
+    duration_ms,
+    cps,
+    risks: [
+      ...(duration_ms < 1000 ? ["少於 1 秒"] : []),
+      ...(cps > 20 ? ["超過 20 CPS"] : []),
+      ...(characters > 30 ? ["超過 30 字"] : [])
+    ]
+  };
+}
+
 export function isWorkspaceSubmitted(workspace) {
   return workspace?.mode === "server"
     && typeof workspace.stage === "string"
@@ -30,6 +88,8 @@ function resolveWorkspaceEndpoint(path, baseHref) {
   try {
     base = new URL(baseHref);
     endpoint = new URL(path, base);
+    const reviewId = base.searchParams.get("review_id");
+    if (reviewId) endpoint.searchParams.set("review_id", reviewId);
   } catch {
     throw new Error("workspace endpoint is invalid");
   }
