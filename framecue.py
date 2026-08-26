@@ -47,6 +47,9 @@ WORKFLOW_ACTIONS = {
     "markdown": {"use_edit", "rewrite", "cut", "split", "needs_source"},
 }
 WORKFLOW_KINDS = set(WORKFLOW_ACTIONS)
+UNDOABLE_DRAFT_OPERATION_KINDS = {
+    "edit", "split", "merge", "delete", "block_merge", "block_split",
+}
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLIDE_PATTERN = re.compile(r"^slide-(\d+)\.png$", re.IGNORECASE)
 LIST_PATTERN = re.compile(r"^\s*(?:[-*+] |\d+\. )")
@@ -1771,7 +1774,7 @@ def decide_suggestion_job(connection, review_id, draft, operation, apply):
     return change
 
 
-def apply_draft_operation(database, review_id, operation):
+def apply_draft_operation(database, review_id, operation, *, capture_undo=False):
     if not isinstance(operation, dict):
         raise FrameCueError("draft operation must be an object")
     expected_version = operation.get("draft_version")
@@ -1797,6 +1800,14 @@ def apply_draft_operation(database, review_id, operation):
                 raise FrameCueError(
                     f"workspace draft version is stale: expected {draft['draft_version']}, got {expected_version}"
                 )
+            undo_before = None
+            if capture_undo and kind in UNDOABLE_DRAFT_OPERATION_KINDS:
+                undo_before = {
+                    "document": copy.deepcopy(draft["document"]),
+                    "issues": copy.deepcopy(draft["issues"]),
+                    "direct_changes": copy.deepcopy(draft["direct_changes"]),
+                    "round_id": workspace_undo_round_id(connection, review_id),
+                }
             ready_suggestions = [
                 row for row in connection.execute(
                     "SELECT * FROM suggestion_jobs WHERE review_id = ? AND status = 'suggestion_ready'",
@@ -1846,6 +1857,14 @@ def apply_draft_operation(database, review_id, operation):
                         draft["issues"].remove(issue)
             if change is not None:
                 draft["direct_changes"].append(change)
+            if undo_before is not None:
+                undo_before["undo_cue_ids"] = list(change["cue_ids"])
+                if kind == "merge":
+                    result_block_ids = set(change["result_block_ids"])
+                    undo_before["undo_cue_ids"] = [
+                        cue["id"] for cue in draft["document"]["cues"]
+                        if cue.get("block_id") in result_block_ids
+                    ]
             next_version = expected_version + 1 if draft_changed else expected_version
             if draft_changed:
                 if connection.execute(
@@ -1879,13 +1898,81 @@ def apply_draft_operation(database, review_id, operation):
             raise
     finally:
         connection.close()
-    return {
+    result = {
         "workspace_id": review_id,
         "stage": workspace["stage"],
         "draft_version": next_version,
         "document": draft["document"],
         "issues": draft["issues"],
         "direct_edit_count": len(draft["direct_changes"]),
+    }
+    if undo_before is not None:
+        result["_undo_before"] = undo_before
+    return result
+
+
+def undo_draft_operation(database, review_id, expected_version, undo_before):
+    if type(expected_version) is not int or expected_version < 0:
+        raise FrameCueError("draft operation draft_version is invalid")
+    if not isinstance(undo_before, dict):
+        raise FrameCueError("workspace undo is unavailable")
+    document = undo_before.get("document")
+    issues = undo_before.get("issues")
+    direct_changes = undo_before.get("direct_changes")
+    round_id = undo_before.get("round_id")
+    if (
+        not isinstance(document, dict)
+        or document.get("schema") != SUBTITLE_DOCUMENT_V2_SCHEMA
+        or not isinstance(issues, list)
+        or not isinstance(direct_changes, list)
+        or type(round_id) is not int
+    ):
+        raise FrameCueError("workspace undo is unavailable")
+    connection = open_workspace_database(database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = workspace_row(connection, review_id)
+            if workspace["stage"] != "content_review":
+                raise FrameCueError(f"workspace is not accepting draft operations: {review_id}")
+            if workspace_undo_round_id(connection, review_id) != round_id:
+                raise FrameCueError("workspace undo is unavailable")
+            draft = draft_row(connection, workspace)
+            if draft["draft_version"] != expected_version:
+                raise FrameCueError(
+                    f"workspace draft version is stale: expected {draft['draft_version']}, got {expected_version}"
+                )
+            next_version = expected_version + 1
+            if connection.execute(
+                """UPDATE workspace_drafts
+                   SET draft_version = ?, document_json = ?, issues_json = ?, direct_changes_json = ?
+                   WHERE review_id = ? AND draft_version = ?""",
+                (
+                    next_version,
+                    canonical_json(document),
+                    canonical_json(issues),
+                    canonical_json(direct_changes),
+                    review_id,
+                    expected_version,
+                ),
+            ).rowcount != 1:
+                raise FrameCueError(f"workspace draft version is stale: {review_id}")
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    return {
+        "workspace_id": review_id,
+        "stage": workspace["stage"],
+        "draft_version": next_version,
+        "document": document,
+        "issues": issues,
+        "direct_edit_count": len(direct_changes),
     }
 
 
@@ -2057,6 +2144,13 @@ def workspace_row(connection, review_id):
     if row is None:
         raise FrameCueError(f"workspace not found: {review_id}")
     return row
+
+
+def workspace_undo_round_id(connection, review_id):
+    return connection.execute(
+        "SELECT COALESCE(MAX(work_order_id), 0) AS value FROM work_orders WHERE review_id = ?",
+        (review_id,),
+    ).fetchone()["value"]
 
 
 def workspace_source_package(connection, workspace):
@@ -2744,6 +2838,7 @@ def workspace_snapshot(database, review_id, csrf_token):
     try:
         workspace = workspace_row(connection, review_id)
         draft = draft_row(connection, workspace)
+        undo_round_id = workspace_undo_round_id(connection, review_id)
         candidate_audio = {}
         if workspace["stage"] == "audiovisual_review":
             row = connection.execute(
@@ -2778,6 +2873,7 @@ def workspace_snapshot(database, review_id, csrf_token):
         "direct_edit_count": len(draft["direct_changes"]),
         "suggestions": values,
         "candidate_audio": candidate_audio,
+        "_undo_round_id": undo_round_id,
     }
 
 
@@ -2869,6 +2965,7 @@ class WorkspaceCollaboration:
             "display_name": self._display_name(display_name),
             "dirty": False,
             "selected_cue_id": "",
+            "undo": None,
             "last_seen": time.monotonic(),
         }
         self.sessions[session_id] = session
@@ -2887,6 +2984,23 @@ class WorkspaceCollaboration:
     def changed(self):
         self.version += 1
         self.condition.notify_all()
+
+    def clear_undo(self):
+        for session in self.sessions.values():
+            session["undo"] = None
+
+    def record_undo(self, session, undo_before, draft_version):
+        session["undo"] = {"draft_version": draft_version, **undo_before}
+
+    def undo_state(self, session, draft_version, round_id=None):
+        undo = session.get("undo")
+        if (
+            isinstance(undo, dict)
+            and undo.get("draft_version") == draft_version
+            and (round_id is None or undo.get("round_id") == round_id)
+        ):
+            return undo
+        return None
 
     def snapshot_fields(self, session_id):
         self.expire()
@@ -3792,6 +3906,7 @@ def make_workspace_server(database, bundle_dir=None, port=0, audiovisual_addon=N
             review_id = self.review_id()
             collaboration = self.collaboration()
             snapshot = workspace_snapshot(database, review_id, csrf_token)
+            undo_round_id = snapshot.pop("_undo_round_id")
             if addon_path is not None and snapshot["stage"] == "audiovisual_review":
                 snapshot["audiovisual_addon"] = {
                     "entry": f"/api/workspace/audiovisual-addon.js?v={addon_version}&review_id={review_id}",
@@ -3801,6 +3916,12 @@ def make_workspace_server(database, bundle_dir=None, port=0, audiovisual_addon=N
                 block_id: f"{path}?review_id={review_id}"
                 for block_id, path in snapshot.get("candidate_audio", {}).items()
             }
+            snapshot["can_undo"] = (
+                snapshot["stage"] == "content_review"
+                and collaboration.undo_state(
+                    session, snapshot["draft_version"], undo_round_id
+                ) is not None
+            )
             snapshot.update(collaboration.snapshot_fields(session["session_id"]))
             return snapshot
 
@@ -3905,10 +4026,31 @@ def make_workspace_server(database, bundle_dir=None, port=0, audiovisual_addon=N
                     raise FrameCueError("workspace lead operation is invalid")
                 collaboration.transfer_lead(session, expected_lead_session_id, new_lead_session_id)
                 return self.current_snapshot(session)
+            if kind == "undo":
+                self.required_draft_version(operation, snapshot)
+                undo_before = collaboration.undo_state(session, snapshot["draft_version"])
+                if undo_before is None:
+                    raise FrameCueError("workspace undo is unavailable")
+                affected_cue_ids = undo_before.get("undo_cue_ids", [])
+                collaboration.assert_unlocked(session, affected_cue_ids)
+                undo_draft_operation(
+                    database, self.review_id(), snapshot["draft_version"], undo_before
+                )
+                collaboration.unlock(session, affected_cue_ids)
+                collaboration.clear_undo()
+                collaboration.changed()
+                return self.current_snapshot(session)
             affected_cue_ids = self.operation_cue_ids(operation, snapshot)
             collaboration.assert_unlocked(session, affected_cue_ids)
-            apply_draft_operation(database, self.review_id(), operation)
+            changed = apply_draft_operation(
+                database, self.review_id(), operation, capture_undo=True
+            )
             collaboration.unlock(session, affected_cue_ids)
+            if changed["draft_version"] != snapshot["draft_version"]:
+                collaboration.clear_undo()
+                undo_before = changed.pop("_undo_before", None)
+                if undo_before is not None:
+                    collaboration.record_undo(session, undo_before, changed["draft_version"])
             collaboration.changed()
             return self.current_snapshot(session)
 
@@ -4238,6 +4380,7 @@ def make_workspace_server(database, bundle_dir=None, port=0, audiovisual_addon=N
                     summary = complete_workspace_round(
                         database, self.review_id(), value.get("draft_version")
                     )
+                    collaboration.clear_undo()
                     collaboration.changed()
                 except FrameCueError as error:
                     self.send_json(409, {"error": str(error)})

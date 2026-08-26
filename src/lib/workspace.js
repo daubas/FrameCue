@@ -110,6 +110,9 @@ function validateWorkspaceSnapshot(snapshot) {
   if (!Number.isInteger(snapshot.draft_version) || snapshot.draft_version < 0) {
     throw new Error("workspace snapshot draft_version is invalid");
   }
+  if (typeof snapshot.can_undo !== "boolean") {
+    throw new Error("workspace snapshot can_undo is invalid");
+  }
   if (typeof snapshot.csrf_token !== "string" || !snapshot.csrf_token.trim()) {
     throw new Error("workspace snapshot CSRF token is required");
   }
@@ -197,8 +200,11 @@ export function submitWorkspaceOperation(workspace, operation, options = {}) {
   }, options);
 }
 
-export function resolveStructuralCueId(cues, operation, selectedBefore) {
+export function resolveStructuralCueId(cues, operation, selectedBefore, selectedIndex, beforeCues = []) {
   const byId = (cueId) => cues.find((cue) => cue.id === cueId);
+  if (operation.kind === "undo") {
+    return resolveUndoCueId(beforeCues, cues, selectedBefore, selectedIndex);
+  }
   if (operation.kind === "split") {
     const children = cues.filter((cue) => cue.lineage?.parent_cue_ids?.includes(operation.cue_id));
     return children[1]?.id || children[0]?.id || byId(selectedBefore)?.id || cues[0]?.id || "";
@@ -214,6 +220,35 @@ export function resolveStructuralCueId(cues, operation, selectedBefore) {
     return nearestRemainingCueId(cues, operation.selection_index);
   }
   return byId(selectedBefore)?.id || byId(operation.cue_id)?.id || cues[0]?.id || "";
+}
+
+export function resolveUndoCueId(beforeCues, afterCues, selectedBefore, selectedIndex) {
+  const before = Array.isArray(beforeCues) ? beforeCues : [];
+  const after = Array.isArray(afterCues) ? afterCues : [];
+  if (!after.length) return "";
+
+  const selected = before.find((cue) => cue.id === selectedBefore);
+  const parentIds = selected?.lineage?.parent_cue_ids;
+  const restoredParent = Array.isArray(parentIds)
+    ? after.find((cue) => parentIds.includes(cue.id))
+    : null;
+  if (restoredParent) return restoredParent.id;
+
+  const beforeIds = new Set(before.map((cue) => cue.id));
+  const restored = after
+    .map((cue, index) => ({ cue, index }))
+    .filter(({ cue }) => !beforeIds.has(cue.id));
+  if (restored.length) {
+    const targetIndex = Number.isInteger(selectedIndex) ? selectedIndex : 0;
+    restored.sort((left, right) =>
+      Math.abs(left.index - targetIndex) - Math.abs(right.index - targetIndex)
+      || left.index - right.index);
+    return restored[0].cue.id;
+  }
+
+  return after.some((cue) => cue.id === selectedBefore)
+    ? selectedBefore
+    : nearestRemainingCueId(after, selectedIndex);
 }
 
 export function nearestRemainingCueId(cues, deletedIndex) {

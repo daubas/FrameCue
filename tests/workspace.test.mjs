@@ -247,6 +247,7 @@ const workspaceSnapshot = {
   stage: "content_review",
   draft_version: 3,
   snapshot_version: 7,
+  can_undo: false,
   csrf_token: "workspace-token",
   session_id: "session-alice",
   lead_session_id: "session-alice",
@@ -310,6 +311,20 @@ test("rejects Workspace snapshots without collaboration identity", async () => {
       baseHref: "https://framecue.test/reviews/index.html"
     }),
     /session_id/
+  );
+});
+
+test("rejects Workspace snapshots whose can_undo is not boolean", async () => {
+  await assert.rejects(
+    () => loadWorkspaceSnapshot({
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ ...workspaceSnapshot, can_undo: "false" })
+      }),
+      baseHref: "https://framecue.test/reviews/index.html"
+    }),
+    /can_undo/
   );
 });
 

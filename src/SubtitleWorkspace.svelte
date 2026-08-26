@@ -24,8 +24,6 @@
   let caretStart = null;
   let caretEnd = null;
   let stageMode = snapshot.document.source_package?.media?.video ? "video" : "still";
-  let playbackMs = snapshot.document.cues[0]?.source_start_ms || 0;
-  let mediaDurationMs = 0;
   let connected = true;
   let syncing = false;
   let localDirty = false;
@@ -191,13 +189,6 @@
     blocks: snapshot.document.blocks || [],
     scenes: sourcePackage.scenes || []
   };
-  $: timelineEndMs = Math.max(mediaDurationMs, ...stageCues.map((cue) => cue.end_ms), 1);
-  $: playheadPercent = Math.min(100, Math.max(0, playbackMs / timelineEndMs * 100));
-  $: selectedTimingLabel = selectedCue?.output_start_ms != null && selectedCue?.output_end_ms != null
-    ? "配音時間已對齊"
-    : selectedCue?.timing_state === "provisional"
-      ? "來源時間 · 暫定切分 · 配音未對齊"
-      : "來源時間 · 配音未對齊";
   $: issueCount = new Set((snapshot.issues || []).map((issue) => issue.range_id || issue.flag_id)).size;
   $: selectedOwnIssues = selectedCue ? (snapshot.issues || []).filter((issue) =>
     issue.cue_ids?.includes(selectedCue.id) && issue.authors?.includes(snapshot.display_name)
@@ -236,6 +227,20 @@
   $: canDecideAgentSuggestion = connected && !busy && !completing && !lockedByOther
     && snapshot.stage === "content_review";
   $: canComplete = canEdit && isLead && !localDirty && !snapshot.participants.some((participant) => participant.dirty) && !snapshot.locks.length;
+  $: undoReason = !selectedCue
+    ? "沒有可復原的 Cue。"
+    : !snapshot.can_undo
+      ? "目前沒有可復原的操作。"
+      : !connected
+        ? "目前離線，請重新同步後再復原。"
+        : syncing || busy || completing
+          ? "上一個操作仍在處理中。"
+          : lockedByOther
+            ? "這句 Cue 正由其他審稿者修改。"
+            : phone
+              ? "手機版僅供唯讀檢視。"
+              : "";
+  $: canUndo = !undoReason;
   $: selectedCueIndex = cues.findIndex((cue) => cue.id === selectedCue?.id);
   $: previousMergeCue = selectedCueIndex > 0 ? cues[selectedCueIndex - 1] : null;
   $: nextMergeCue = selectedCueIndex >= 0 ? cues[selectedCueIndex + 1] || null : null;
@@ -551,7 +556,6 @@
     await leaveEditor();
     editingCueId = "";
     selectedCueId = cueId;
-    playbackMs = cues.find((cue) => cue.id === cueId)?.source_start_ms || 0;
     await post({ kind: "presence", selected_cue_id: cueId });
     if (center) await centerBrowseCue(cueId);
   }
@@ -629,10 +633,12 @@
     if (cues.some((cue) => cue.id === cueId)) selectCue(cueId);
   }
 
-  async function structuralOperation(operation, cueIds) {
+  async function structuralOperation(operation, cueIds, { acquireLocks = true } = {}) {
     if (!canEdit) return;
     let result = null;
     const selectedBefore = selectedCueId;
+    const selectedBeforeIndex = selectedCueIndex;
+    const beforeCues = cues;
     const focused = document.activeElement;
     const anchorRow = focused?.closest?.(".cue-row")
       || focused?.closest?.(".block-group")?.querySelector(".cue-row")
@@ -646,11 +652,17 @@
     busy = true;
     message = "";
     try {
-      await lockCues(cueIds);
+      if (acquireLocks && cueIds.length) await lockCues(cueIds);
       const changed = await post(operation);
       result = changed;
       heldCueIds = [];
-      selectedCueId = resolveStructuralCueId(changed.document.cues, operation, selectedBefore);
+      selectedCueId = resolveStructuralCueId(
+        changed.document.cues,
+        operation,
+        selectedBefore,
+        selectedBeforeIndex,
+        beforeCues
+      );
       await post({ kind: "presence", selected_cue_id: selectedCueId });
     } catch (cause) {
       message = cause?.message || "字幕結構修改失敗";
@@ -662,7 +674,9 @@
     editingCueId = restoreEditor ? selectedCueId : "";
     await flushQueuedReload();
     await tick();
-    const resultAnchorId = snapshot.document.cues.some((cue) => cue.id === anchorCueId)
+    const resultAnchorId = operation.kind === "undo"
+      ? selectedCueId
+      : snapshot.document.cues.some((cue) => cue.id === anchorCueId)
       ? anchorCueId
       : selectedCueId;
     const resultRow = [...(cueList?.querySelectorAll(".cue-row") || [])]
@@ -721,6 +735,15 @@
     if (!changed) return;
     selectedCueId = nearestRemainingCueId(snapshot.document.cues, selectionIndex);
     message = "已刪除整個 Cue";
+  }
+
+  async function undoLastOperation() {
+    if (!canUndo) {
+      message = undoReason;
+      return;
+    }
+    const changed = await structuralOperation({ kind: "undo" }, [], { acquireLocks: false });
+    if (changed) message = "已復原上一個操作";
   }
 
   function mergeBlocks(left, right, reason) {
@@ -946,6 +969,8 @@
     const deleteShortcutAllowed = !editingCueId
       && (!interactive || event.target?.closest?.(".cue-row-select"))
       && !event.target?.closest?.("details");
+    const textEditingTarget = event.target?.closest?.("textarea, input, [contenteditable='true'], [contenteditable='']");
+    const undoShortcutAllowed = !textEditingTarget;
     if (editing) updateCaret(event.target);
     const enterSplitReason = editing
       ? splitAvailabilityReason(selectedCue, editReason, event.target.selectionStart, event.target.selectionEnd, event.target.value)
@@ -963,7 +988,6 @@
         pendingNavigationIndex = nextIndex;
         selectedCueId = cues[nextIndex].id;
         editingCueId = "";
-        playbackMs = cues[nextIndex].source_start_ms || 0;
         flushCueNavigation();
       }
     }
@@ -978,6 +1002,12 @@
     if (editing && event.key === "Escape") {
       event.preventDefault();
       exitEditMode();
+      return;
+    }
+    if (undoShortcutAllowed && canUndo && (event.metaKey || event.ctrlKey)
+      && !event.shiftKey && event.key.toLowerCase() === "z") {
+      event.preventDefault();
+      undoLastOperation();
       return;
     }
     if (editing && event.key === "Enter" && !canType) {
@@ -1095,40 +1125,9 @@
       {assetUrl}
       onStageMode={(mode) => { stageMode = mode; }}
       onPlaybackCue={followPlaybackCue}
-      onPlaybackTime={(currentMs, durationMs = 0) => {
-        playbackMs = currentMs;
-        if (durationMs > 0) mediaDurationMs = durationMs;
-      }}
     />
 
-    <section class="cue-workspace" class:content-review={snapshot.stage === "content_review"} aria-label="字幕工作區">
-      {#if snapshot.stage !== "content_review"}
-        <section class="cue-timeline" aria-label="影片字幕時間軸">
-        <div class="timeline-heading">
-          <strong>字幕時間軸</strong>
-          <span>{formatTime(playbackMs)} / {formatTime(timelineEndMs)}</span>
-        </div>
-        <div class="timeline-track">
-          {#each stageCues as cue}
-            <button
-              type="button"
-              class:active={cue.id === selectedCue?.id}
-              class:needs-change={(snapshot.issues || []).some((issue) => issue.cue_ids?.includes(cue.id))}
-              style={`left:${cue.start_ms / timelineEndMs * 100}%;width:${Math.max(.25, (cue.end_ms - cue.start_ms) / timelineEndMs * 100)}%`}
-              aria-label={`${cue.id} ${formatTime(cue.start_ms)} 至 ${formatTime(cue.end_ms)}`}
-              title={`${cue.id} · ${formatTime(cue.start_ms)}–${formatTime(cue.end_ms)}`}
-              on:click={() => selectCue(cue.id)}
-            ></button>
-          {/each}
-          <span class="playhead" style={`left:${playheadPercent}%`}></span>
-        </div>
-        <div class="timeline-status">
-          <span>{selectedTimingLabel}</span>
-          <span>{sourcePackage.media?.video ? "影片時間軸" : "目前套件未附影片 · 依 Cue 來源時間顯示"}</span>
-        </div>
-        </section>
-      {/if}
-
+    <section class="cue-workspace" aria-label="字幕工作區">
       <div class="cue-list" bind:this={cueList} role="region" aria-label="字幕清單">
         {#each cueGroups as group, groupIndex}
           <section class="block-group" class:active={group.cues.some((cue) => cue.id === selectedCue?.id)} aria-label={`Semantic Block ${group.block?.id || "未歸屬"}`}>
@@ -1265,8 +1264,12 @@
                       <details class="cue-actions" bind:this={actionsMenu} on:toggle={() => closeOtherMenu(actionsMenu, agentMenu)}>
                         <summary>更多操作</summary>
                         <div class="cue-actions-panel">
-                          <p class="shortcut-help">瀏覽：↑/↓ 換句 · Shift+Delete 刪除整句 · 雙擊字幕修稿 · 修稿：←/→ 在首尾跨句 · Esc 結束修稿 · Enter 切成兩句 · Ctrl/Cmd+Enter 同 Cue 換行 · Backspace/Delete 首尾合併 · M 快速標記</p>
+                          <p class="shortcut-help">瀏覽：↑/↓ 換句 · Ctrl/Cmd+Z 復原上一個操作 · Shift+Delete 刪除整句 · 雙擊字幕修稿 · 修稿：←/→ 在首尾跨句 · Esc 結束修稿 · Enter 切成兩句 · Ctrl/Cmd+Enter 同 Cue 換行 · Backspace/Delete 首尾合併 · M 快速標記</p>
                           <div class="action-grid" role="group" aria-label="Cue 操作">
+                          <div class="action-control">
+                            <button type="button" disabled={!canUndo} aria-describedby={undoReason ? "undo-reason" : undefined} title={undoReason || "復原上一個伺服器操作（Ctrl/Cmd+Z）"} on:click={undoLastOperation}>復原上一個操作</button>
+                            {#if undoReason}<small id="undo-reason" class="action-reason">{undoReason}</small>{/if}
+                          </div>
                           <div class="action-control">
                             <button type="button" disabled={Boolean(splitReason)} aria-describedby={splitReason ? "split-reason" : undefined} title={splitReason || "從目前游標切開 Cue"} on:click={splitCue}>從游標切成兩句</button>
                             {#if splitReason}<small id="split-reason" class="action-reason">{splitReason}</small>{/if}
@@ -1332,16 +1335,7 @@
   .workspace-message { color: #ffc6be; }
   .workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(420px, 560px); height: calc(100vh - 64px); }
   .workspace-grid :global(.media-stage) { min-width: 0; }
-  .cue-workspace { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; background: #1b201d; }
-  .cue-workspace.content-review { grid-template-rows: minmax(0, 1fr); }
-  .cue-timeline { padding: 10px 12px 9px; border-left: 1px solid #3b443d; border-bottom: 1px solid #3b443d; }
-  .timeline-heading, .timeline-status { display: flex; justify-content: space-between; gap: 10px; color: #aeb9ad; font-size: 11px; }
-  .timeline-heading strong { color: #eef2ec; font-size: 12px; }
-  .timeline-track { position: relative; height: 22px; margin: 7px 0 5px; overflow: hidden; border-radius: 4px; background: #101311; }
-  .timeline-track button { position: absolute; top: 4px; height: 14px; min-width: 2px; padding: 0; border: 1px solid #607061; border-radius: 2px; background: #39443b; }
-  .timeline-track button.active { z-index: 2; border-color: #d7efcd; background: #6b9068; }
-  .timeline-track button.needs-change { background: #975d4c; }
-  .timeline-track .playhead { position: absolute; z-index: 3; top: 0; bottom: 0; width: 2px; transform: translateX(-1px); background: #f3d26d; pointer-events: none; }
+  .cue-workspace { display: grid; grid-template-rows: minmax(0, 1fr); min-width: 0; min-height: 0; background: #1b201d; }
   .cue-list { min-height: 0; overflow: auto; border-left: 1px solid #3b443d; border-right: 1px solid #3b443d; }
   .block-group { position: relative; margin-left: 9px; border-left: 3px solid #526555; border-bottom: 1px solid #323a34; border-radius: 2px 0 0 2px; }
   .block-group:nth-child(even) { border-left-color: #6a7157; }

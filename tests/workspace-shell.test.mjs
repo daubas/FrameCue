@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { nearestRemainingCueId, resolveStructuralCueId } from "../src/lib/workspace.js";
+import { nearestRemainingCueId, resolveStructuralCueId, resolveUndoCueId } from "../src/lib/workspace.js";
+
+test("undo selection follows a restored structural Cue", () => {
+  const splitBefore = [
+    { id: "left", lineage: { operation: "split", parent_cue_ids: ["parent"] } },
+    { id: "right", lineage: { operation: "split", parent_cue_ids: ["parent"] } }
+  ];
+  assert.equal(resolveUndoCueId(splitBefore, [{ id: "parent" }], "right", 1), "parent");
+
+  const deleteBefore = [{ id: "first" }, { id: "anchor" }];
+  assert.equal(resolveUndoCueId(deleteBefore, [{ id: "first" }, { id: "restored" }, { id: "anchor" }], "anchor", 1), "restored");
+});
 
 test("structural result selection ignores a concurrent reload fallback", () => {
   const merged = [
@@ -54,10 +65,13 @@ test("Workspace v2 has its own reverse-approval shell while static pages keep Ap
   assert.match(shell, /接手 lead/);
   assert.match(shell, /issue\.authors\?\.includes\(snapshot\.display_name/);
   assert.match(shell, /等待 .*lead/i);
-  assert.match(shell, /aria-label="影片字幕時間軸"/);
-  assert.match(shell, /onPlaybackTime/);
+  assert.doesNotMatch(shell, /aria-label="影片字幕時間軸"/);
   assert.match(shell, /timing_state/);
-  assert.match(shell, /來源時間.*配音未對齊/);
+  assert.match(shell, /\.cue-workspace \{[^}]*display: grid;[^}]*grid-template-rows: minmax\(0, 1fr\)/);
+  assert.match(shell, /\.cue-list \{[^}]*min-height: 0;[^}]*overflow: auto/);
+  assert.match(shell, /resolveStructuralCueId\(\s*changed\.document\.cues,\s*operation,\s*selectedBefore,\s*selectedBeforeIndex,\s*beforeCues\s*\)/);
+  assert.match(shell, /structuralOperation\(\{ kind: "undo" \}, \[\], \{ acquireLocks: false \}\)/);
+  assert.match(shell, /operation\.kind === "undo"\s*\? selectedCueId/);
   assert.doesNotMatch(shell, /已審|reviewed_cues|完成百分比/);
 });
 
@@ -129,7 +143,7 @@ test("Workspace keeps Cue, Block, and Agent interactions visibly distinct", () =
 
   assert.match(shell, /event\.key === "Enter" && !event\.metaKey && !event\.ctrlKey/);
   assert.match(shell, /insertCueLineBreak/);
-  assert.match(shell, /resolveStructuralCueId\(changed\.document\.cues, operation, selectedBefore\)/);
+  assert.match(shell, /resolveStructuralCueId\(\s*changed\.document\.cues,\s*operation,\s*selectedBefore/);
   assert.match(shell, /focus\(\{ preventScroll: true \}\)/);
   assert.match(shell, /cueList\.scrollTop \+= delta/);
   assert.match(shell, /if \(busy\) \{\s*reloadQueued = true;/);
@@ -152,8 +166,6 @@ test("Workspace keeps Cue, Block, and Agent interactions visibly distinct", () =
   assert.match(shell, /mergeBlockBoundary/);
   assert.match(shell, /splitBlockBoundary/);
   assert.match(shell, /blockNumberById/);
-  assert.match(shell, /snapshot\.stage !== "content_review"/);
-  assert.match(shell, /class:content-review/);
   assert.match(shell, /\.block-rail-handle \{[^}]*opacity: 0/);
   assert.match(shell, /\.cue-actions \{ position: absolute/);
   assert.doesNotMatch(shell, /class="agent-request"|<summary>Block 操作<\/summary>/);
@@ -258,4 +270,20 @@ test("Workspace displays the latest Agent note and preserves blank updates", () 
   assert.match(shell, /nextOverrides\.set\(`\$\{selectedCue\.id\}:\$\{agentCategory\}`, agentNote\.trim\(\)\)/);
   assert.match(shell, /on:change=\{syncAgentCategoryNote\}/);
   assert.match(shell, /selectedOwnIssues\.map\(\(issue\) => agentIssueSummary\(issue\)\)/);
+});
+
+test("Workspace exposes server-owned Cue undo only outside text editing", () => {
+  const shell = readFileSync(new URL("../src/SubtitleWorkspace.svelte", import.meta.url), "utf8");
+
+  assert.match(shell, /snapshot\.can_undo/);
+  assert.match(shell, /kind: "undo"/);
+  assert.match(shell, /<summary>更多操作<\/summary>[\s\S]*?復原上一個操作/);
+  assert.match(shell, /disabled=\{!canUndo\}/);
+  assert.match(shell, /undoReason/);
+  assert.match(shell, /event\.metaKey \|\| event\.ctrlKey/);
+  assert.match(shell, /const textEditingTarget = event\.target\?\.closest\?\.\("textarea, input, \[contenteditable='true'\], \[contenteditable=''\]"\)/);
+  assert.match(shell, /const undoShortcutAllowed = !textEditingTarget/);
+  assert.doesNotMatch(shell, /const undoShortcutAllowed = !editingCueId[\s\S]*?details/);
+  const undoReason = shell.slice(shell.indexOf("$: undoReason ="), shell.indexOf("$: canUndo ="));
+  assert.doesNotMatch(undoReason, /editingCueId/);
 });

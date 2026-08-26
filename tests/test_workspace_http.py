@@ -730,6 +730,347 @@ class WorkspaceHTTPTests(unittest.TestCase):
                 thread.join(timeout=5)
                 server.server_close()
 
+    def test_workspace_session_undo_reverts_only_its_latest_draft_change(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-session-undo-") as temp:
+            root = Path(temp)
+            _, _, server, thread = self._workspace_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                _, _, alice = self._json_request(
+                    base, "/api/workspace/snapshot",
+                    headers={"X-FrameCue-Display-Name": "Alice"},
+                )
+                _, _, bob = self._json_request(
+                    base, "/api/workspace/snapshot",
+                    headers={"X-FrameCue-Display-Name": "Bob"},
+                )
+                alice_headers = self._workspace_headers(base, alice, alice["session_id"])
+                bob_headers = self._workspace_headers(base, bob, bob["session_id"])
+                original_text = alice["document"]["cues"][0]["display_text"]
+                self.assertFalse(alice["can_undo"])
+
+                _, _, edited = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "edit", "draft_version": 0, "cue_id": "c0001",
+                        "display_text": "Alice 的可撤回修改",
+                    },
+                    headers=alice_headers,
+                )
+                self.assertEqual(edited["draft_version"], 1)
+                self.assertTrue(edited["can_undo"])
+
+                _, _, alice_snapshot = self._json_request(
+                    base, "/api/workspace/snapshot", headers={"Cookie": alice_headers["Cookie"]}
+                )
+                self.assertTrue(alice_snapshot["can_undo"])
+
+                other_session_undo = urllib.request.Request(
+                    f"{base}/api/workspace/operation",
+                    data=json.dumps({"kind": "undo", "draft_version": 1}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json", **bob_headers},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(other_session_undo, timeout=5)
+                self.assertEqual(failure.exception.code, 409)
+
+                _, _, undone = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={"kind": "undo", "draft_version": 1},
+                    headers=alice_headers,
+                )
+                self.assertEqual(undone["draft_version"], 2)
+                self.assertEqual(undone["document"]["cues"][0]["display_text"], original_text)
+                self.assertEqual(undone["direct_edit_count"], 0)
+                self.assertFalse(undone["can_undo"])
+
+                _, _, second_edit = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "edit", "draft_version": 2, "cue_id": "c0001",
+                        "display_text": "這個修改會被其他人的修改介入",
+                    },
+                    headers=alice_headers,
+                )
+                self.assertTrue(second_edit["can_undo"])
+                _, _, intervening_edit = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "edit", "draft_version": 3, "cue_id": "c0002",
+                        "display_text": "Bob 的介入修改",
+                    },
+                    headers=bob_headers,
+                )
+                self.assertEqual(intervening_edit["draft_version"], 4)
+
+                stale_undo = urllib.request.Request(
+                    f"{base}/api/workspace/operation",
+                    data=json.dumps({"kind": "undo", "draft_version": 4}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json", **alice_headers},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(stale_undo, timeout=5)
+                self.assertEqual(failure.exception.code, 409)
+
+                _, _, final_snapshot = self._json_request(
+                    base, "/api/workspace/snapshot", headers={"Cookie": alice_headers["Cookie"]}
+                )
+                self.assertFalse(final_snapshot["can_undo"])
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_workspace_session_undo_respects_locks_on_cross_block_merge_siblings(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-undo-merge-lock-") as temp:
+            root = Path(temp)
+            _, _, server, thread = self._workspace_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                _, _, alice = self._json_request(
+                    base, "/api/workspace/snapshot",
+                    headers={"X-FrameCue-Display-Name": "Alice"},
+                )
+                _, _, bob = self._json_request(
+                    base, "/api/workspace/snapshot",
+                    headers={"X-FrameCue-Display-Name": "Bob"},
+                )
+                alice_headers = self._workspace_headers(base, alice, alice["session_id"])
+                bob_headers = self._workspace_headers(base, bob, bob["session_id"])
+
+                _, _, first_split = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={"kind": "split", "draft_version": 0, "cue_id": "c0001", "cursor": 4},
+                    headers=alice_headers,
+                )
+                first_children = [cue["id"] for cue in first_split["document"]["cues"][:2]]
+                _, _, second_split = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={"kind": "split", "draft_version": 1, "cue_id": "c0002", "cursor": 4},
+                    headers=alice_headers,
+                )
+                second_children = [cue["id"] for cue in second_split["document"]["cues"][2:]]
+                self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "block_split", "draft_version": 2,
+                        "block_id": second_split["document"]["blocks"][0]["id"],
+                        "cue_id": second_children[0],
+                    },
+                    headers=alice_headers,
+                )
+                _, _, merged = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "merge", "draft_version": 3,
+                        "cue_id": first_children[1], "adjacent_cue_id": second_children[0],
+                    },
+                    headers=alice_headers,
+                )
+                self.assertEqual(merged["draft_version"], 4)
+                self.assertTrue(merged["can_undo"])
+
+                self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={"kind": "lock", "draft_version": 4, "cue_ids": [first_children[0]]},
+                    headers=bob_headers,
+                )
+                locked_sibling_undo = urllib.request.Request(
+                    f"{base}/api/workspace/operation",
+                    data=json.dumps({"kind": "undo", "draft_version": 4}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json", **alice_headers},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(locked_sibling_undo, timeout=5)
+                self.assertEqual(failure.exception.code, 409)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_workspace_session_undo_stays_invalid_after_external_completion_and_reopen(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-undo-reopen-") as temp:
+            root = Path(temp)
+            database, package, server, thread = self._workspace_server(root)
+            try:
+                base = f"http://127.0.0.1:{server.server_address[1]}"
+                _, _, alice = self._json_request(
+                    base, "/api/workspace/snapshot",
+                    headers={"X-FrameCue-Display-Name": "Alice"},
+                )
+                headers = self._workspace_headers(base, alice, alice["session_id"])
+                self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "flag", "draft_version": 0, "cue_id": "c0002",
+                        "categories": ["translation"], "author": "Alice", "note": "請調整",
+                    },
+                    headers=headers,
+                )
+                _, _, edited = self._json_request(
+                    base,
+                    "/api/workspace/operation",
+                    method="POST",
+                    value={
+                        "kind": "edit", "draft_version": 1, "cue_id": "c0001",
+                        "display_text": "完成前的可撤回修改",
+                    },
+                    headers=headers,
+                )
+                self.assertTrue(edited["can_undo"])
+
+                completed = framecue.complete_workspace_round(database, package["review_id"], 2)
+                self.assertEqual(completed["stage"], "content_agent_review_pending")
+                reopened = framecue.reopen_workspace_round(database, package["review_id"])
+                self.assertEqual(reopened["stage"], "content_review")
+
+                _, _, snapshot = self._json_request(
+                    base, "/api/workspace/snapshot", headers={"Cookie": headers["Cookie"]}
+                )
+                self.assertEqual(snapshot["draft_version"], 2)
+                self.assertFalse(snapshot["can_undo"])
+                revived_undo = urllib.request.Request(
+                    f"{base}/api/workspace/operation",
+                    data=json.dumps({"kind": "undo", "draft_version": 2}).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json", **headers},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    urllib.request.urlopen(revived_undo, timeout=5)
+                self.assertEqual(failure.exception.code, 409)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_workspace_session_undo_round_trips_every_supported_draft_operation(self):
+        for kind in ("edit", "split", "merge", "delete", "block_merge", "block_split"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(
+                prefix=f"framecue-workspace-undo-{kind}-"
+            ) as temp:
+                root = Path(temp)
+                database, package, server, thread = self._workspace_server(root)
+                try:
+                    base = f"http://127.0.0.1:{server.server_address[1]}"
+                    _, _, snapshot = self._json_request(base, "/api/workspace/snapshot")
+                    headers = self._workspace_headers(base, snapshot, snapshot["session_id"])
+                    _, _, current = self._json_request(
+                        base,
+                        "/api/workspace/operation",
+                        method="POST",
+                        value={
+                            "kind": "flag", "draft_version": 0, "cue_id": "c0001",
+                            "categories": ["other"], "author": "Reviewer", "note": "保留這個 issue",
+                        },
+                        headers=headers,
+                    )
+                    if kind == "block_merge":
+                        _, _, current = self._json_request(
+                            base,
+                            "/api/workspace/operation",
+                            method="POST",
+                            value={
+                                "kind": "block_split", "draft_version": 1,
+                                "block_id": current["document"]["blocks"][0]["id"], "cue_id": "c0002",
+                            },
+                            headers=headers,
+                        )
+                    before_version = current["draft_version"]
+                    before_document = copy.deepcopy(current["document"])
+                    before_issues = copy.deepcopy(current["issues"])
+                    connection = framecue.open_workspace_database(database)
+                    try:
+                        before_direct_changes = copy.deepcopy(framecue.draft_row(
+                            connection, framecue.workspace_row(connection, package["review_id"])
+                        )["direct_changes"])
+                    finally:
+                        connection.close()
+                    self.assertTrue(before_issues)
+
+                    if kind == "edit":
+                        operation = {
+                            "kind": "edit", "draft_version": before_version, "cue_id": "c0001",
+                            "display_text": "可撤回的字幕修改",
+                        }
+                    elif kind == "split":
+                        operation = {
+                            "kind": "split", "draft_version": before_version,
+                            "cue_id": "c0001", "cursor": 4,
+                        }
+                    elif kind == "merge":
+                        operation = {
+                            "kind": "merge", "draft_version": before_version,
+                            "cue_id": "c0001", "adjacent_cue_id": "c0002",
+                        }
+                    elif kind == "delete":
+                        operation = {
+                            "kind": "delete", "draft_version": before_version, "cue_id": "c0001",
+                        }
+                    elif kind == "block_merge":
+                        operation = {
+                            "kind": "block_merge", "draft_version": before_version,
+                            "block_id": current["document"]["blocks"][0]["id"],
+                            "adjacent_block_id": current["document"]["blocks"][1]["id"],
+                        }
+                    else:
+                        operation = {
+                            "kind": "block_split", "draft_version": before_version,
+                            "block_id": current["document"]["blocks"][0]["id"], "cue_id": "c0002",
+                        }
+
+                    _, _, changed = self._json_request(
+                        base, "/api/workspace/operation", method="POST", value=operation, headers=headers
+                    )
+                    self.assertEqual(changed["draft_version"], before_version + 1)
+                    self.assertTrue(changed["can_undo"])
+                    _, _, undone = self._json_request(
+                        base,
+                        "/api/workspace/operation",
+                        method="POST",
+                        value={"kind": "undo", "draft_version": before_version + 1},
+                        headers=headers,
+                    )
+                    connection = framecue.open_workspace_database(database)
+                    try:
+                        after_direct_changes = framecue.draft_row(
+                            connection, framecue.workspace_row(connection, package["review_id"])
+                        )["direct_changes"]
+                    finally:
+                        connection.close()
+                    self.assertEqual(undone["draft_version"], before_version + 2)
+                    self.assertEqual(undone["document"], before_document)
+                    self.assertEqual(undone["issues"], before_issues)
+                    self.assertEqual(after_direct_changes, before_direct_changes)
+                    self.assertEqual(undone["direct_edit_count"], len(before_direct_changes))
+                    self.assertFalse(undone["can_undo"])
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=5)
+                    server.server_close()
+
     def test_workspace_collaboration_blocks_locked_or_dirty_completion_and_requires_the_lead(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-collaboration-") as temp:
             root = Path(temp)

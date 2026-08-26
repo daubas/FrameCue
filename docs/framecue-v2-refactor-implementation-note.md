@@ -696,3 +696,19 @@ Direct human text edits still take precedence and may stale an older proposal.
   46/46, Python 85/85, and the production build pass. Updating the pinned
   runtime skill remains a release step rather than pointing it at an untagged
   development checkout.
+
+### 2026-08-26 — Session-safe one-level Undo and timeline ownership
+
+- Subtitle Workspace now offers exactly one server-owned Undo for the latest
+  `edit`, Cue split/merge/delete, or Block split/merge made by the same browser
+  session. Undo restores the previous document, Review Flags, and direct-change
+  audit while advancing `draft_version`; it never rewinds version history.
+- Any later draft-changing operation invalidates every outstanding Undo. Other
+  sessions cannot use it, service restart safely drops it, and textarea
+  `Ctrl/Cmd+Z` remains native. The server advertises `can_undo` only in the
+  session-bound HTTP snapshot; the generic snapshot and CLI stay session-free.
+- Removed FrameCue's compressed audiovisual timeline. AgenticDub's reviewed
+  audiovisual addon owns waveform/timeline presentation; FrameCue retains
+  `MediaStage`, Cue playback-follow, native-video fallback, Candidate audio,
+  and the addon event bridge instead of maintaining a second overview.
+- Node 49/49, Python 89/89, production build, `py_compile`, and diff check pass.
