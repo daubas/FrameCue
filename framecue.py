@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 ADAPTER_PATH = ROOT / "adapters" / "hyperframes-player.html"
-VIEWER_VERSION = "2.8.0"
+VIEWER_VERSION = "2.9.0"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
