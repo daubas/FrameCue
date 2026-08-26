@@ -5,7 +5,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
 import wave
 from pathlib import Path
 from unittest.mock import patch
@@ -41,13 +43,15 @@ class WorkspaceCliTests(unittest.TestCase):
                 "BUNDLE",
                 "--port",
                 "8765",
+                "--audiovisual-addon",
+                "ADDON.js",
             ])
             try:
                 args.func(args)
             except KeyboardInterrupt:
                 pass
 
-        factory.assert_called_once_with("DB", "BUNDLE", 8765)
+        factory.assert_called_once_with("DB", "BUNDLE", 8765, "ADDON.js")
         server.serve_forever.assert_called_once_with()
         server.server_close.assert_called_once_with()
 
@@ -259,6 +263,106 @@ class WorkspaceCliTests(unittest.TestCase):
             self.assertEqual(summary["stage"], "audiovisual_review")
             self.assertEqual(summary["status"], "candidate_ready")
             self.assertEqual(summary["request_id"], work_order["request_id"])
+
+    def test_candidate_reopen_returns_voice_order_to_pending(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-reopen-candidate-") as temp:
+            root = Path(temp)
+            database, package, work_order = self._pending_work_order(root)
+            candidate_path = self._write_candidate(root, "candidate.json", self._candidate(root, work_order))
+            self._submit(database, candidate_path)
+
+            summary = json.loads(run_cli(
+                "candidate-reopen", "--database", str(database),
+                "--review-id", package["review_id"],
+            ).stdout)
+            self.assertEqual(summary["stage"], "voice_realization_pending")
+            self.assertEqual(summary["status"], "pending")
+            self.assertEqual(summary["request_id"], work_order["request_id"])
+            self.assertEqual(json.loads(self._submit(database, candidate_path).stdout)["status"], "candidate_ready")
+
+    def test_candidate_reopen_content_restores_editable_draft(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-reopen-content-") as temp:
+            root = Path(temp)
+            database, package, work_order = self._pending_work_order(root)
+            self._submit(database, self._write_candidate(root, "candidate.json", self._candidate(root, work_order)))
+
+            summary = json.loads(run_cli(
+                "candidate-reopen", "--database", str(database),
+                "--review-id", package["review_id"], "--content",
+            ).stdout)
+            self.assertEqual(summary["stage"], "content_review")
+            self.assertEqual(summary["status"], "changes_requested")
+            snapshot = framecue.workspace_snapshot(database, package["review_id"], "csrf")
+            operation = root / "edit.json"
+            operation.write_text(json.dumps({
+                "kind": "edit", "draft_version": snapshot["draft_version"],
+                "cue_id": "c0001", "display_text": "精簡字幕",
+            }), encoding="utf-8")
+            changed = json.loads(run_cli(
+                "workspace-apply", "--database", str(database),
+                "--review-id", package["review_id"], "--operation", str(operation),
+            ).stdout)
+            completed = json.loads(run_cli(
+                "workspace-complete", "--database", str(database),
+                "--review-id", package["review_id"],
+                "--draft-version", str(changed["draft_version"]),
+            ).stdout)
+            self.assertEqual(completed["stage"], "voice_realization_pending")
+
+    def test_audiovisual_snapshot_uses_voice_candidate_without_leaking_asset_paths(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-audiovisual-") as temp:
+            root = Path(temp)
+            database, package, work_order = self._pending_work_order(root)
+            candidate = self._candidate(root, work_order)
+            self._submit(database, self._write_candidate(root, "candidate.json", candidate))
+
+            snapshot = framecue.workspace_snapshot(database, package["review_id"], "csrf")
+            self.assertEqual(snapshot["stage"], "audiovisual_review")
+            self.assertEqual(
+                snapshot["document"]["cues"][0]["output_start_ms"],
+                candidate["document"]["cues"][0]["output_start_ms"],
+            )
+            self.assertEqual(snapshot["candidate_audio"][candidate["document"]["blocks"][0]["id"]],
+                             "/api/workspace/candidate-audio/" + candidate["document"]["blocks"][0]["id"])
+            self.assertNotIn(str(root), json.dumps(snapshot))
+            changed = framecue.apply_draft_operation(database, package["review_id"], {
+                "kind": "flag", "draft_version": snapshot["draft_version"], "cue_id": "c0001",
+                "categories": ["timing"], "author": "lead", "note": "配音進字太晚",
+            })
+            self.assertEqual(changed["stage"], "audiovisual_review")
+            self.assertEqual(changed["issues"][0]["category"], "timing")
+
+    def test_workspace_server_mounts_audiovisual_addon_only_for_candidate_review(self):
+        with tempfile.TemporaryDirectory(prefix="framecue-workspace-addon-") as temp:
+            root = Path(temp)
+            database, package, work_order = self._pending_work_order(root)
+            candidate = self._write_candidate(root, "candidate.json", self._candidate(root, work_order))
+            addon = root / "audiovisual-review.js"
+            addon.write_text("export const mounted = true;\n", encoding="utf-8")
+            server = framecue.make_workspace_server(database, root / "bundle", 0, addon)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{server.server_port}"
+                request = urllib.request.Request(
+                    base + "/api/workspace/snapshot",
+                    headers={"X-FrameCue-Display-Name": "Reviewer"},
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertNotIn("audiovisual_addon", json.load(response))
+                self._submit(database, candidate)
+                with urllib.request.urlopen(request) as response:
+                    snapshot = json.load(response)
+                entry = snapshot["audiovisual_addon"]["entry"]
+                self.assertTrue(entry.startswith("/api/workspace/audiovisual-addon.js?v="))
+                self.assertNotIn(str(addon), json.dumps(snapshot))
+                with urllib.request.urlopen(base + entry) as response:
+                    self.assertEqual(response.read(), addon.read_bytes())
+                    self.assertEqual(response.headers.get_content_type(), "text/javascript")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
     def test_work_submit_rejects_immutable_document_changes(self):
         with tempfile.TemporaryDirectory(prefix="framecue-workspace-immutable-") as temp:

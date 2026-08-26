@@ -7,6 +7,7 @@
   export let cueDraft;
   export let stageMode = "still";
   export let subtitleOnlyVideo = false;
+  export let audiovisualAddon = null;
   export let assetUrl = (path) => path;
   export let onStageMode = () => {};
   export let onPlaybackCue = () => {};
@@ -14,7 +15,10 @@
 
   let cueAudio;
   let sourceVideoElement;
+  let audiovisualElement;
+  let audiovisualAddonLoaded = "";
   let sourceVideoCueId = "";
+  let syncedPlayback = false;
   let cuePlaybackActive = false;
   let cuePlaybackEndMs = 0;
   let playerFrame;
@@ -52,6 +56,25 @@
     sourceVideoCueId = cue.id;
     alignSourceVideo();
   }
+  $: if (audiovisualAddon?.entry && audiovisualAddon.entry !== audiovisualAddonLoaded) {
+    loadAudiovisualAddon(audiovisualAddon.entry);
+  }
+  $: if (audiovisualElement && audiovisualAddonLoaded) audiovisualElement.review = {
+    videoUrl: assetUrl(sourceVideo?.src || ""),
+    posterUrl: scene?.image ? assetUrl(scene.image) : "",
+    cues: packageData?.cues || [],
+    selectedCueId: cue?.id || ""
+  };
+
+  async function loadAudiovisualAddon(entry) {
+    try {
+      await import(/* @vite-ignore */ assetUrl(entry));
+      audiovisualAddonLoaded = entry;
+      playerError = "";
+    } catch (_) {
+      playerError = "配音審查器載入失敗";
+    }
+  }
 
   function postPlayer(type, payload = {}) {
     if (!playerOrigin || !playerFrame?.contentWindow) return;
@@ -61,6 +84,7 @@
   function pausePlayer() {
     postPlayer("framecue:pause");
     sourceVideoElement?.pause();
+    audiovisualElement?.pause?.();
     cuePlaybackActive = false;
     playerPlaying = false;
   }
@@ -82,7 +106,9 @@
   function toggleCueAudio() {
     if (!cueAudio?.src) return;
     if (cueAudio.paused) {
+      syncedPlayback = false;
       pausePlayer();
+      cueAudio.currentTime = (cue?.audio_start_ms || 0) / 1000;
       cueAudio.play();
     } else {
       cueAudio.pause();
@@ -91,6 +117,10 @@
 
   function toggleVideo() {
     if (sourceVideo) {
+      if (audiovisualAddonLoaded && audiovisualElement) {
+        audiovisualElement.togglePlayback();
+        return;
+      }
       toggleSourceVideo();
       return;
     }
@@ -122,9 +152,15 @@
     }
     cuePlaybackEndMs = cue.end_ms;
     cuePlaybackActive = true;
+    syncedPlayback = Boolean(cueAudio?.src);
     pauseCueAudio();
-    sourceVideoElement.play().catch(() => {
+    sourceVideoElement.play().then(() => {
+      if (!cueAudio?.src) return;
+      cueAudio.currentTime = (cue.audio_start_ms || 0) / 1000;
+      return cueAudio.play();
+    }).catch(() => {
       cuePlaybackActive = false;
+      syncedPlayback = false;
       playerPlaying = false;
     });
   }
@@ -136,6 +172,7 @@
     if (cuePlaybackActive && cuePlaybackEnded(currentMs, cuePlaybackEndMs)) {
       cuePlaybackActive = false;
       sourceVideoElement.pause();
+      pauseCueAudio();
       const duration = Number.isFinite(sourceVideoElement.duration) ? sourceVideoElement.duration : cuePlaybackEndMs / 1000;
       sourceVideoElement.currentTime = Math.min(cuePlaybackEndMs / 1000, duration);
       return;
@@ -184,6 +221,14 @@
     toggleCueAudio();
   }
 
+  function stopCueAudioAtBoundary() {
+    if (cue?.audio_end_ms != null && cueAudio?.currentTime * 1000 >= cue.audio_end_ms) cueAudio.pause();
+  }
+
+  function handleCueAudioPlay() {
+    if (!syncedPlayback) pausePlayer();
+  }
+
   onMount(() => {
     window.addEventListener("message", handleMessage);
     window.addEventListener("framecue:toggle-playback", togglePlayback);
@@ -214,7 +259,20 @@
   </div>
 
   <div class="stage-canvas">
-    {#if stageMode === "video" && sourceVideo}
+    {#if stageMode === "video" && sourceVideo && audiovisualAddon}
+      {#if audiovisualAddonLoaded}
+        <agenticdub-audiovisual-review
+          bind:this={audiovisualElement}
+          on:framecue-time={(event) => {
+            playerPlaying = event.detail.playing;
+            onPlaybackTime(event.detail.currentMs, event.detail.durationMs);
+          }}
+          on:framecue-cue={(event) => onPlaybackCue(event.detail.cueId)}
+        ></agenticdub-audiovisual-review>
+      {:else}
+        <div class:error={Boolean(playerError)} class="player-overlay">{playerError || "正在載入配音審查器"}</div>
+      {/if}
+    {:else if stageMode === "video" && sourceVideo}
       <div class="source-video-stage">
         <video
           bind:this={sourceVideoElement}
@@ -222,10 +280,11 @@
           poster={scene?.image ? assetUrl(scene.image) : ""}
           preload="metadata"
           controls
+          muted={Boolean(cue?.audio)}
           playsinline
           on:loadedmetadata={() => { alignSourceVideo(true); handleSourceTimeUpdate(); }}
           on:play={() => { pauseCueAudio(); playerPlaying = true; }}
-          on:pause={() => playerPlaying = false}
+          on:pause={() => { syncedPlayback = false; pauseCueAudio(); playerPlaying = false; }}
           on:ended={() => { cuePlaybackActive = false; playerPlaying = false; }}
           on:timeupdate={handleSourceTimeUpdate}
         >
@@ -338,7 +397,7 @@
       {#if stageMode === "video" && (sourceVideo || hyperframes)}
         <button type="button" on:click={toggleVideo}>{playerPlaying ? "暫停 Cue" : "播放 Cue"}</button>
       {:else if cue?.audio}
-        <button type="button" on:click={toggleCueAudio}>{cueAudio?.paused === false ? "暫停 Cue" : "播放 Cue"}</button>
+        <button type="button" on:click={toggleCueAudio}>{cueAudio?.paused === false ? "暫停配音" : "播放配音"}</button>
       {/if}
       {#if (cue?.risks || []).length && cue?.audio}
         <button class="warning-button" type="button" on:click={replayRisk}>重播風險字</button>
@@ -346,6 +405,6 @@
     </div>
   </div>
   {#if cue?.audio}
-    <audio bind:this={cueAudio} src={assetUrl(cue.audio)} preload="metadata" on:play={pausePlayer}></audio>
+    <audio bind:this={cueAudio} src={assetUrl(cue.audio)} preload="metadata" on:play={handleCueAudioPlay} on:timeupdate={stopCueAudioAtBoundary}></audio>
   {/if}
 </section>

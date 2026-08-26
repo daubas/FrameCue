@@ -134,18 +134,19 @@
       const key = cue.block_id || `unassigned-${cue.id}`;
       let group = groups[groups.length - 1];
       if (!group || group.key !== key) {
+        const startMs = snapshot.stage === "audiovisual_review" ? cue.output_start_ms : cue.source_start_ms;
         group = {
           key,
           block,
           cues: [],
           first_index: index,
-          start_ms: cue.source_start_ms,
-          end_ms: cue.source_end_ms
+          start_ms: startMs ?? cue.source_start_ms,
+          end_ms: (snapshot.stage === "audiovisual_review" ? cue.output_end_ms : cue.source_end_ms) ?? cue.source_end_ms
         };
         groups.push(group);
       }
       group.cues.push(cue);
-      group.end_ms = cue.source_end_ms;
+      group.end_ms = (snapshot.stage === "audiovisual_review" ? cue.output_end_ms : cue.source_end_ms) ?? cue.source_end_ms;
     });
     return groups;
   })();
@@ -158,16 +159,26 @@
     caretEnd = null;
   }
   $: sourcePackage = snapshot.document.source_package || {};
+  $: outputBlockStartMs = new Map(blocks.map((block) => [
+    block.id,
+    Math.min(...cues.filter((cue) => cue.block_id === block.id).map((cue) => cue.output_start_ms).filter(Number.isInteger))
+  ]));
   $: stageCues = cues.map((cue) => {
     const sourceId = cue.origin_cue_ids?.[0] || cue.id;
     const source = sourcePackage.cues?.find((item) => item.id === sourceId) || {};
+    const outputTiming = snapshot.stage === "audiovisual_review"
+      && Number.isInteger(cue.output_start_ms) && Number.isInteger(cue.output_end_ms);
+    const blockStartMs = outputBlockStartMs.get(cue.block_id) || 0;
     return {
       ...source,
       ...cue,
-      start_ms: cue.source_start_ms ?? source.start_ms ?? 0,
-      end_ms: cue.source_end_ms ?? source.end_ms ?? 0,
+      start_ms: outputTiming ? cue.output_start_ms : cue.source_start_ms ?? source.start_ms ?? 0,
+      end_ms: outputTiming ? cue.output_end_ms : cue.source_end_ms ?? source.end_ms ?? 0,
       text: cue.display_text ?? cue.text ?? "",
-      original_text: cue.source_text ?? source.original_text ?? ""
+      original_text: cue.source_text ?? source.original_text ?? "",
+      audio: snapshot.candidate_audio?.[cue.block_id] || cue.audio,
+      audio_start_ms: outputTiming ? cue.output_start_ms - blockStartMs : 0,
+      audio_end_ms: outputTiming ? cue.output_end_ms - blockStartMs : null
     };
   });
   $: stageCue = stageCues.find((cue) => cue.id === selectedCue?.id) || null;
@@ -205,8 +216,8 @@
   $: lockedByOther = Boolean(selectedLock && selectedLock.session_id !== snapshot.session_id);
   $: isLead = snapshot.lead_session_id === snapshot.session_id;
   $: leadName = snapshot.participants.find((participant) => participant.session_id === snapshot.lead_session_id)?.display_name || "lead";
-  $: reviewActionReason = snapshot.stage !== "content_review"
-    ? "目前不是內容審查階段，字幕結構已唯讀。"
+  $: reviewActionReason = !["content_review", "audiovisual_review"].includes(snapshot.stage)
+    ? "目前不是可審查階段。"
     : !connected
       ? "目前離線，請重新同步後再修改。"
       : busy || completing
@@ -215,7 +226,9 @@
           ? "這句 Cue 正由其他審稿者修改。"
           : "";
   $: canReview = !reviewActionReason;
-  $: editReason = reviewActionReason || (phone ? "手機版僅供唯讀檢視。" : "");
+  $: editReason = snapshot.stage !== "content_review"
+    ? "配音審查只標記需修改，字幕結構維持唯讀。"
+    : reviewActionReason || (phone ? "手機版僅供唯讀檢視。" : "");
   $: canEdit = !editReason;
   $: canType = canEdit && editingCueId === selectedCue?.id && heldCueIds.includes(selectedCue?.id);
   $: canDecideAgentSuggestion = connected && !busy && !completing && !lockedByOther
@@ -792,7 +805,7 @@
     await leaveEditor();
     if (!selectedOwnIssues.length) {
       const saved = await submit({ kind: "flag", cue_ids: [selectedCue.id], categories: ["other"], author: snapshot.display_name || "reviewer" });
-      if (saved) queueLocalAgentSuggestion(selectedCue, "other", "");
+      if (saved && snapshot.stage === "content_review") queueLocalAgentSuggestion(selectedCue, "other", "");
       return;
     }
     for (const issue of selectedOwnIssues) {
@@ -1055,6 +1068,7 @@
       cueDraft={{ text: editText }}
       {stageMode}
       subtitleOnlyVideo={Boolean(sourcePackage.media?.video)}
+      audiovisualAddon={snapshot.audiovisual_addon}
       {assetUrl}
       onStageMode={(mode) => { stageMode = mode; }}
       onPlaybackCue={followPlaybackCue}

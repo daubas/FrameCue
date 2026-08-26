@@ -27,7 +27,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 ADAPTER_PATH = ROOT / "adapters" / "hyperframes-player.html"
-VIEWER_VERSION = "2.6.0"
+VIEWER_VERSION = "2.8.0"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
@@ -1788,7 +1788,9 @@ def apply_draft_operation(database, review_id, operation):
         try:
             connection.execute("BEGIN IMMEDIATE")
             workspace = workspace_row(connection, review_id)
-            if workspace["stage"] != "content_review":
+            if workspace["stage"] != "content_review" and not (
+                workspace["stage"] == "audiovisual_review" and kind == "flag"
+            ):
                 raise FrameCueError(f"workspace is not accepting draft operations: {review_id}")
             draft = draft_row(connection, workspace)
             if draft["draft_version"] != expected_version:
@@ -1861,12 +1863,12 @@ def apply_draft_operation(database, review_id, operation):
                 ).rowcount != 1:
                     raise FrameCueError(f"workspace draft version is stale: {review_id}")
                 if flag is not None:
-                    if flag["enabled"]:
+                    if flag["enabled"] and workspace["stage"] == "content_review":
                         enqueue_suggestion_jobs(
                             connection, review_id, flag, draft["document"], next_version,
                             draft["document"]["checksum"],
                         )
-                    else:
+                    elif not flag["enabled"] and workspace["stage"] == "content_review":
                         ignore_flag_suggestion_jobs(connection, review_id, flag)
             connection.commit()
         except sqlite3.Error as error:
@@ -1879,7 +1881,7 @@ def apply_draft_operation(database, review_id, operation):
         connection.close()
     return {
         "workspace_id": review_id,
-        "stage": "content_review",
+        "stage": workspace["stage"],
         "draft_version": next_version,
         "document": draft["document"],
         "issues": draft["issues"],
@@ -2733,6 +2735,22 @@ def workspace_snapshot(database, review_id, csrf_token):
     try:
         workspace = workspace_row(connection, review_id)
         draft = draft_row(connection, workspace)
+        candidate_audio = {}
+        if workspace["stage"] == "audiovisual_review":
+            row = connection.execute(
+                """SELECT candidate_json FROM work_orders
+                   WHERE review_id = ? AND status = 'candidate_ready'
+                   ORDER BY work_order_id DESC LIMIT 1""",
+                (review_id,),
+            ).fetchone()
+            if row is None:
+                raise FrameCueError(f"audiovisual review candidate is missing: {review_id}")
+            candidate = json.loads(row["candidate_json"])
+            draft["document"] = candidate["document"]
+            candidate_audio = {
+                asset["block_id"]: f"/api/workspace/candidate-audio/{asset['block_id']}"
+                for asset in candidate["assets"]["block_audio"]
+            }
         values = suggestion_jobs(connection, review_id, draft)
         connection.commit()
     except sqlite3.Error as error:
@@ -2750,7 +2768,36 @@ def workspace_snapshot(database, review_id, csrf_token):
         "issues": draft["issues"],
         "direct_edit_count": len(draft["direct_changes"]),
         "suggestions": values,
+        "candidate_audio": candidate_audio,
     }
+
+
+def workspace_candidate_audio(database, review_id, block_id):
+    if not ID_PATTERN.fullmatch(block_id):
+        raise FrameCueError("candidate audio block ID is invalid")
+    connection = open_workspace_database(database)
+    try:
+        row = connection.execute(
+            """SELECT candidate_json FROM work_orders
+               WHERE review_id = ? AND status = 'candidate_ready'
+               ORDER BY work_order_id DESC LIMIT 1""",
+            (review_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise FrameCueError("candidate audio was not found")
+    candidate = json.loads(row["candidate_json"])
+    asset = next(
+        (value for value in candidate.get("assets", {}).get("block_audio", []) if value.get("block_id") == block_id),
+        None,
+    )
+    if asset is None:
+        raise FrameCueError("candidate audio was not found")
+    path = Path(asset["path"]).expanduser().resolve()
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != asset.get("sha256"):
+        raise FrameCueError("candidate audio failed integrity verification")
+    return path
 
 
 class WorkspaceCollaboration:
@@ -2974,9 +3021,13 @@ def agent_work_order_metadata(row):
     }
 
 
-def make_workspace_server(database, bundle_dir, port=0):
+def make_workspace_server(database, bundle_dir, port=0, audiovisual_addon=None):
     directory = Path(bundle_dir).expanduser().resolve()
     database_path = Path(database).expanduser().absolute()
+    addon_path = Path(audiovisual_addon).expanduser().resolve() if audiovisual_addon else None
+    if addon_path is not None and (not addon_path.is_file() or addon_path.suffix != ".js"):
+        raise FrameCueError("audiovisual addon must be an existing JavaScript file")
+    addon_version = hashlib.sha256(addon_path.read_bytes()).hexdigest()[:12] if addon_path else ""
     for candidate in (database_path, Path(f"{database_path}-wal"), Path(f"{database_path}-shm")):
         if candidate.is_relative_to(directory) or candidate.resolve().is_relative_to(directory):
             raise FrameCueError("workspace database files must not be inside the served bundle tree")
@@ -3650,6 +3701,10 @@ def make_workspace_server(database, bundle_dir, port=0):
 
         def current_snapshot(self, session):
             snapshot = workspace_snapshot(database, review_id, csrf_token)
+            if addon_path is not None and snapshot["stage"] == "audiovisual_review":
+                snapshot["audiovisual_addon"] = {
+                    "entry": f"/api/workspace/audiovisual-addon.js?v={addon_version}",
+                }
             snapshot.update(collaboration.snapshot_fields(session["session_id"]))
             return snapshot
 
@@ -3809,9 +3864,22 @@ def make_workspace_server(database, bundle_dir, port=0):
             path = self.translate_path(self.path)
             if not range_header or not Path(path).is_file():
                 return super().send_head()
+            return self.send_file(Path(path))
+
+        def send_file(self, path):
+            self._range_length = None
+            range_header = self.headers.get("Range")
             file = open(path, "rb")
             file.seek(0, 2)
             size = file.tell()
+            if not range_header:
+                file.seek(0)
+                self.send_response(200)
+                self.send_header("Content-Type", self.guess_type(str(path)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                return file
             match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
             if not match or not size:
                 file.close()
@@ -3854,6 +3922,29 @@ def make_workspace_server(database, bundle_dir, port=0):
         def do_GET(self):
             parsed_request = urlsplit(self.path)
             path = parsed_request.path
+            if path == "/api/workspace/audiovisual-addon.js" and addon_path is not None:
+                file = self.send_file(addon_path)
+                if file is not None:
+                    try:
+                        self.copyfile(file, self.wfile)
+                    finally:
+                        file.close()
+                return
+            candidate_audio = re.fullmatch(r"/api/workspace/candidate-audio/([^/]+)", path)
+            if candidate_audio:
+                try:
+                    file = self.send_file(workspace_candidate_audio(
+                        database, review_id, unquote(candidate_audio.group(1))
+                    ))
+                except FrameCueError as error:
+                    self.send_json(404, {"error": str(error)})
+                    return
+                if file is not None:
+                    try:
+                        self.copyfile(file, self.wfile)
+                    finally:
+                        file.close()
+                return
             if path == "/api/agent/suggestions":
                 identity = self.require_agent("list")
                 if identity is None:
@@ -4032,7 +4123,7 @@ def make_workspace_server(database, bundle_dir, port=0):
 
 
 def command_workspace_serve(args):
-    server = make_workspace_server(args.database, args.dir, args.port)
+    server = make_workspace_server(args.database, args.dir, args.port, args.audiovisual_addon)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4718,6 +4809,58 @@ def command_work_submit(args):
     }, ensure_ascii=False))
 
 
+def command_candidate_reopen(args):
+    connection = open_workspace_database(args.database)
+    try:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = workspace_row(connection, args.review_id)
+            if workspace["stage"] != "audiovisual_review":
+                raise FrameCueError(f"workspace has no voice candidate to reopen: {args.review_id}")
+            if draft_row(connection, workspace)["issues"]:
+                raise FrameCueError("voice candidate has unresolved review flags")
+            order = connection.execute(
+                """SELECT work_order_id, request_id FROM work_orders
+                   WHERE review_id = ? AND operation = 'realize_voice_timeline'
+                     AND status = 'candidate_ready'
+                   ORDER BY work_order_id DESC LIMIT 1""",
+                (args.review_id,),
+            ).fetchone()
+            if order is None:
+                raise FrameCueError(f"voice candidate is not ready: {args.review_id}")
+            status = "changes_requested" if args.content else "pending"
+            stage = "content_review" if args.content else "voice_realization_pending"
+            if connection.execute(
+                "UPDATE work_orders SET status = ? WHERE work_order_id = ? AND status = 'candidate_ready'",
+                (status, order["work_order_id"]),
+            ).rowcount != 1:
+                raise FrameCueError(f"voice candidate changed while reopening: {args.review_id}")
+            if args.content:
+                connection.execute(
+                    "UPDATE workspace_drafts SET frozen_revision_id = NULL WHERE review_id = ?",
+                    (args.review_id,),
+                )
+            connection.execute(
+                "UPDATE workspaces SET stage = ? WHERE review_id = ?",
+                (stage, args.review_id),
+            )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise FrameCueError(f"workspace database error: {error}") from error
+        except Exception:
+            connection.rollback()
+            raise
+    finally:
+        connection.close()
+    print(json.dumps({
+        "workspace_id": args.review_id,
+        "stage": stage,
+        "status": status,
+        "request_id": order["request_id"],
+    }, ensure_ascii=False))
+
+
 def candidate_checksum(candidate):
     return hashlib.sha256(canonical_json(candidate).encode("utf-8")).hexdigest()
 
@@ -5029,6 +5172,7 @@ def parser():
     workspace_serve.add_argument("--database", required=True)
     workspace_serve.add_argument("--dir", required=True)
     workspace_serve.add_argument("--port", type=int, default=3069)
+    workspace_serve.add_argument("--audiovisual-addon")
     workspace_serve.set_defaults(func=command_workspace_serve)
 
     agent_token_create = commands.add_parser("agent-token-create", help="create one scoped agent bearer token")
@@ -5056,6 +5200,14 @@ def parser():
     work_submit.add_argument("--database", required=True)
     work_submit.add_argument("--candidate", required=True)
     work_submit.set_defaults(func=command_work_submit)
+
+    candidate_reopen = commands.add_parser(
+        "candidate-reopen", help="return an unflagged voice candidate to its pending work order",
+    )
+    candidate_reopen.add_argument("--database", required=True)
+    candidate_reopen.add_argument("--review-id", required=True)
+    candidate_reopen.add_argument("--content", action="store_true")
+    candidate_reopen.set_defaults(func=command_candidate_reopen)
 
     candidate_decide = commands.add_parser("candidate-decide", help="accept or reject every proposal in a content Candidate")
     candidate_decide.add_argument("--database", required=True)

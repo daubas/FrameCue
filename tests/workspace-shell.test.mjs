@@ -212,7 +212,8 @@ test("Workspace keeps phone editing read-only while allowing review decisions", 
 
   assert.match(shell, /reviewActionReason/);
   assert.match(shell, /\$:\s*canReview = !reviewActionReason/);
-  assert.match(shell, /\$:\s*editReason = reviewActionReason \|\| \(phone \? "手機版僅供唯讀檢視。"/);
+  assert.match(shell, /\$:\s*editReason = snapshot\.stage !== "content_review"/);
+  assert.match(shell, /"配音審查只標記需修改，字幕結構維持唯讀。"/);
   assert.match(shell, /\$:\s*flagReason = !selectedCue \? "沒有可標記的 Cue。" : reviewActionReason/);
   assert.match(shell, /\["flag"\]\.includes\(operation\?\.kind\) \? canReview/);
   assert.match(shell, /\["suggestion_apply", "suggestion_ignore"\]\.includes\(operation\?\.kind\)/);
