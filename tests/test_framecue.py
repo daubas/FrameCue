@@ -171,6 +171,15 @@ class FrameCueV2Tests(unittest.TestCase):
         self.assertEqual(command[command.index("--index") + 1], "index.html")
         self.assertEqual(command[-1], str(bundle.resolve()))
 
+    def test_serve_uses_local_vite_range_server_before_python_fallback(self):
+        bundle = self.output / "serve-vite"
+        bundle.mkdir()
+        (bundle / "index.html").write_text("FrameCue", encoding="utf-8")
+        args = SimpleNamespace(dir=str(bundle), port=3069)
+        with patch.object(framecue.shutil, "which", return_value=None), patch.object(framecue.Path, "is_file", return_value=True), patch.object(framecue.subprocess, "run") as run:
+            framecue.command_serve(args)
+        self.assertEqual(run.call_args.args[0], [str(framecue.ROOT / "node_modules" / ".bin" / "vite"), str(bundle.resolve()), "--host", "127.0.0.1", "--port", "3069", "--strictPort"])
+
     def test_null_legacy_milliseconds_fall_back_to_seconds(self):
         self.assertEqual(framecue.source_ms({"start_ms": None, "start": 1.25}, "start_ms", "fixture"), 1250)
 

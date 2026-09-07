@@ -13,6 +13,7 @@
   let cueAudio;
   let sourceVideoElement;
   let sourceVideoCueId = "";
+  let sourceVideoAligned = false;
   let cuePlaybackActive = false;
   let cuePlaybackEndMs = 0;
   let playerFrame;
@@ -47,6 +48,7 @@
   }
   $: if (stageMode === "video" && sourceVideo && sourceVideoElement && cue?.id && cue.id !== sourceVideoCueId) {
     sourceVideoCueId = cue.id;
+    sourceVideoAligned = false;
     alignSourceVideo();
   }
 
@@ -70,6 +72,7 @@
     if (mode === "video") {
       pauseCueAudio();
       sourceVideoCueId = "";
+      sourceVideoAligned = false;
     } else {
       pausePlayer();
     }
@@ -100,10 +103,18 @@
     if (!sourceVideoElement || !cue) return;
     const currentMs = sourceVideoElement.currentTime * 1000;
     if (force || cueNeedsSeek(cue, currentMs)) {
+      sourceVideoAligned = false;
       sourceVideoElement.pause();
       cuePlaybackActive = false;
       sourceVideoElement.currentTime = cue.start_ms / 1000;
+    } else {
+      sourceVideoAligned = true;
     }
+  }
+
+  function handleSourceSeeked() {
+    if (!sourceVideoElement || !cue) return;
+    sourceVideoAligned = !cueNeedsSeek(cue, sourceVideoElement.currentTime * 1000);
   }
 
   function toggleSourceVideo() {
@@ -115,6 +126,7 @@
     }
     const currentMs = sourceVideoElement.currentTime * 1000;
     if (currentMs < cue.start_ms - 100 || cuePlaybackEnded(currentMs, cue.end_ms)) {
+      sourceVideoAligned = false;
       sourceVideoElement.currentTime = cue.start_ms / 1000;
     }
     cuePlaybackEndMs = cue.end_ms;
@@ -128,6 +140,7 @@
 
   function handleSourceTimeUpdate() {
     if (!sourceVideoElement) return;
+    if (!sourceVideoAligned || sourceVideoCueId !== cue?.id) return;
     const currentMs = sourceVideoElement.currentTime * 1000;
     if (cuePlaybackActive && cuePlaybackEnded(currentMs, cuePlaybackEndMs)) {
       cuePlaybackActive = false;
@@ -219,6 +232,7 @@
           on:play={() => { pauseCueAudio(); playerPlaying = true; }}
           on:pause={() => playerPlaying = false}
           on:ended={() => { cuePlaybackActive = false; playerPlaying = false; }}
+          on:seeked={handleSourceSeeked}
           on:timeupdate={handleSourceTimeUpdate}
         >
           <track kind="captions" src={assetUrl(sourceVideo.captions)} srclang="zh-Hant" label="FrameCue 中英字幕" />

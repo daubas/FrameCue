@@ -12,6 +12,7 @@ import {
   cuePlaybackEnded,
   finalApprovalAllowed,
   makeResult,
+  makeResultBundle,
   rangeNeedsConfirmation,
   reviewCueAndAdvance,
   reviewedCueCount,
@@ -156,6 +157,12 @@ test("cue playback seeks outside the cue and stops at its end", () => {
   assert.equal(cuePlaybackEnded(2480, cue.end_ms), true);
 });
 
+test("source video ignores initial time updates until the selected cue is aligned", () => {
+  const mediaStage = readFileSync(new URL("../src/components/MediaStage.svelte", import.meta.url), "utf8");
+  assert.match(mediaStage, /if \(!sourceVideoAligned \|\| sourceVideoCueId !== cue\?\.id\) return;/);
+  assert.match(mediaStage, /on:seeked=\{handleSourceSeeked\}/);
+});
+
 test("video time selects the current cue at each boundary", () => {
   const cues = [
     { id: "c0001", start_ms: 0, end_ms: 1000 },
@@ -201,4 +208,18 @@ test("new-mode browser drafts export the frozen result contract", () => {
   assert.equal(result.schema_version, "framecue_review_result_v1");
   assert.equal(result.cues[0].action, "reorder");
   assert.equal(result.cues.length, 1);
+});
+
+test("manifest review exports one bundle containing every package result", () => {
+  const results = [
+    { schema_version: "framecue_review_result_v1", review_id: "section-00", revision: "r8" },
+    { schema_version: "framecue_review_result_v1", review_id: "section-01", revision: "r8" }
+  ];
+  const bundle = makeResultBundle(results);
+  assert.equal(bundle.schema_version, "framecue_review_result_bundle_v1");
+  assert.equal(bundle.result_count, 2);
+  assert.deepEqual(bundle.results, results);
+  const app = readFileSync(new URL("../src/App.svelte", import.meta.url), "utf8");
+  assert.match(app, /for \(const item of items\)/);
+  assert.match(app, /輸出全部審閱結果/);
 });

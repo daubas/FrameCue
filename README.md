@@ -74,6 +74,10 @@ python3 framecue.py collect \
 `collect` rejects a stale checksum, wrong revision, incomplete snapshot, or
 unapproved result.
 
+When a dashboard manifest contains multiple packages, `輸出全部審閱結果`
+downloads one `framecue_review_result_bundle_v1` JSON whose `results` array
+contains one unchanged `framecue_review_result_v1` snapshot per package.
+
 ## Contract
 
 `framecue_package_v2` is immutable and records:

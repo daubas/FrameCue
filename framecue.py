@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DIST_DIR = ROOT / "dist"
 ADAPTER_PATH = ROOT / "adapters" / "hyperframes-player.html"
-VIEWER_VERSION = "2.6.0"
+VIEWER_VERSION = "2.7.0"
 PACKAGE_SCHEMA = "framecue_package_v2"
 RESULT_SCHEMA = "framecue_review_result_v1"
 MANIFEST_SCHEMA = "framecue_manifest_v2"
@@ -1088,6 +1088,10 @@ def command_serve(args):
     miniserve = shutil.which("miniserve")
     if miniserve:
         subprocess.run([miniserve, "--interfaces", "127.0.0.1", "--port", str(args.port), "--index", "index.html", str(directory)], check=True)
+        return
+    vite = ROOT / "node_modules" / ".bin" / "vite"
+    if vite.is_file():
+        subprocess.run([str(vite), str(directory), "--host", "127.0.0.1", "--port", str(args.port), "--strictPort"], check=True)
         return
     print("warning: Python http.server may not support byte ranges needed by video playback", file=sys.stderr)
     subprocess.run([sys.executable, "-m", "http.server", str(args.port), "--directory", str(directory)], check=True)

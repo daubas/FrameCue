@@ -3,7 +3,7 @@
   import MediaStage from "./components/MediaStage.svelte";
   import ReviewWorkbench from "./components/ReviewWorkbench.svelte";
   import DetailsPanel from "./components/DetailsPanel.svelte";
-  import { downloadText, resultFileName } from "./lib/download.js";
+  import { downloadText, resultBundleFileName, resultFileName } from "./lib/download.js";
   import { loadDraft, removeDraft, saveDraft } from "./lib/storage.js";
   import {
     approveReviewedBlock,
@@ -13,6 +13,7 @@
     finalApprovalAllowed,
     formatTime,
     makeResult,
+    makeResultBundle,
     mergeDraft,
     reviewedCueCount,
     reviewCueAndAdvance,
@@ -31,6 +32,7 @@
   let error = "";
   let stageMode = "still";
   let playbackCueId = "";
+  let exportingResults = false;
 
   $: selectedCue = packageData?.cues.find((cue) => cue.id === draft?.selected_cue_id) || packageData?.cues[0] || null;
   $: selectedBlock = packageData?.blocks.find((block) => block.id === draft?.selected_block_id) || packageData?.blocks[0] || null;
@@ -58,17 +60,22 @@
     saveDraft(packageData, next);
   }
 
+  async function fetchItemPackage(item) {
+    const packageUrl = new URL(item.review_package, window.location.href);
+    const response = await fetch(packageUrl, { cache: "no-store" });
+    if (!response.ok) throw new Error(`無法載入 ${item.review_package}`);
+    const nextPackage = await response.json();
+    validateBrowserPackage(nextPackage);
+    return { nextPackage, packageUrl };
+  }
+
   async function loadItem(item) {
     loading = true;
     error = "";
     playbackCueId = "";
     stageMode = "still";
     try {
-      const packageUrl = new URL(item.review_package, window.location.href);
-      const response = await fetch(packageUrl, { cache: "no-store" });
-      if (!response.ok) throw new Error(`無法載入 ${item.review_package}`);
-      const nextPackage = await response.json();
-      validateBrowserPackage(nextPackage);
+      const { nextPackage, packageUrl } = await fetchItemPackage(item);
       packageData = nextPackage;
       packageBase = new URL(".", packageUrl).href;
       draft = mergeDraft(nextPackage, loadDraft(nextPackage));
@@ -184,10 +191,33 @@
     persist({ ...draft, final_approval: { approved_at: approvedAt } });
   }
 
-  function downloadResult() {
+  async function downloadResult() {
     if (!packageData || !draft) return;
-    const result = makeResult(packageData, draft, draft.final_approval?.approved_at || "");
-    downloadText(resultFileName(packageData), "application/json", JSON.stringify(result, null, 2));
+    if (items.length === 1) {
+      const result = makeResult(packageData, draft, draft.final_approval?.approved_at || "");
+      downloadText(resultFileName(packageData), "application/json", JSON.stringify(result, null, 2));
+      return;
+    }
+    if (exportingResults) return;
+    exportingResults = true;
+    try {
+      const results = [];
+      for (const item of items) {
+        const nextPackage = item.id === currentItemId
+          ? packageData
+          : (await fetchItemPackage(item)).nextPackage;
+        const nextDraft = item.id === currentItemId
+          ? draft
+          : mergeDraft(nextPackage, loadDraft(nextPackage));
+        results.push(makeResult(nextPackage, nextDraft, nextDraft.final_approval?.approved_at || ""));
+      }
+      const bundle = makeResultBundle(results);
+      downloadText(resultBundleFileName(results), "application/json", JSON.stringify(bundle, null, 2));
+    } catch (cause) {
+      window.alert(cause.message || "無法輸出全部審閱結果。");
+    } finally {
+      exportingResults = false;
+    }
   }
 
   function downloadSrt() {
@@ -280,7 +310,9 @@
         {#if ["subtitle", "redraw", "boundary", "hyperframes"].includes(packageData.workflow.kind)}
           <button type="button" on:click={downloadSrt}>輸出 SRT</button>
         {/if}
-        <button type="button" on:click={downloadResult}>輸出審閱結果</button>
+        <button type="button" disabled={exportingResults} on:click={downloadResult}>
+          {exportingResults ? "正在輸出" : items.length > 1 ? "輸出全部審閱結果" : "輸出審閱結果"}
+        </button>
         <button class:approved={Boolean(draft.final_approval)} class="approve-package" disabled={!approvalAllowed || Boolean(draft.final_approval)} type="button" on:click={approvePackage}>
           {draft.final_approval ? "套件已核准" : "核准套件"}
         </button>

@@ -280,6 +280,15 @@ export function makeResult(packageData, draft, approvedAt = "") {
   };
 }
 
+export function makeResultBundle(results) {
+  return {
+    schema_version: "framecue_review_result_bundle_v1",
+    generated_at: new Date().toISOString(),
+    result_count: results.length,
+    results
+  };
+}
+
 export function changedCount(packageData, draft) {
   let count = 0;
   for (const cue of packageData.cues) {
