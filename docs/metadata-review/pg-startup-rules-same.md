@@ -40,7 +40,7 @@
 04:13 創辦人還是同一種人
 05:04 還能用的尺仍是出貨，仍是人
 
-本片為繁體中文精華摘要版，非完整中文配音。
+本片為繁體中文精華摘要版。
 原始訪談：https://www.youtube.com/watch?v=5bxp78i96S8
 ```
 
@@ -77,7 +77,7 @@ Y Combinator 共同創辦人：出貨速度還是那把尺｜Paul Graham
 ```text
 #PaulGraham 在 #YCombinator 的訪談中指出，即使有了強大的 #AI 工具，很多新創仍然出貨不夠快。AI 改變了工具與成本，但出貨速度仍是衡量創業者的那把尺，變的是帳單，不是創辦人。
 
-本片為繁體中文同步語音短片，保留英文原聲與中英字幕。
+本片保留英文原聲與中英字幕。
 
 完整整理即將上架：〈有了AI創業人沒變，變的是帳單〉
 原始訪談：https://www.youtube.com/watch?v=5bxp78i96S8
@@ -96,7 +96,7 @@ Paul Graham, Y Combinator, 出貨速度, 創業, 新創, AI創業, 人工智慧,
 
 ### Title
 
-Y Combinator 共同創辦人：入場券沒有永久漲價｜Paul Graham
+Y Combinator 共同創辦人：創業的入場券沒有永久漲價｜Paul Graham
 
 ### Content summary
 
@@ -107,7 +107,7 @@ Y Combinator 共同創辦人：入場券沒有永久漲價｜Paul Graham
 ```text
 #PaulGraham 說，現在的 #AI token 之所以昂貴，首先是 #GPU 供給不足；但科技通常會變便宜，入場券沒有永久漲價，仍然可以用不多的錢開始創業。
 
-本片為繁體中文同步語音短片，保留英文原聲與中英字幕。
+本片保留英文原聲與中英字幕。
 
 這支是 short family 的可選入口；若只保留兩支，會留下 S1 與 S3。
 完整整理即將上架：〈有了AI創業人沒變，變的是帳單〉
@@ -138,9 +138,9 @@ Y Combinator 共同創辦人：創辦人還是同一種人｜Paul Graham
 ```text
 #PaulGraham 認為，下一家兆美元公司會來自難搞的創辦人，而不是某個固定點子。#YCombinator 看了二十年創辦人，仍然看見同一種人；#AI 改變工具，沒有把創業者變成機器人。
 
-本片為繁體中文同步語音短片，保留英文原聲與中英字幕。
+本片保留英文原聲與中英字幕。
 
-完整整理即將上架：〈有了AI創業人沒變，變的是帳單〉
+完整整理：〈有了AI創業人沒變，變的是帳單〉
 原始訪談：https://www.youtube.com/watch?v=5bxp78i96S8
 ```
 
